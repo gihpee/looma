@@ -31,6 +31,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+from pathlib import Path
 from typing import List, Optional
 
 logger = logging.getLogger("looma.orchestrator.rendezvous")
@@ -164,6 +165,13 @@ class RendezvousNode:
             # peer id, and workers hold on to it. Regenerating it on restart
             # would invalidate every worker's entry point at once.
             .with_key_path(self.key_dir)
+            # Карта сети переживает перезапуск. Без этого она живёт только в
+            # памяти: оркестратор перезапускается — и точка встречи забывает,
+            # кто где живёт, разом. Узлы к ней подключаются заново, выглядят
+            # здоровыми, а найти друг друга не могут, потому что искать больше
+            # не у кого. Со стенда это выглядело как «кластер то собирается, то
+            # нет» и стоило дня.
+            .with_dht_db_path(str(Path(self.key_dir) / "dht"))
             .with_dcutr(True)
             .with_autonat(True)
             .with_mdns(False)

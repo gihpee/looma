@@ -8,6 +8,8 @@ Ray файл пропускается молча.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 
@@ -37,7 +39,7 @@ def test_зависшая_попытка_считается_неудачной_�
         return Result()
 
     monkeypatch.setattr(sp, "run", hangs_then_works)
-    cluster._run_start(["ray", "start"], rank=1, retries=4, timeout_s=60)
+    cluster._run_start(["ray", "start"], rank=1, until=time.time() + 60, timeout_s=60)
     assert len(attempts) == 3, "зависание должно быть попыткой, а не концом"
 
 
@@ -55,21 +57,35 @@ def test_все_попытки_зависли_дают_внятный_отказ
 
     monkeypatch.setattr(sp, "run", always_hangs)
     with pytest.raises(cluster.ClusterRefused) as отказ:
-        cluster._run_start(["ray", "start"], rank=1, retries=2, timeout_s=60)
+        cluster._run_start(["ray", "start"], rank=1, until=time.time() + 1, timeout_s=60)
     assert "ранга 1" in str(отказ.value)
     assert "не ответил за 60с" in str(отказ.value)
 
 
-def test_срок_одной_попытки_меньше_бюджета_всех(monkeypatch):
-    """Числа обязаны быть согласованы. Раньше на попытку отводилось 600 секунд
-    при пяти повторах по 15 — одна попытка перекрывала весь замысел, и повторов
-    не случалось ни разу."""
+def test_присоединяющийся_не_сдаётся_раньше_головы(monkeypatch):
+    """Со стенда: поиск соседа в DHT занял четыре с половиной минуты.
+
+    Прежде число попыток было задано жёстко (пять), и присоединяющийся сдавался
+    примерно через 435 секунд, тогда как голова ждёт 900. Кластер собрался на
+    четвёртой попытке — то есть едва разминулся с отказом по причине, которая к
+    делу не относится. Теперь оба срока берутся из одной величины.
+    """
+    import subprocess as sp
+
     from looma_ray import cluster
 
-    бюджет = cluster.JOIN_ATTEMPTS * cluster.JOIN_RETRY_S
-    assert cluster.START_TIMEOUT_S <= бюджет, (
-        "попытка не должна длиться дольше, чем все паузы между попытками")
-    assert cluster.START_TIMEOUT_S < cluster.JOIN_WAIT_S
+    monkeypatch.setattr(cluster, "JOIN_RETRY_S", 0.01)
+    попытки = []
+
+    class Отказ:
+        returncode, stdout, stderr = 1, "", "GCS не отвечает"
+
+    monkeypatch.setattr(sp, "run", lambda *_a, **_k: попытки.append(1) or Отказ())
+    with pytest.raises(cluster.ClusterRefused):
+        cluster._run_start(["ray", "start"], rank=1, until=time.time() + 0.2)
+
+    assert len(попытки) > 5, (
+        f"должен пробовать, пока голова ждёт, а сделал {len(попытки)} попыток")
 
 
 def test_срок_попытки_передаётся_в_subprocess(monkeypatch):
@@ -88,7 +104,7 @@ def test_срок_попытки_передаётся_в_subprocess(monkeypatch)
         return Result()
 
     monkeypatch.setattr(sp, "run", capture)
-    cluster._run_start(["ray", "start"], rank=1, retries=0, timeout_s=42)
+    cluster._run_start(["ray", "start"], rank=1, until=0.0, timeout_s=42)
     assert видели.get("timeout") == 42
 
 
@@ -113,7 +129,7 @@ def test_зависший_ray_доносит_свои_слова(monkeypatch):
 
     monkeypatch.setattr(sp, "run", hangs)
     with pytest.raises(cluster.ClusterRefused) as отказ:
-        cluster._run_start(["ray", "start"], rank=0, retries=0, timeout_s=60)
+        cluster._run_start(["ray", "start"], rank=0, until=0.0, timeout_s=60)
     сказано = str(отказ.value)
     assert "version mismatch" in сказано, "слова ray обязаны дойти"
     assert "подняли дашборд" in сказано
@@ -130,7 +146,7 @@ def test_молчаливое_зависание_так_и_называется(
 
     monkeypatch.setattr(sp, "run", hangs)
     with pytest.raises(cluster.ClusterRefused) as отказ:
-        cluster._run_start(["ray", "start"], rank=0, retries=0, timeout_s=60)
+        cluster._run_start(["ray", "start"], rank=0, until=0.0, timeout_s=60)
     assert "и ничего не сказал" in str(отказ.value)
 
 
@@ -146,5 +162,5 @@ def test_байтовый_вывод_тоже_доносится(monkeypatch):
 
     monkeypatch.setattr(sp, "run", hangs)
     with pytest.raises(cluster.ClusterRefused) as отказ:
-        cluster._run_start(["ray", "start"], rank=0, retries=0, timeout_s=60)
+        cluster._run_start(["ray", "start"], rank=0, until=0.0, timeout_s=60)
     assert "GCS не встал" in str(отказ.value)

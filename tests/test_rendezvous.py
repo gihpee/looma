@@ -186,3 +186,35 @@ def test_объявленные_адреса_ip_остаются_ip4():
 
     node = RendezvousNode(public_host="203.0.113.7", port=47100)
     assert node._announced_addrs()[0] == "/ip4/203.0.113.7/tcp/47100"
+
+
+def test_карта_сети_переживает_перезапуск(tmp_path, monkeypatch):
+    """Со стенда: оркестратор перезапускался — и узлы переставали находить друг
+    друга, хотя каждый по-прежнему видел точку встречи.
+
+    Её карта жила только в памяти. Узлы подключались заново, выглядели
+    здоровыми, а искать соседа было не у кого: путь к DHT на диске никто не
+    задавал. Здесь проверяется, что задаём.
+    """
+    from looma.orchestrator.rendezvous import RendezvousNode
+
+    было = {}
+
+    class Строитель:
+        def __getattr__(self, name):
+            def запомнить(*args, **kwargs):
+                было[name] = args[0] if args else True
+                return self
+            return запомнить
+
+        def build(self):
+            return object()
+
+    node = RendezvousNode(public_host="looma.example", port=47100,
+                          key_dir=str(tmp_path))
+    monkeypatch.setattr("lattica.Lattica.builder", staticmethod(lambda: Строитель()))
+    node._build()
+
+    assert "with_dht_db_path" in было, "путь к DHT на диске не задан"
+    assert str(tmp_path) in было["with_dht_db_path"], "карта должна лежать рядом с ключом"
+    assert "with_key_path" in было, "личность тоже обязана переживать перезапуск"

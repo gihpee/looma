@@ -27,9 +27,12 @@ logger = logging.getLogger("looma_ray.cluster")
 HEAD_WAIT_S = float(os.environ.get("LOOMA_RAY_HEAD_WAIT_S", "900"))
 # Сколько голова ждёт остальных, прежде чем считать это провалом.
 JOIN_WAIT_S = float(os.environ.get("LOOMA_RAY_JOIN_WAIT_S", "900"))
-# Сколько раз ранг пробует присоединиться и сколько ждёт между попытками.
-# Голова занимает свой порт задолго до того, как становится готова принимать.
-JOIN_ATTEMPTS = int(os.environ.get("LOOMA_RAY_JOIN_ATTEMPTS", "5"))
+# Сколько ждёт между попытками присоединиться. Число попыток не задаётся: они
+# идут, пока голова ждёт остальных (JOIN_WAIT_S). Раньше их было пять, то есть
+# около 435 секунд против её 900 — присоединяющийся сдавался вдвое раньше, чем
+# голова переставала его ждать. Со стенда: поиск соседа в DHT занял ЧЕТЫРЕ с
+# половиной минуты, и кластер собрался на четвёртой попытке из шести — то есть
+# едва разминулся с отказом по причине, к делу не относящейся.
 JOIN_RETRY_S = float(os.environ.get("LOOMA_RAY_JOIN_RETRY_S", "15"))
 # Сколько ждать ОДНУ попытку `ray start`. Отдельно от бюджета всех попыток:
 # раньше здесь стояло 600 секунд при бюджете примерно в 75 — одна попытка
@@ -165,7 +168,10 @@ def start_node(rank: int, size: int, *, gpus: Optional[int] = None,
     logger.info("ранг %d/%d: %s", rank, size,
                 "поднимаю голову" if rank == 0 else f"пробую подключиться к {address}")
     _run_start(argv, rank=rank,
-               retries=0 if rank == 0 else JOIN_ATTEMPTS,
+               # Голове повторять незачем: ждать ей некого. Остальные пробуют,
+               # пока она их ждёт, — сроки берутся из одной величины и потому
+               # не могут разойтись.
+               until=0.0 if rank == 0 else time.time() + JOIN_WAIT_S,
                timeout_s=HEAD_START_TIMEOUT_S if rank == 0 else START_TIMEOUT_S)
     return address
 
@@ -224,8 +230,8 @@ def _said(stdout, stderr) -> str:
     return " / ".join(said[-4:]) if said else "и ничего не сказал"
 
 
-def _run_start(argv: List[str], *, rank: int, retries: int,
-               timeout_s: float = START_TIMEOUT_S) -> None:
+def _run_start(argv: List[str], *, until: float = 0.0,
+               rank: int = 0, timeout_s: float = START_TIMEOUT_S) -> None:
     """Запустить `ray start`, повторяя, пока голова не примет.
 
     Повтор нужен именно неголовным рангам. Открытый порт головы не значит, что
@@ -250,7 +256,9 @@ def _run_start(argv: List[str], *, rank: int, retries: int,
     порт, следующая честно скажет об этом своим сообщением.
     """
     last = ""
-    for attempt in range(retries + 1):
+    attempt = 0
+    while True:
+        attempt += 1
         if STOP.is_set():
             raise Stopped("сборку кластера прервали")
         try:
@@ -267,10 +275,11 @@ def _run_start(argv: List[str], *, rank: int, retries: int,
             if result.returncode == 0:
                 return
             last = _said(result.stdout, result.stderr)
-        if attempt < retries:
-            logger.warning("ранг %d: голова ещё не принимает (попытка %d из %d): %s",
-                           rank, attempt + 1, retries + 1, last[:200])
-            STOP.wait(JOIN_RETRY_S)
+        if time.time() + JOIN_RETRY_S >= until:
+            break
+        logger.warning("ранг %d: голова ещё не принимает (попытка %d, осталось %.0f с): %s",
+                       rank, attempt, until - time.time(), last[:200])
+        STOP.wait(JOIN_RETRY_S)
     raise ClusterRefused(f"ray start для ранга {rank} не отработал: {last}")
 
 

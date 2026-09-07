@@ -174,7 +174,15 @@ def pump(local: socket.socket, remote: "RemoteSide", *, closed: threading.Event)
             for piece in remote.read():
                 if closed.is_set():
                     break
-                local.sendall(piece)
+                try:
+                    local.sendall(piece)
+                except OSError as exc:
+                    # Обязательно отдельно от ошибок стрима: «Broken pipe» здесь
+                    # означает, что местная сторона закрыла соединение, а не что
+                    # сосед пропал. В одном обработчике подпись обвиняла не того,
+                    # и по ней шли искать причину на другой машине.
+                    why(f"местная сторона закрыла соединение при записи: {exc}")
+                    return
             why("поток от соседа кончился")
         except Exception as exc:
             why(f"поток от соседа: {exc}")
