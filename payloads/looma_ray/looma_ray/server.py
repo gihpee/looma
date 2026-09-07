@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from looma_ray import cluster
-from looma_ray.ports import crossing_for_group, ports_for
+from looma_ray.ports import crossing_for_group, hosts_for_group, ports_for
 
 logging.basicConfig(level=os.environ.get("LOOMA_LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -125,6 +125,15 @@ def ask_forwarding(size: int, rank: int) -> dict:
         body["external"] = [STATE["client_port"]]
     if not body:
         return {"listening": 0}
+    # Адрес, на котором каждый ранг ждут. Присылаем МЫ по той же причине, что и
+    # порты: адрес выбирает наш софт, и агент, знай он это сам, обновлялся бы
+    # вместе с ним. И для одиночного ранга тоже: адрес у него всё равно не
+    # локалхост, а через него к кластеру приходит looma-connect.
+    #
+    # Задача постарше поля не присылала, и агент постарше его не увидит — тогда
+    # остаётся прежнее поведение: кластер на РАЗНЫХ машинах у такой пары не
+    # соберётся, но и хуже не станет.
+    body["hosts"] = {str(r): h for r, h in hosts_for_group(size).items()}
     request = urllib.request.Request(
         f"{AGENT_URL}/forward", data=json.dumps(body).encode(), method="POST",
         headers={"Content-Type": "application/json", "X-Looma-Task": TASK_ID})

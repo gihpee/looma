@@ -5,10 +5,15 @@
 кластер, обращаясь к адресам и портам, и переписать который нельзя, потому что
 весь смысл в том, чтобы код клиента работал как есть.
 
-Приём такой. Ранг N получает свой непересекающийся диапазон портов; агент на
-каждом узле слушает у себя на 127.0.0.1 диапазоны ЧУЖИХ рангов и возит принятые
+Приём такой. У ранга N свой адрес и свой непересекающийся диапазон портов;
+агент на каждом узле слушает у себя адреса ЧУЖИХ рангов и возит принятые
 соединения в туннель до нужного пира. Все узлы видят одинаковую картину «ранг M
-живёт на локалхосте», и Ray про NAT не узнаёт никогда.
+живёт вот по этому адресу», и Ray про NAT не узнаёт никогда.
+
+Адрес приходит вместе с портами и от того же, кто их разложил, — по той же
+причине: его выбирает софт задачи. Задача постарше адресов не присылает; для
+неё остаётся прежнее поведение (локалхост и адрес машины), и оно работает,
+пока ранги на одной машине.
 
 Два следствия, оба существенные:
 
@@ -100,13 +105,16 @@ class Forwarder:
 
     # ------------------------------------------------------------- открытие
     def open(self, task_id: str, *, mine: List[int], remote: Dict[int, str],
-             ports: Dict[int, List[int]]) -> dict:
+             ports: Dict[int, List[int]],
+             hosts: Optional[Dict[int, str]] = None) -> dict:
         """Начать пробрасывать для этой задачи.
 
         `mine`   — порты нашего ранга: их надо открыть входящим.
         `remote` — ранг → peer_id тех, кто НЕ на этой машине.
         `ports`  — ранг → его порты, как их посчитала сама задача.
+        `hosts`  — ранг → адрес, на котором его ждут. Пусто у задач постарше.
         """
+        hosts = hosts or {}
         self.allow_local(list(mine))
         if not remote:
             # Все соседи на этой же машине: их Ray уже слушает эти порты
@@ -121,8 +129,9 @@ class Forwarder:
         ports_open = 0
         try:
             for rank, peer_id in sorted(remote.items()):
+                where = [hosts[rank]] if rank in hosts else self._hosts()
                 for port in ports.get(rank, []):
-                    opened.extend(self._listen(port, peer_id))
+                    opened.extend(self._listen(port, peer_id, where))
                     ports_open += 1
         except Exception:
             for sock in opened:
@@ -132,11 +141,12 @@ class Forwarder:
             self._by_task.setdefault(task_id, []).extend(opened)
         self._ensure_loop()
         self._wake()
-        # Портов, а не сокетов: на каждый порт их два — локалхост и адрес
-        # машины. Считать сокеты значило бы удвоить число в логе на ровном месте.
+        # Портов, а не сокетов: у задачи постарше на каждый порт их два —
+        # локалхост и адрес машины. Считать сокеты значило бы удвоить число.
         logger.info("задача %s: слушаю %d чужих портов для рангов %s (на %s)",
                     task_id, ports_open, sorted(remote),
-                    ", ".join(self._hosts()))
+                    ", ".join(hosts.get(rank) or "+".join(self._hosts())
+                              for rank in sorted(remote)))
         return {"listening": ports_open, "ranks": sorted(remote)}
 
     def close(self, task_id: str) -> None:
@@ -158,8 +168,8 @@ class Forwarder:
     def listening(self) -> int:
         """Сколько ПОРТОВ слушаем, а не сокетов.
 
-        На каждый порт их теперь два — локалхост и адрес машины, — и счёт по
-        сокетам удваивал бы число на ровном месте.
+        У задачи постарше на порт приходится два сокета — локалхост и адрес
+        машины, — и счёт по сокетам удваивал бы число на ровном месте.
         """
         with self._lock:
             return len({self._ports[sock]
@@ -168,7 +178,8 @@ class Forwarder:
 
     # -------------------------------------------------------------- частное
     def _hosts(self) -> List[str]:
-        """Где слушать. Локалхост обязателен, адрес машины — если он есть.
+        """Где слушать, когда задача адреса не прислала. Локалхост обязателен,
+        адрес машины — если он есть.
 
         Не 0.0.0.0: это домашняя машина, и открывать порты соседа во все
         интерфейсы разом, включая публичный, мы не станем.
@@ -176,9 +187,10 @@ class Forwarder:
         own = own_address()
         return ["127.0.0.1", own] if own else ["127.0.0.1"]
 
-    def _listen(self, port: int, peer_id: str) -> List[socket.socket]:
+    def _listen(self, port: int, peer_id: str,
+                where: List[str]) -> List[socket.socket]:
         made: List[socket.socket] = []
-        for host in self._hosts():
+        for host in where:
             sock = socket.socket()
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:

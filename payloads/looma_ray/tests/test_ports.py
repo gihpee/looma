@@ -9,7 +9,8 @@ from __future__ import annotations
 import pytest
 
 from looma_ray.ports import (BASE, PortsRefused, crossing_for_group,
-                            head_address, ports_for)
+                            head_address, hosts_for_group, loopback_for,
+                            ports_for)
 
 
 def test_диапазоны_рангов_не_пересекаются():
@@ -26,7 +27,7 @@ def test_диапазоны_рангов_не_пересекаются():
 def test_ранг_вычисляет_чужие_порты_не_спрашивая():
     """Смысл всей схемы: адреса не ищут, их считают — одинаково на всех узлах."""
     assert ports_for(3).gcs == ports_for(3, base=BASE).gcs
-    assert head_address() == f"127.0.0.1:{ports_for(0).gcs}"
+    assert head_address() == f"{loopback_for(0)}:{ports_for(0).gcs}"
     # То, что посчитал ранг 5 про ранг 2, совпадает с тем, что ранг 2 знает о себе.
     assert ports_for(2).node_manager == ports_for(2).node_manager
 
@@ -120,3 +121,23 @@ def test_окно_не_залезает_в_эфемерный_диапазон(m
         monkeypatch.setenv("LOOMA_GROUP_ID", f"group-{i}")
         base = group_base(4)
         assert ports_for(3, base=base).worker_last < WINDOW_END, f"группа {i}"
+
+
+def test_у_каждого_ранга_свой_адрес_и_он_не_локалхост():
+    """Ради этого всё и затевалось. `127.0.0.1` Ray под узел не отдаёт — он
+    подменяет его адресом машины, и узел записывается в кластер под адресом
+    своей локальной сети, до которого с чужой машины не дойти. Со стенда:
+    192.168.2.84 у одного узла и 10.124.10.11 у другого, и голова после пяти
+    неудачных проверок объявляла узел мёртвым."""
+    адреса = [loopback_for(rank) for rank in range(16)]
+    assert len(set(адреса)) == len(адреса), "два ранга на одном адресе"
+    assert "127.0.0.1" not in адреса
+    assert all(a.startswith("127.") for a in адреса), "адрес обязан быть на петле"
+    # Считается, а не выдаётся: два узла приходят к одному ответу порознь.
+    assert loopback_for(3) == hosts_for_group(8)[3]
+
+
+def test_адреса_кончаются_понятным_отказом():
+    """Молча завернуть ранг на 127.0.1.0 нельзя: это уже не петля."""
+    with pytest.raises(PortsRefused):
+        loopback_for(1000)

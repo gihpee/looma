@@ -18,7 +18,8 @@ import threading
 import time
 from typing import List, Optional
 
-from looma_ray.ports import RankPorts, group_base, head_address, ports_for
+from looma_ray.ports import (RankPorts, group_base, head_address, loopback_for,
+                             ports_for)
 
 logger = logging.getLogger("looma_ray.cluster")
 
@@ -87,9 +88,13 @@ def wait_for_head(base: int = 0, stride: int = 0, *, timeout_s: float = 0.0) -> 
         "означает, что между ними нет проброса портов (docs/RAY.md)")
 
 
-def _common_flags(ports: RankPorts, gpus: Optional[int]) -> List[str]:
+def _common_flags(ports: RankPorts, gpus: Optional[int], rank: int) -> List[str]:
     flags = [
-        "--node-ip-address", "127.0.0.1",
+        # Свой адрес на петле, а не 127.0.0.1: последний Ray под узел не берёт,
+        # а подменяет адресом машины — и узел записывается в кластер под
+        # адресом своей локальной сети, до которого с чужой машины не дойти.
+        # См. ports.loopback_for.
+        "--node-ip-address", loopback_for(rank),
         "--node-manager-port", str(ports.node_manager),
         "--object-manager-port", str(ports.object_manager),
         "--runtime-env-agent-port", str(ports.runtime_env_agent),
@@ -149,11 +154,11 @@ def start_node(rank: int, size: int, *, gpus: Optional[int] = None,
     else:
         address = wait_for_head(base, stride)
         argv += ["--address", address]
-    argv += _common_flags(ports, gpus)
+    argv += _common_flags(ports, gpus, rank)
     if temp_dir:
         argv += ["--temp-dir", temp_dir]
 
-    if rank == 0 and _occupied(ports.gcs):
+    if rank == 0 and _occupied(loopback_for(0), ports.gcs):
         # Иначе Ray подключится к чужому кластеру и упадёт на несовпадении
         # имени сессии — сообщении, из которого причина не следует вовсе, и
         # искать её пойдут в своём коде, а не в списке процессов.
@@ -209,11 +214,15 @@ def client_port(size: int, *, base: int = 0, stride: int = 0) -> int:
     return ports_for(0, base=base, stride=stride).client_server
 
 
-def _occupied(port: int) -> bool:
-    """Слушает ли кто-то этот порт прямо сейчас."""
+def _occupied(host: str, port: int) -> bool:
+    """Слушает ли кто-то этот адрес прямо сейчас.
+
+    Адрес, а не только порт: у каждого ранга он свой, и занятость на чужом
+    ничего про наш не говорит.
+    """
     with socket.socket() as probe:
         probe.settimeout(1.0)
-        return probe.connect_ex(("127.0.0.1", port)) == 0
+        return probe.connect_ex((host, port)) == 0
 
 
 def _said(stdout, stderr) -> str:

@@ -164,3 +164,22 @@ def test_байтовый_вывод_тоже_доносится(monkeypatch):
     with pytest.raises(cluster.ClusterRefused) as отказ:
         cluster._run_start(["ray", "start"], rank=0, until=0.0, timeout_s=60)
     assert "GCS не встал" in str(отказ.value)
+
+
+def test_ранг_поднимается_на_своём_адресе_а_не_на_локалхосте():
+    """Ровно то, обо что кластер разваливался последним.
+
+    Ray записывает узел в кластер под адресом, который выбрал сам, и голова
+    потом по нему проверяет живость. `127.0.0.1` он под это не берёт — подменяет
+    адресом машины: со стенда голова записалась как 192.168.2.84, а второй узел
+    как 10.124.10.11, каждый адресом СВОЕЙ локальной сети. Пять неудачных
+    проверок — и узел объявлен мёртвым.
+    """
+    from looma_ray.cluster import _common_flags
+    from looma_ray.ports import ports_for
+
+    for rank in (0, 1, 2):
+        flags = _common_flags(ports_for(rank), None, rank)
+        адрес = flags[flags.index("--node-ip-address") + 1]
+        assert адрес != "127.0.0.1"
+        assert адрес == f"127.0.0.{2 + rank}"

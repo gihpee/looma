@@ -57,10 +57,16 @@ class Endpoint:
     порт, она открывает к нему локальное соединение и возит байты.
     """
 
-    def __init__(self, *, allow: Optional[Callable[[int], bool]] = None) -> None:
+    def __init__(self, *, allow: Optional[Callable[[int], bool]] = None,
+                 host_for: Optional[Callable[[int], str]] = None) -> None:
         # Что разрешено открывать. Без этого сосед мог бы дотянуться до любого
         # порта на этой машине, включая порты чужих задач и самого агента.
         self.allow = allow or (lambda _port: False)
+        # На каком адресе искать этот порт у себя. Обычно локалхост, но у
+        # кластера Ray каждый ранг живёт на своём адресе петли (см.
+        # tasks/forward.py), и там его слушают только по нему — соединение на
+        # 127.0.0.1 отвергается, а выглядит это как «сосед не отвечает».
+        self.host_for = host_for or (lambda _port: "127.0.0.1")
         self._conns: Dict[str, socket.socket] = {}
         self._lock = threading.Lock()
 
@@ -75,11 +81,12 @@ class Endpoint:
                 return {"ok": False, "error": "слишком много туннелей на этом узле"}
             if conn_id in self._conns:
                 return {"ok": False, "error": f"туннель {conn_id} уже есть"}
+        host = self.host_for(port) or "127.0.0.1"
         try:
-            sock = socket.create_connection(("127.0.0.1", port),
+            sock = socket.create_connection((host, port),
                                             timeout=CONNECT_TIMEOUT_S)
         except OSError as exc:
-            return {"ok": False, "error": f"127.0.0.1:{port} не отвечает: {exc}"}
+            return {"ok": False, "error": f"{host}:{port} не отвечает: {exc}"}
         sock.settimeout(None)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         with self._lock:

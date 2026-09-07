@@ -62,8 +62,14 @@ class TaskCommands:
         # оркестратор: разрешение выдаёт задача, а кто им воспользуется, её
         # не касается.
         self.allowed_ports: set = set()
+        # На каком адресе у нас самих искать разрешённый порт. Пусто для почти
+        # всех: там обычный локалхост. Заполняется, когда задача сама говорит,
+        # где её ждать, — так делает кластер Ray, у которого каждый ранг живёт
+        # на своём адресе петли.
+        self.inbound_host: Dict[int, str] = {}
         # Наша сторона канала по управляющему стриму.
-        self.tunnels = Endpoint(allow=lambda port: port in self.allowed_ports)
+        self.tunnels = Endpoint(allow=lambda port: port in self.allowed_ports,
+                                host_for=self.inbound_host.get)
         # Порты соседей, притворяющиеся местными. Нужны только тем задачам,
         # которые ходят по адресам, а не по рангам, — и они об этом просят.
         self.forward = Forwarder(stub_for=self._stub_for,
@@ -328,14 +334,23 @@ class TaskCommands:
             # приходят снаружи. Соседним рангам они не нужны, и поэтому в
             # раскладке для них места нет — а разрешение всё равно требуется.
             external = [int(p) for p in (body.get("external") or [])]
+            # Где каждый ранг ждут. Наш адрес отсюда нужен не меньше чужих:
+            # сосед стучится к нам в туннель, а на выходе из туннеля надо
+            # открыть соединение туда, где наш Ray на самом деле слушает.
+            hosts = {int(rank): str(host)
+                     for rank, host in (body.get("hosts") or {}).items()}
         except (TypeError, ValueError) as exc:
             raise TaskRefused(f"раскладка портов не читается: {exc}") from None
         if not ports and not external:
             raise TaskRefused("в раскладке нет ни одного порта")
+        own = hosts.get(group.rank, "")
         if external:
-            self._allow_inbound(external)
+            # На том же адресе, что и остальное наше: внешний вход — это порт
+            # нашего же Ray, и если тот слушает не локалхост, то и здесь тоже.
+            self._allow_inbound(external, own)
         if not ports:
             return {"listening": 0, "ranks": [], "external": len(external)}
+        self._allow_inbound(ports.get(group.rank, []), own)
 
         remote: Dict[int, str] = {}
         for rank, member in group.members.items():
@@ -349,15 +364,24 @@ class TaskCommands:
                     "без него соседи друг друга не найдут")
             remote[rank] = member.peer_id
         return self.forward.open(task_id, mine=ports.get(group.rank, []),
-                                 remote=remote, ports=ports)
+                                 remote=remote, ports=ports, hosts=hosts)
 
-    def _allow_inbound(self, ports: List[int]) -> None:
+    def _allow_inbound(self, ports: List[int], host: str = "") -> None:
         """Открыть НАШИ порты снаружи. По умолчанию закрыто всё: иначе через
-        любой из каналов достаётся любой порт этой машины."""
+        любой из каналов достаётся любой порт этой машины.
+
+        `host` — где эти порты искать у себя, если не на локалхосте. Пустая
+        строка ничего не стирает: тот же список приходит сюда дважды — от
+        задачи с адресом и от проброса без него, — и затирание превратило бы
+        порядок этих двух вызовов в поведение.
+        """
         self.allowed_ports.update(ports)
+        if host:
+            self.inbound_host.update({port: host for port in ports})
         endpoint = getattr(self._peer_node(), "tunnels", None)
         if endpoint is not None:
             endpoint.allow = lambda port: port in self.allowed_ports
+            endpoint.host_for = self.inbound_host.get
 
     def _addresses_of(self, peer_id: str) -> List[str]:
         """Что DHT знает о соседе. Только для сообщения об ошибке, поэтому

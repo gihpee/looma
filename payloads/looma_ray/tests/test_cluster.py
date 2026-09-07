@@ -253,7 +253,7 @@ def test_ранг_повторяет_попытку_пока_голова_не_�
         return Result(1 if len(attempts) < 3 else 0)
 
     monkeypatch.setattr(sp, "run", flaky)
-    cluster._run_start(["ray", "start"], rank=1, retries=4)
+    cluster._run_start(["ray", "start"], rank=1, until=time.time() + 5)
     assert len(attempts) == 3, "должен был повторять, пока голова не примет"
 
 
@@ -271,6 +271,6 @@ def test_голова_не_повторяет(monkeypatch):
 
     monkeypatch.setattr(sp, "run", lambda *_a, **_k: attempts.append(1) or Result())
     with pytest.raises(cluster.ClusterRefused, match="ранга 0"):
-        cluster._run_start(["ray", "start", "--head"], rank=0, retries=0)
+        cluster._run_start(["ray", "start", "--head"], rank=0, until=0.0)
     assert len(attempts) == 1
 
