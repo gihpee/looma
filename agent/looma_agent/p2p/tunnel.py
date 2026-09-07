@@ -136,23 +136,36 @@ class Endpoint:
             return len(self._conns)
 
 
-def pump(local: socket.socket, remote: "RemoteSide", *, closed: threading.Event) -> None:
+def pump(local: socket.socket, remote: "RemoteSide", *, closed: threading.Event) -> str:
     """Возить байты между локальным сокетом и соседом, пока кто-то не кончится.
 
     Два направления — два потока: чтение из сокета блокирующее, и совместить
     его с чтением из стрима в одном потоке нельзя, не поставив одно в
     зависимость от другого.
+
+    Возвращает причину, по которой всё кончилось. Раньше обе стороны глотали
+    любую ошибку молча — и оборванный туннель не оставлял ни следа. Со стенда:
+    кластер Ray собирался, через несколько минут разваливался, и в логах при
+    этом не было ничего, а состояние показывалось как «ok». Разбираться
+    приходилось по косвенным признакам, потому что прямых не существовало.
     """
+    reason: dict = {}
+
+    def why(text: str) -> None:
+        reason.setdefault("why", text)
+
     def outbound() -> None:
         try:
             while not closed.is_set():
                 piece = local.recv(CHUNK)
                 if not piece:
+                    why("местная сторона закрыла соединение")
                     break
                 if not remote.write(piece):
+                    why("сосед не принял данные")
                     break
-        except OSError:
-            pass
+        except OSError as exc:
+            why(f"чтение из местного сокета: {exc}")
         finally:
             closed.set()
 
@@ -162,8 +175,9 @@ def pump(local: socket.socket, remote: "RemoteSide", *, closed: threading.Event)
                 if closed.is_set():
                     break
                 local.sendall(piece)
-        except (OSError, Exception):
-            pass
+            why("поток от соседа кончился")
+        except Exception as exc:
+            why(f"поток от соседа: {exc}")
         finally:
             closed.set()
 
@@ -177,6 +191,7 @@ def pump(local: socket.socket, remote: "RemoteSide", *, closed: threading.Event)
         t.join()
     _shutdown(local)
     remote.close()
+    return reason.get("why", "обе стороны замолчали")
 
 
 class RemoteSide:

@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import selectors
 import socket
+import time
 import threading
 import uuid
 from typing import Callable, Dict, List, Optional
@@ -37,6 +38,31 @@ logger = logging.getLogger("looma_agent.tasks.forward")
 # Сколько соединений держать в очереди на каждом слушателе. Ray открывает их
 # пачками при сборке кластера.
 BACKLOG = 32
+
+
+def own_address() -> str:
+    """Адрес, который Ray считает адресом ЭТОЙ машины. Пусто — если его нет.
+
+    Тем же приёмом, каким его выбирает сам Ray: спросить у таблицы
+    маршрутизации, с какого адреса она пошла бы наружу. Пакет при этом не
+    уходит — UDP-connect локален.
+
+    Зачем это здесь. Ray переписывает loopback в `--address` на адрес машины и
+    флаг `--node-ip-address` этому не мешает — проверено на стенде: из
+    `--address 127.0.0.1:65000` получается `10.124.10.11:65000`. То есть
+    присоединяющийся ранг стучится НЕ туда, где мы его ждём. Спорить с этим
+    нечем, поэтому слушаем и там тоже: адрес переписан — попадает в тот же
+    туннель.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 53))
+        found = probe.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        probe.close()
+    return "" if not found or found.startswith("127.") else found
 
 
 class ForwardRefused(RuntimeError):
@@ -92,10 +118,12 @@ class Forwarder:
                 "друг друга не найдут")
 
         opened: List[socket.socket] = []
+        ports_open = 0
         try:
             for rank, peer_id in sorted(remote.items()):
                 for port in ports.get(rank, []):
-                    opened.append(self._listen(port, peer_id))
+                    opened.extend(self._listen(port, peer_id))
+                    ports_open += 1
         except Exception:
             for sock in opened:
                 self._drop(sock)
@@ -104,9 +132,12 @@ class Forwarder:
             self._by_task.setdefault(task_id, []).extend(opened)
         self._ensure_loop()
         self._wake()
-        logger.info("задача %s: слушаю %d чужих портов для рангов %s",
-                    task_id, len(opened), sorted(remote))
-        return {"listening": len(opened), "ranks": sorted(remote)}
+        # Портов, а не сокетов: на каждый порт их два — локалхост и адрес
+        # машины. Считать сокеты значило бы удвоить число в логе на ровном месте.
+        logger.info("задача %s: слушаю %d чужих портов для рангов %s (на %s)",
+                    task_id, ports_open, sorted(remote),
+                    ", ".join(self._hosts()))
+        return {"listening": ports_open, "ranks": sorted(remote)}
 
     def close(self, task_id: str) -> None:
         with self._lock:
@@ -125,27 +156,48 @@ class Forwarder:
 
     @property
     def listening(self) -> int:
+        """Сколько ПОРТОВ слушаем, а не сокетов.
+
+        На каждый порт их теперь два — локалхост и адрес машины, — и счёт по
+        сокетам удваивал бы число на ровном месте.
+        """
         with self._lock:
-            return sum(len(s) for s in self._by_task.values())
+            return len({self._ports[sock]
+                        for socks in self._by_task.values()
+                        for sock in socks if sock in self._ports})
 
     # -------------------------------------------------------------- частное
-    def _listen(self, port: int, peer_id: str) -> socket.socket:
-        sock = socket.socket()
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind(("127.0.0.1", port))
-        except OSError as exc:
-            sock.close()
-            raise ForwardRefused(
-                f"порт {port} на этом узле занят ({exc}); если ранги делят "
-                "машину, их диапазоны обязаны различаться") from None
-        sock.listen(BACKLOG)
-        sock.setblocking(False)
-        with self._lock:
-            self._targets[sock] = peer_id
-            self._ports[sock] = port
-        self._sel.register(sock, selectors.EVENT_READ)
-        return sock
+    def _hosts(self) -> List[str]:
+        """Где слушать. Локалхост обязателен, адрес машины — если он есть.
+
+        Не 0.0.0.0: это домашняя машина, и открывать порты соседа во все
+        интерфейсы разом, включая публичный, мы не станем.
+        """
+        own = own_address()
+        return ["127.0.0.1", own] if own else ["127.0.0.1"]
+
+    def _listen(self, port: int, peer_id: str) -> List[socket.socket]:
+        made: List[socket.socket] = []
+        for host in self._hosts():
+            sock = socket.socket()
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((host, port))
+            except OSError as exc:
+                sock.close()
+                for done in made:
+                    self._drop(done)
+                raise ForwardRefused(
+                    f"порт {port} на {host} занят ({exc}); если ранги делят "
+                    "машину, их диапазоны обязаны различаться") from None
+            sock.listen(BACKLOG)
+            sock.setblocking(False)
+            with self._lock:
+                self._targets[sock] = peer_id
+                self._ports[sock] = port
+            self._sel.register(sock, selectors.EVENT_READ)
+            made.append(sock)
+        return made
 
     def _drop(self, sock: socket.socket) -> None:
         try:
@@ -228,4 +280,12 @@ class Forwarder:
             except OSError:
                 pass
             return
-        pump(client, remote, closed=threading.Event())
+        # Долгие соединения — это несущие: связь raylet с головой держится
+        # именно ими. Их обрыв разваливает кластер, и знать о нём надо. Короткие
+        # Ray открывает и закрывает пачками, они в лог не идут.
+        started = time.monotonic()
+        why = pump(client, remote, closed=threading.Event())
+        lived = time.monotonic() - started
+        говорить = logger.info if lived >= 10 else logger.debug
+        говорить("туннель к %s:%d прожил %.0f с и закрылся: %s",
+                 peer_id[:12], port, lived, why)

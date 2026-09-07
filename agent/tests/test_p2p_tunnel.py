@@ -332,3 +332,104 @@ def _закрытый_сокет():
     один, другой = socket.socketpair()
     другой.close()
     return один
+
+
+def test_слушаем_и_на_адресе_машины(pair):
+    """Ray переписывает loopback в адрес машины — и стучится туда.
+
+    Проверено на стенде: из `--address 127.0.0.1:65000` он делает
+    `10.124.10.11:65000`, и флаг `--node-ip-address 127.0.0.1` этому не мешает.
+    Спорить с этим нечем, поэтому слушать надо на обоих адресах: иначе
+    присоединяющийся ранг стучится туда, где никого нет, и кластер не
+    собирается — молча, до самого таймаута.
+    """
+    import socket as sock_mod
+
+    from looma_agent.tasks.forward import Forwarder, own_address
+
+    свой = own_address()
+    if not свой:
+        pytest.skip("у машины нет адреса, кроме локалхоста")
+
+    a, peer_id, _echo = pair
+    порт = free_port()
+    forwarder = Forwarder(stub_for=a.stub_for)
+    try:
+        forwarder.open("t", mine=[], remote={1: peer_id}, ports={1: [порт]})
+        for адрес in ("127.0.0.1", свой):
+            проба = sock_mod.socket(); проба.settimeout(2)
+            код = проба.connect_ex((адрес, порт)); проба.close()
+            assert код == 0, f"на {адрес}:{порт} никто не слушает"
+    finally:
+        forwarder.close_all()
+
+
+def test_счёт_идёт_по_портам_а_не_сокетам(pair):
+    """На порт приходится два сокета; счёт по ним удваивал бы число."""
+    from looma_agent.tasks.forward import Forwarder
+
+    a, peer_id, _echo = pair
+    forwarder = Forwarder(stub_for=a.stub_for)
+    try:
+        forwarder.open("t", mine=[], remote={1: peer_id},
+                       ports={1: [free_port(), free_port()]})
+        assert forwarder.listening == 2
+    finally:
+        forwarder.close_all()
+
+
+def test_обрыв_туннеля_не_остаётся_без_следа(caplog, monkeypatch):
+    """Со стенда: кластер Ray собирался, через несколько минут разваливался, и
+    в логах при этом не было НИЧЕГО, а состояние показывалось как «ok».
+
+    Связь raylet с головой держится долгим соединением через туннель. Его обрыв
+    и есть развал кластера — значит он обязан быть событием, а не тишиной.
+    """
+    import logging
+
+    from looma_agent.tasks import forward as fwd
+
+    monkeypatch.setattr(fwd, "RemoteSide", lambda *a, **k: _Молчун())
+    # Долгое соединение: короткие Ray открывает пачками, их в лог не берут.
+    monkeypatch.setattr(fwd, "pump",
+                        lambda *a, **k: "поток от соседа: connection reset")
+    monkeypatch.setattr(fwd.time, "monotonic",
+                        _по_очереди([100.0, 400.0]))
+
+    вперёд = fwd.Forwarder(stub_for=lambda _p: object())
+    with caplog.at_level(logging.INFO):
+        вперёд._carry(_закрытый_сокет(), "12D3KooWDee41w6D", 22600)
+
+    сказано = caplog.text
+    assert "прожил 300 с" in сказано, "длительность обязана попасть в лог"
+    assert "connection reset" in сказано, "и причина тоже"
+
+
+class _Молчун:
+    def open(self): return None
+    def close(self): pass
+
+
+def _по_очереди(values):
+    остаток = list(values)
+    def часы():
+        return остаток.pop(0) if остаток else values[-1]
+    return часы
+
+
+def test_причина_обрыва_называется_словами():
+    """Пустая причина бесполезна: «оборвалось» и так видно по факту."""
+    import threading as th
+
+    from looma_agent.p2p.tunnel import pump
+
+    один, другой = socket.socketpair()
+
+    class Немой:
+        def write(self, _piece): return True
+        def read(self): return iter(())
+        def close(self): pass
+
+    другой.close()                      # местная сторона исчезла
+    why = pump(один, Немой(), closed=th.Event())
+    assert why and why != "обе стороны замолчали", f"невнятная причина: {why!r}"

@@ -96,7 +96,16 @@ function Cluster({ group, nodes, onStop, onForget }: {
   const ranks = health?.stages ?? group.ranks.map((r) => ({
     ...r, state: "?", error: "", seconds: 0, ready: false, stage: null,
   } as StageHealth));
-  const alive = ranks.filter((r) => r.ready).length;
+  // Узлы, которые ранги видят в кластере ПРЯМО СЕЙЧАС, а не отметка «когда-то
+  // собрался». Прежний счёт по `ready` был снимком момента сборки: флаг
+  // выставляется один раз и не снимается никогда, поэтому распавшийся кластер
+  // продолжал показываться целым. Со стенда: консоль рапортовала «2 из 2», а
+  // клиент видел один узел — и разошлись они на три часа.
+  const seen = ranks.map((r) => r.stage?.nodes ?? 0);
+  const alive = seen.length ? Math.max(...seen) : 0;
+  // Ранги, которые сами считают себя частью кластера, но видят разное:
+  // связь между ними развалилась после сборки, и это отдельная беда.
+  const split = ranks.length > 1 && new Set(seen).size > 1;
   const byId = new Map(nodes.map((n) => [n.node_id, n]));
   const head = ranks.find((r) => r.rank === 0);
   // Пара пойдёт через реле, если ни один из двоих не принимает входящие и
@@ -116,10 +125,11 @@ function Cluster({ group, nodes, onStop, onForget }: {
         </code>
         <span className="sub" style={{ margin: 0 }}>{ago(group.submitted_at)}</span>
         <span style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
-          <Badge tone={alive === ranks.length ? "ok" : "warn"}
-                 pulse={alive !== ranks.length}>
+          <Badge tone={alive === ranks.length ? "ok" : alive > 0 ? "bad" : "warn"}
+                 pulse={alive === 0}>
             {alive} из {ranks.length} в кластере
           </Badge>
+          {split && <Badge tone="bad">ранги видят разное</Badge>}
           {onForget
             ? <Button size="sm" kind="ghost" onClick={onForget}>убрать</Button>
             : <Button size="sm" kind="danger" onClick={onStop}>снять</Button>}
@@ -206,6 +216,7 @@ export function Ray() {
 
   const [picked, setPicked] = useState<string[]>([]);
   const [size, setSize] = useState("1");
+  const [gpus, setGpus] = useState("1");
   const [label, setLabel] = useState("");
   const [version, setVersion] = useState("");
   const [script, setScript] = useState("");
@@ -241,6 +252,9 @@ export function Ray() {
       // две машины — по рангу на каждой.
       node_ids: picked.flatMap((n) => Array(count).fill(n)),
       size: picked.length ? undefined : count,
+      // Без этого кластер собирался вовсе без карт: спросить было негде, и
+      // человек узнавал о процессорном кластере из пустого cluster_resources().
+      resources: { gpus: Math.max(0, Number(gpus) || 0) },
       script: script || undefined,
       label: label || undefined,
       ray_version: version || undefined,
@@ -312,6 +326,13 @@ export function Ray() {
               <input type="number" min={1}
                      max={picked.length ? 8 : Math.max(1, free.length)}
                      value={size} onChange={(e) => setSize(e.target.value)} />
+            </Field>
+            <Field label="карт на ранг"
+                   hint={Number(gpus) > 0
+                     ? "столько GPU получит каждый ранг"
+                     : "ноль — кластер соберётся, но считать будет на процессоре"}>
+              <input type="number" min={0} max={8} value={gpus}
+                     onChange={(e) => setGpus(e.target.value)} />
             </Field>
             <Field label="метка" hint="чтобы найти его потом">
               <input value={label} onChange={(e) => setLabel(e.target.value)}

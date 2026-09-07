@@ -1099,7 +1099,16 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         label = (raw.get("label") or "ray").strip()
         # Свой ранг задача узнаёт из окружения, которое ставит агент, поэтому
         # команда у всех одна. Отличается только нулевой: ему запускать код.
+        # Сколько карт получит каждый ранг. Ноль — процессорный кластер: он
+        # соберётся и будет считать, просто без GPU. Раньше это и получалось
+        # всегда, потому что спросить было негде, и человек узнавал об этом из
+        # пустого cluster_resources(), а не из формы.
+        per_gpu = int((raw.get("resources") or {}).get("gpus") or 0)
         command = ["python", "-m", "looma_ray.server", "--size", str(len(chosen))]
+        if per_gpu:
+            # Явно, а не полагаясь на самоопределение Ray по CUDA_VISIBLE_DEVICES:
+            # угаданное число и выданное — разные вещи, и расходятся они молча.
+            command += ["--gpus", str(per_gpu)]
         per_rank = [
             {"command": command + (["--script", entry] if rank == 0 and entry else [])}
             for rank in range(len(chosen))
