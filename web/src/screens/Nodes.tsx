@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { get } from "../lib/api";
 import { gb } from "../lib/format";
 import type { Connect, Node } from "../lib/types";
 import {
@@ -176,6 +177,8 @@ export function Nodes() {
             </div>
           </section>
 
+          <NodeLog nodeId={current.node_id} />
+
           <section>
             <h2>Канал к соседям</h2>
             <div className="card">
@@ -233,5 +236,49 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
       <span style={{ color: "var(--text-mute)", minWidth: 180, fontSize: 12.5 }}>{k}</span>
       <span style={{ flex: 1 }}>{v}</span>
     </div>
+  );
+}
+
+
+/** Хвост лога самого агента, забранный через оркестратор.
+
+ *  Раньше это было доступно только тому, у кого есть shell на этой машине —
+ *  а машина чужая. Всё, что агент знает про туннели, соседей и p2p, оператору
+ *  было не видно вовсе, и любая сетевая неполадка упиралась в «а что там на
+ *  другой стороне».
+ *
+ *  Не грузится сама: узел может быть не на связи, а лог нужен редко и по
+ *  запросу. Опрашивать его в фоне значило бы дёргать чужую машину постоянно.
+ */
+function NodeLog({ nodeId }: { nodeId: string }) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const load = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const body = await get<{ text: string }>(
+        `/admin/agents/${encodeURIComponent(nodeId)}/logs?tail=300`);
+      setText(body.text || "узел ответил, но сказать ему нечего");
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : String(exc));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section>
+      <h2>
+        Лог агента
+        <Button size="sm" kind="ghost" disabled={busy} onClick={load}>
+          {busy ? "берём…" : text ? "обновить" : "показать"}
+        </Button>
+      </h2>
+      {error && <ErrorLine error={error} />}
+      {text && <pre className="block tall">{text}</pre>}
+    </section>
   );
 }

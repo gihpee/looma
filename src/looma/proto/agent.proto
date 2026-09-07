@@ -203,6 +203,10 @@ message FetchLogs {
   string command_id = 1;
   string task_id = 2;
   uint32 tail_lines = 3;
+  // Лог САМОГО агента, а не задачи. Отдельным полем, а не пустым task_id:
+  // неявные соглашения такого рода читаются как ошибка ровно до того дня,
+  // когда кто-то пришлёт пустое имя по недосмотру и получит чужие строки.
+  bool agent = 4;
 }
 
 // Input travelling orchestrator -> agent, in pieces.

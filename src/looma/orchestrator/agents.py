@@ -594,6 +594,28 @@ class AgentHub:
         finally:
             self._pending_logs.pop(command_id, None)
 
+    async def agent_logs(self, node_id: str, *, tail_lines: int = 200) -> str:
+        """Хвост собственного лога агента на этом узле.
+
+        Отдельно от logs(): та ищет узел по задаче, а неполадки, ради которых
+        это писалось, случаются как раз тогда, когда задач нет или они уже
+        упали. Спрашивать надо про узел.
+        """
+        session = self.sessions.get(node_id)
+        if session is None:
+            raise AgentError(f"узел {node_id} сейчас не на связи")
+        command_id = f"agentlog-{node_id}-{uuid.uuid4().hex[:6]}"
+        waiter: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending_logs[command_id] = waiter
+        session.send(agent_pb2.ServerMessage(fetch_logs=agent_pb2.FetchLogs(
+            command_id=command_id, agent=True, tail_lines=tail_lines)))
+        try:
+            return await asyncio.wait_for(waiter, NODE_REPLY_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            raise AgentError(f"узел {node_id} не ответил вовремя") from None
+        finally:
+            self._pending_logs.pop(command_id, None)
+
     async def collect(self, task_id: str, name: str) -> bytes:
         record, session = self._locate(task_id)
         key = f"{task_id}/{name}"

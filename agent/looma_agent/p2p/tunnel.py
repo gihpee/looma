@@ -149,23 +149,27 @@ def pump(local: socket.socket, remote: "RemoteSide", *, closed: threading.Event)
     этом не было ничего, а состояние показывалось как «ok». Разбираться
     приходилось по косвенным признакам, потому что прямых не существовало.
     """
+    # По причине на каждое направление, а не одна на обе. Потоки кончаются
+    # почти одновременно, и запись только первого оставляла второй невидимым:
+    # «Ray закрыл соединение» и «сосед перестал отвечать» — разные диагнозы, а
+    # выглядели одинаково, потому что побеждал тот, кто успел первым.
     reason: dict = {}
 
-    def why(text: str) -> None:
-        reason.setdefault("why", text)
+    def why(side: str, text: str) -> None:
+        reason.setdefault(side, text)
 
     def outbound() -> None:
         try:
             while not closed.is_set():
                 piece = local.recv(CHUNK)
                 if not piece:
-                    why("местная сторона закрыла соединение")
+                    why("наружу", "местная сторона закрыла соединение")
                     break
                 if not remote.write(piece):
-                    why("сосед не принял данные")
+                    why("наружу", "сосед не принял данные")
                     break
         except OSError as exc:
-            why(f"чтение из местного сокета: {exc}")
+            why("наружу", f"чтение из местного сокета: {exc}")
         finally:
             closed.set()
 
@@ -181,11 +185,11 @@ def pump(local: socket.socket, remote: "RemoteSide", *, closed: threading.Event)
                     # означает, что местная сторона закрыла соединение, а не что
                     # сосед пропал. В одном обработчике подпись обвиняла не того,
                     # и по ней шли искать причину на другой машине.
-                    why(f"местная сторона закрыла соединение при записи: {exc}")
+                    why("внутрь", f"местная сторона закрыла соединение: {exc}")
                     return
-            why("поток от соседа кончился")
+            why("внутрь", "поток от соседа кончился")
         except Exception as exc:
-            why(f"поток от соседа: {exc}")
+            why("внутрь", f"поток от соседа: {exc}")
         finally:
             closed.set()
 
@@ -199,7 +203,11 @@ def pump(local: socket.socket, remote: "RemoteSide", *, closed: threading.Event)
         t.join()
     _shutdown(local)
     remote.close()
-    return reason.get("why", "обе стороны замолчали")
+    # Оба направления, а не одно: пара «наружу … / внутрь …» отвечает на
+    # вопрос, кто из двоих кончился первым и по своей ли воле.
+    return " | ".join(f"{side}: {reason[side]}"
+                      for side in ("наружу", "внутрь") if side in reason) \
+        or "обе стороны замолчали"
 
 
 class RemoteSide:

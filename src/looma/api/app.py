@@ -729,6 +729,19 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         except AgentError as exc:
             return _error(409, str(exc))
 
+    @app.get("/admin/agents/{node_id}/logs")
+    async def admin_agent_logs(node_id: str, tail: int = 200,
+                               x_looma_admin_token: str | None = Header(default=None)):
+        """Хвост лога самого агента. Всё, что он знает о туннелях, соседях и
+        p2p, — то есть ровно то, чего не видно ниоткуда, когда узел чужой."""
+        if agents is None:
+            return need_agents()
+        try:
+            return {"node_id": node_id,
+                    "text": await agents.agent_logs(node_id, tail_lines=tail)}
+        except AgentError as exc:
+            return _error(409, str(exc))
+
     @app.get("/admin/tasks/{task_id}/results/{name:path}")
     async def admin_task_result(task_id: str, name: str,
                                 x_looma_admin_token: str | None = Header(default=None)):

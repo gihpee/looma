@@ -42,16 +42,21 @@ from looma_agent.tasks.models import ModelCache
 from looma_agent.tasks.registry import TaskRegistry
 from looma_agent.update import Updater, mark_healthy
 from looma_agent.control.tasks import TaskCommands
+from looma_agent import recent
 from looma_agent.proto import agent_pb2
 
 logger = logging.getLogger("looma_agent")
 
 
 def _setup_logging() -> None:
+    формат = "%(asctime)s %(levelname)s %(name)s: %(message)s"
     logging.basicConfig(
         level=os.environ.get("LOOMA_LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=формат,
     )
+    # Рядом с выводом, а не вместо: `docker logs` на самой машине должен
+    # работать как раньше, а оператору нужен тот же текст издалека.
+    recent.install(logging.Formatter(формат))
 
 
 def hardware_message() -> agent_pb2.Hardware:

@@ -22,6 +22,7 @@ import queue
 import threading
 from typing import Callable, Dict, List, Optional
 
+from looma_agent import recent
 from looma_agent.proto import agent_pb2
 from looma_agent.tasks import channel as channel_mod
 from looma_agent.p2p.tunnel import Endpoint
@@ -151,8 +152,14 @@ class TaskCommands:
                          name=f"result-{command.task_id}", daemon=True).start()
 
     def fetch_logs(self, command: agent_pb2.FetchLogs) -> None:
-        task = self.registry.get(command.task_id)
-        text = task.logs(tail=command.tail_lines) if task else ""
+        if command.agent:
+            # Лог самого агента: то, что он знает про туннели, соседей и p2p.
+            # Раньше это было доступно только с shell на этой машине, а машина
+            # чужая — и половина разбирательств шла вслепую.
+            text = recent.BUFFER.tail(command.tail_lines or 200)
+        else:
+            task = self.registry.get(command.task_id)
+            text = task.logs(tail=command.tail_lines) if task else ""
         self.send(agent_pb2.AgentMessage(logs=agent_pb2.TaskLogs(
             command_id=command.command_id, task_id=command.task_id, text=text)))
 
