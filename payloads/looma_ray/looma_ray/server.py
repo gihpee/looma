@@ -213,6 +213,10 @@ def main(argv=None) -> int:
         STATE["phase"] = "ok"
         logger.info("ранг %d/%d в кластере, узлов %d, голова %s",
                     args.rank, args.size, STATE["nodes"], address)
+        # Адреса, под которыми узлы записаны в кластере. Именно по ним голова
+        # проверяет живость и раздаёт работу — и если там адрес чужой локальной
+        # сети, до узла никто не дотянется.
+        logger.info("узлы в кластере: %s", cluster.registered_addresses())
 
         if args.rank == 0 and args.script:
             code = run_script(args.script, address)

@@ -358,6 +358,32 @@ def alive_nodes(timeout_s: float = 30.0) -> int:
         return 0
 
 
+def registered_addresses() -> str:
+    """Под какими адресами узлы записаны в кластере — словами самого Ray.
+
+    Не то же, что мы передали флагом. Ray подменяет `127.0.0.1` на адрес
+    машины, и именно записанный адрес голова использует, когда проверяет
+    живость узла и когда раздаёт ему работу. Если он локальный для чужой сети,
+    голова стучится в пустоту: со стенда — пять неудачных проверок подряд, узел
+    помечен мёртвым, и ни одного следа о причине ни в одном логе.
+    """
+    if not _connect(30.0):
+        return "к Ray не подключиться"
+    try:
+        import ray
+
+        части = []
+        for node in ray.nodes():
+            части.append("{} {}:{} alive={}".format(
+                node.get("NodeID", "?")[:12],
+                node.get("NodeManagerAddress", "?"),
+                node.get("NodeManagerPort", "?"),
+                node.get("Alive")))
+        return "; ".join(части) or "узлов не видно"
+    except Exception as exc:
+        return f"спросить не вышло: {exc}"
+
+
 def stop_node() -> None:
     """Ничего не делать — и это осознанно.
 
