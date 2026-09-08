@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Питон в составе узла запускает код, который приезжает от клиента: ставит
+       колёса с нативными модулями, собирает окружения, грузит torch и mlx.
+       Ужесточённая среда исполнения без этих послаблений запрещает и загрузку
+       неподписанных библиотек, и генерацию исполняемой памяти, которой
+       пользуется любой JIT. Без них узел не запустит ни одной настоящей
+       задачи, а выглядеть это будет как падение чужого кода. -->
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+</dict>
+</plist>

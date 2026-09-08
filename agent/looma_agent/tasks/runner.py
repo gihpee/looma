@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Sequence
 
 from looma_agent.tasks.directory import TaskDirectory
 from looma_agent.tasks.env.base import NO_ENVIRONMENT, Environment
+from looma_agent.tasks import sandbox
 from looma_agent.tasks.limits import Isolation, MemoryWatchdog, can_chroot, preexec
 from looma_agent.tasks.spec import TaskRefused, TaskSpec
 from looma_agent.transport.files import ResultFile
@@ -47,6 +48,8 @@ class Task:
         group=None,
         channel_url: str = "",
         models=None,
+        envs_root=None,
+        agent_root=None,
     ) -> None:
         self.spec = spec
         self.directory = directory
@@ -56,6 +59,11 @@ class Task:
         # Общий на узел кэш весов. Может отсутствовать: без него задача просто
         # скачает их себе, как раньше.
         self.models = models
+        # Что песочница обязана открыть задаче и что обязана закрыть. Пусто —
+        # значит запирать нечем и не от чего (так в тестах); тогда задача
+        # остаётся при отдельном пользователе, как было.
+        self.envs_root = envs_root
+        self.agent_root = agent_root
         # Where this task sits in a job spread over several nodes, and how to
         # reach the agent. Both absent for an ordinary one-node task.
         self.group = group
@@ -92,7 +100,7 @@ class Task:
         self.state = RUNNING
         rootfs = str(self.directory.rootfs) if self.directory.rootfs else None
         self._proc = subprocess.Popen(
-            list(self.spec.command),
+            self._argv(),
             # Inside an image the working directory is set after the chroot,
             # so passing it here would name a path that stops existing.
             cwd=None if rootfs else str(self.directory.work),
@@ -116,6 +124,33 @@ class Task:
         self._drained.start()
         threading.Thread(target=self._watch, name=f"task-{self.spec.task_id}",
                          daemon=True).start()
+
+    def _argv(self) -> List[str]:
+        """Команда задачи, при необходимости запертая в песочницу.
+
+        На Linux этого слоя нет и не нужно: задача уже внутри контейнера с
+        собственной файловой системой. На macOS контейнера не будет никогда —
+        Metal в него не пробрасывается, — и границу по файлам приходится
+        ставить здесь, поверх отдельного пользователя.
+        """
+        command = list(self.spec.command)
+        if self.agent_root is None or self.envs_root is None:
+            return command
+        # Кэш весов может отсутствовать — тогда задача качает их себе, и
+        # открывать ей нечего. Связывать с ним всю песочницу было бы ошибкой:
+        # узел без кэша остался бы вообще без границы по файлам.
+        models_dir = self.models.root if self.models is not None else self.directory.root
+        profile = sandbox.prepare(
+            task_dir=self.directory.root, scratch=self.directory.scratch,
+            envs_dir=self.envs_root, models_dir=models_dir,
+            agent_root=self.agent_root)
+        if profile is None:
+            return command
+        logger.info("task %s: песочница %s", self.spec.task_id, profile.name)
+        return sandbox.wrap(
+            command, profile_path=profile, task_dir=self.directory.root,
+            scratch=self.directory.scratch, envs_dir=self.envs_root,
+            models_dir=models_dir, agent_root=self.agent_root)
 
     def _model_cache_env(self) -> dict:
         """Куда задаче складывать скачанные веса.

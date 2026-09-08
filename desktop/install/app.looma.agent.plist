@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>app.looma.agent</string>
+
+  <!-- Демон, а не агент сессии: узел должен работать и когда в систему никто
+       не вошёл. Панель — отдельное приложение, и её отсутствие ничего не
+       останавливает. -->
+  <!-- Пусковой слой, а не агент напрямую. Разница не в удобстве: обновление
+       по сети ставит именно он — скачанное агентом распаковывается и
+       проверяется по подписи в том слое, который обновление заменить не может.
+       Запущенный напрямую агент честно пишет «ставить обновление некому» и
+       остаётся на своей версии навсегда.
+
+       Питон свой, из пакета: системный на macOS — 3.9, а агенту нужен 3.10+.
+       Полагаться на то, что стоит у провайдера, значит не установиться у
+       большинства из них.
+
+       Модулем, а не готовым скриптом looma-launcher: pip вписывает в такие
+       скрипты путь к питону ТОЙ машины, где шла установка, а ставим мы во
+       временный каталог сборки. На чужой машине этого пути нет, и запуск
+       кончается «No such file or directory» про каталог, которого человек
+       никогда не видел. `-P` не пускает в sys.path текущий каталог. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Library/Application Support/Looma/runtime/bin/python3</string>
+    <string>-P</string>
+    <string>-m</string>
+    <string>looma_launcher.main</string>
+  </array>
+
+  <key>RunAtLoad</key><true/>
+  <!-- Перезапускать всегда. Агент выходит нарочно только ради обновления или
+       по кнопке из панели оператора, и в обоих случаях подняться заново — это
+       и есть нужное поведение. -->
+  <key>KeepAlive</key><true/>
+  <!-- Не чаще раза в десять секунд: иначе сломанная установка крутится в
+       цикле и заваливает журнал системы. -->
+  <key>ThrottleInterval</key><integer>10</integer>
+
+  <key>WorkingDirectory</key>
+  <string>/</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LOOMA_ROOT</key><string>/Library/Application Support/Looma</string>
+    <!-- Строки лога уходят в файл без буфера: иначе последнее, что сказал
+         упавший агент, теряется вместе с ним. -->
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+
+  <key>StandardOutPath</key><string>/Library/Logs/Looma/agent.log</string>
+  <key>StandardErrorPath</key><string>/Library/Logs/Looma/agent.log</string>
+
+  <!-- Хватает и на кластер Ray, и на его воркеров: у Ray их десятки, у каждого
+       свои дескрипторы, и предел по умолчанию они выбирают заметно раньше, чем
+       машина кончается. -->
+  <key>SoftResourceLimits</key>
+  <dict><key>NumberOfFiles</key><integer>65536</integer></dict>
+</dict>
+</plist>

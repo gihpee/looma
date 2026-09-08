@@ -1,0 +1,50 @@
+#!/bin/bash
+# Что происходит на машине провайдера после распаковки пакета.
+#
+# Пакет кладёт файлы; всё, что нельзя выразить файлами, делается здесь:
+# служебный пользователь, права и регистрация демона.
+#
+# Ошибка тут означает установку, которая выглядит успешной и не работает,
+# поэтому `set -e`: пусть лучше установщик скажет, что не смог.
+
+set -euo pipefail
+
+ROOT="/Library/Application Support/Looma"
+LOGS="/Library/Logs/Looma"
+PLIST="/Library/LaunchDaemons/app.looma.agent.plist"
+TASK_USER="_looma"
+
+# ------------------------------------------------- служебный пользователь
+# Под ним идут чужие задачи. Без него агент откажется их запускать, и это
+# правильно: задача под пользователем агента читает ключ узла и каталоги
+# соседних задач.
+if ! dscl . -read "/Users/$TASK_USER" >/dev/null 2>&1; then
+    NEXT_UID=300
+    while dscl . -list /Users UniqueID | awk '{print $2}' | grep -qx "$NEXT_UID"; do
+        NEXT_UID=$((NEXT_UID + 1))
+    done
+    dscl . -create "/Users/$TASK_USER"
+    dscl . -create "/Users/$TASK_USER" UserShell /usr/bin/false
+    dscl . -create "/Users/$TASK_USER" RealName "Looma tasks"
+    dscl . -create "/Users/$TASK_USER" UniqueID "$NEXT_UID"
+    dscl . -create "/Users/$TASK_USER" PrimaryGroupID 20
+    dscl . -create "/Users/$TASK_USER" NFSHomeDirectory /var/empty
+    dscl . -create "/Users/$TASK_USER" IsHidden 1
+fi
+
+# ------------------------------------------------------------- каталоги
+mkdir -p "$ROOT/tasks" "$ROOT/envs" "$ROOT/models" "$LOGS"
+# Группа admin на корне — чтобы панель, работающая под обычным пользователем,
+# могла положить сюда ключ. Всё, что внутри, остаётся за root.
+chown root:admin "$ROOT" "$LOGS"
+chmod 775 "$ROOT" "$LOGS"
+chown -R root:wheel "$ROOT/tasks" "$ROOT/envs" "$ROOT/models" "$ROOT/runtime"
+chmod 755 "$ROOT/tasks" "$ROOT/envs" "$ROOT/models"
+
+# --------------------------------------------------------------- демон
+# bootout перед bootstrap: при переустановке иначе падает на «уже загружен», и
+# человек получает ошибку там, где ничего не сломано.
+launchctl bootout system "$PLIST" 2>/dev/null || true
+launchctl bootstrap system "$PLIST"
+
+exit 0

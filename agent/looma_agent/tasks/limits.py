@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import pwd
 import resource
 import threading
@@ -80,6 +81,17 @@ class Isolation:
         return self.uid is not None
 
 
+def default_task_user() -> str:
+    """Под кем здесь принято запускать служебное.
+
+    На macOS у служебных пользователей имена с подчёркиванием (`_www`,
+    `_spotlight`), и системные инструменты полагаются на это соглашение.
+    Заводить там `looma-task` значит завести пользователя, который выглядит
+    человеком и попадает в окно входа в систему.
+    """
+    return "_looma" if platform.system() == "Darwin" else "looma-task"
+
+
 def resolve_isolation() -> Isolation:
     """Work out which user tasks will run as, or refuse to run any.
 
@@ -87,8 +99,13 @@ def resolve_isolation() -> Isolation:
     it as the agent's user means it can read the join key, the other tasks'
     directories and the agent's own files. That is not a marketplace anyone
     sane joins, so the default is to refuse rather than to quietly do it.
+
+    На macOS контейнера вокруг этого нет, и отдельный пользователь остаётся
+    единственной границей уровня прав. Вторую половину — границу по файловой
+    системе — добавляет песочница (tasks/sandbox.py); порознь ни одна из них
+    не заменяет контейнер, вместе дают то же самое.
     """
-    name = os.environ.get("LOOMA_TASK_USER", "looma-task").strip()
+    name = os.environ.get("LOOMA_TASK_USER", default_task_user()).strip()
     if os.geteuid() != 0:
         return _cannot_drop(
             f"this agent does not run as root, so it cannot start tasks as {name!r}"

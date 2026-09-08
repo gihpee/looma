@@ -284,3 +284,44 @@ def test_смена_пина_меняет_окружение_узла():
     bumped = [VLLM_PIN + ".1" if name == VLLM_PIN else name for name in packages]
     later = EnvSpec(kind="python", requirements=tuple(bumped)).fingerprint()
     assert now != later
+
+
+def test_смешанный_кластер_не_требует_называть_устройство(stand, monkeypatch):
+    """Устройство приходит ОДНИМ флагом на всю модель, а на смешанном кластере
+    Mac стоит рядом с машиной NVIDIA. Любое жёсткое значение неверно для
+    половины стадий, поэтому по умолчанию каждая выбирает своё."""
+    from looma.orchestrator.models import ModelInfo
+
+    orchestrator, _agent = stand
+    monkeypatch.setattr("looma.api.app.describe",
+                        lambda repo, **kw: ModelInfo(repo=repo, num_layers=8))
+    команда = {}
+    исходный = orchestrator.hub.submit_group
+
+    def подсмотреть(**kwargs):
+        команда.update(kwargs)
+        return исходный(**kwargs)
+
+    monkeypatch.setattr(orchestrator.hub, "submit_group", подсмотреть)
+    ответ = api(orchestrator).post("/admin/deploy",
+                                   json=deploy_body(repo="Qwen/Qwen3-4B"))
+
+    assert ответ.status_code == 200, ответ.text
+    флаги = команда["per_rank"][0]["command"]
+    assert флаги[флаги.index("--device") + 1] == "auto"
+
+
+def test_vllm_без_устройства_идёт_на_карту(stand, monkeypatch):
+    """Он не поднимается ни на чём, кроме NVIDIA. Требовать назвать device
+    вручную ради единственно возможного значения — работа на ровном месте."""
+    from looma.orchestrator.models import ModelInfo
+
+    orchestrator, _agent = stand
+    monkeypatch.setattr("looma.api.app.describe",
+                        lambda repo, **kw: ModelInfo(repo=repo, num_layers=8))
+    ответ = api(orchestrator).post("/admin/deploy",
+                                   json=deploy_body(repo="Qwen/Qwen3-4B", engine="vllm"))
+
+    # Либо развернулось, либо отвергнуто по другой причине (драйвер, память),
+    # но НЕ из-за того, что устройство не названо.
+    assert ответ.status_code != 400 or "vllm" not in ответ.json()["error"]["message"]

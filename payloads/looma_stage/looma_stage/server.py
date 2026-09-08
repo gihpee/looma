@@ -877,7 +877,11 @@ def main(argv=None) -> None:
     parser.add_argument("--pipeline-id", default=os.environ.get("LOOMA_GROUP_ID", ""))
     parser.add_argument("--port", type=int,
                         default=int(os.environ.get("LOOMA_SERVE_PORT", "0")))
-    parser.add_argument("--device", default=os.environ.get("LOOMA_SHARD_DEVICE", "cpu"))
+    # "auto": стадия выбирает ускоритель этой машины сама — cuda, Metal или
+    # процессор. Прежний "cpu" был безопасным умолчанием для тестов, но на
+    # смешанном конвейере устройство приходит одним флагом на всю модель, и
+    # угадать его снаружи нельзя (loader.best_device).
+    parser.add_argument("--device", default=os.environ.get("LOOMA_SHARD_DEVICE", "auto"))
     parser.add_argument("--dtype", default=os.environ.get("LOOMA_SHARD_DTYPE", "float32"))
     parser.add_argument(
         "--stage-timeout-s", type=float, default=float(os.environ.get("LOOMA_STAGE_TIMEOUT_S", "120"))

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +29,31 @@ class Config:
         return self.root / "tasks"
 
     @property
+    def key_file(self) -> Path:
+        """Где лежит ключ, если его не передали при запуске.
+
+        Нужен там, где агента ставят раньше, чем вводят ключ, — то есть на
+        пользовательской машине: установщик кладёт демон и уходит, а ключ
+        провайдер вставляет потом, в панели.
+        """
+        return self.root / "join.key"
+
+    @property
+    def pause_file(self) -> Path:
+        """Пока он есть, узел работы не берёт.
+
+        Файлом, а не выключением демона: остановить системный демон может
+        только root, а панель работает под обычным пользователем, и просить у
+        него пароль каждый раз — плохая цена за кнопку, которую нажимают
+        ежедневно. Каталог узла открыт группе admin на запись, чего для файла
+        достаточно.
+
+        Заодно решение переживает перезагрузку: владелец, отключивший машину на
+        ночь, не обнаружит её утром снова в работе.
+        """
+        return self.root / "paused"
+
+    @property
     def envs_dir(self) -> Path:
         return self.root / "envs"
 
@@ -36,6 +62,18 @@ class Config:
         """Веса. Рядом с окружениями и по той же причине: и то и другое
         переживает задачу, которая их запросила."""
         return self.root / "models"
+
+
+def default_root() -> str:
+    """Где узел держит свои данные.
+
+    На macOS — там, где системе положено держать данные служебных демонов, а не
+    в /var/lib: последний на Mac существует, но принадлежит совсем другому
+    порядку вещей, и всё, что смотрит на систему со стороны — Time Machine,
+    антивирусы, сама Apple, — ищет наши файлы не там.
+    """
+    return ("/Library/Application Support/Looma" if platform.system() == "Darwin"
+            else "/var/lib/looma")
 
 
 def parse_args(argv=None) -> Config:
@@ -54,7 +92,7 @@ def parse_args(argv=None) -> Config:
     parser.add_argument("--region", default=os.environ.get("LOOMA_REGION", "default"))
     parser.add_argument(
         "--root",
-        default=os.environ.get("LOOMA_ROOT", "/var/lib/looma"),
+        default=os.environ.get("LOOMA_ROOT", default_root()),
         help="where task directories and the environment cache live",
     )
     parser.add_argument("--heartbeat-interval", type=float, default=5.0)

@@ -1006,10 +1006,21 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         # до обращения к нему. Опечатка в имени движка не стоит похода в сеть,
         # и оператор узнаёт о ней сразу, а не через задержку, которая выглядит
         # как работа.
-        device = (raw.get("device") or "cuda").strip()
+        # "auto" по умолчанию, а не "cuda": устройство приходит ОДНИМ флагом на
+        # всю модель, и на смешанном кластере — Mac рядом с машиной NVIDIA —
+        # любое жёсткое значение неверно для половины стадий. С "auto" каждая
+        # выбирает своё, а активации между Metal и CUDA ходят через один и тот
+        # же провод байт-в-байт (looma_stage/wire.py).
+        device = (raw.get("device") or "auto").strip()
         engine = (raw.get("engine") or "torch").strip().lower()
         if engine not in ("torch", "vllm"):
             return _error(400, f"движок {engine!r} не поддерживается: torch или vllm")
+        # Для vLLM «auto» может означать только одно: он не поднимается ни на
+        # чём, кроме карты NVIDIA. Отвергать его тут значило бы требовать от
+        # оператора писать device вручную ради значения, которое единственно
+        # возможно.
+        if engine == "vllm" and device == "auto":
+            device = "cuda"
         if engine == "vllm" and device != "cuda":
             # vLLM без карты не поднимается вовсе, и узнавать об этом из его
             # внутренней ошибки на узле — худший способ.

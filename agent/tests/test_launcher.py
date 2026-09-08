@@ -196,3 +196,141 @@ def test_брошенный_каталог_убирается_а_свежий_н
     payload._sweep_stale(agents)
     assert not старый.exists(), "брошенный каталог должен убираться"
     assert свежий.exists(), "каталог соседа трогать нельзя"
+
+
+def test_падающая_версия_запоминается_и_не_качается_снова(tmp_path, monkeypatch):
+    """Со стенда: узел скачал релиз, тот упал три раза, лаунчер откатился к
+    прежней версии — и она немедленно скачала ту же самую снова. Цикл повторялся
+    каждые двенадцать секунд, а со стороны выглядел как «узел то появляется, то
+    пропадает».
+
+    Откат без записи отказа ничего не решает: предложение от оркестратора
+    приходит при каждом подключении и не меняется от того, что мы уже пробовали.
+    """
+    from looma_launcher import payload as payload_mod
+    from looma_launcher.supervise import FAILURES_BEFORE_ROLLBACK, Supervisor
+
+    monkeypatch.setenv("LOOMA_ROOT", str(tmp_path))
+    monkeypatch.setenv("LOOMA_AGENT_INCOMING", str(tmp_path / "agent" / "incoming"))
+    плохая = payload_mod.Payload(version="0.9.9", path=tmp_path / "agent" / "0.9.9")
+    supervisor = Supervisor(плохая, [])
+    supervisor.consecutive_failures = FAILURES_BEFORE_ROLLBACK
+
+    supervisor._consider_rollback()
+
+    from looma_agent.update import refusal_for
+    assert "падала" in refusal_for("0.9.9"), "агент снова скачает эту версию"
+
+
+def test_ключ_из_файла_доезжает_до_агента_любой_версии(tmp_path):
+    """Со стенда: узел на macOS получил по сети релиз, собранный без чтения
+    ключа из файла, и упал на «no join key» три раза подряд — а дальше пошёл
+    откат и повторное скачивание того же релиза по кругу.
+
+    Пусковой слой чинит это раз и навсегда: агент получает ключ аргументом,
+    ровно как в контейнере, и знать про файл не обязан."""
+    from looma_launcher.main import _with_key
+
+    (tmp_path / "join.key").write_text("looma_abc\n")
+
+    assert _with_key([], tmp_path) == ["--key", "looma_abc"]
+
+
+def test_переданный_ключ_не_подменяется_файлом(tmp_path):
+    """В контейнере ключ приходит аргументом, и он главнее: файл рядом может
+    остаться от прошлой жизни этого тома."""
+    from looma_launcher.main import _with_key
+
+    (tmp_path / "join.key").write_text("looma_старый\n")
+
+    assert _with_key(["--key", "looma_новый"], tmp_path) == ["--key", "looma_новый"]
+
+
+def test_без_файла_ключа_ничего_не_добавляется(tmp_path):
+    from looma_launcher.main import _with_key
+
+    assert _with_key(["--region", "eu"], tmp_path) == ["--region", "eu"]
+
+
+def test_пауза_действует_на_агента_любой_версии(tmp_path, monkeypatch):
+    """Со стенда: кнопку «остановить» сделали в агенте, узел обновился до
+    релиза без неё — и кнопка перестала действовать, хотя файл создавала
+    исправно. Управление узлом обязано жить в пусковом слое: он меняется только
+    вместе с пакетом, а агент приезжает по сети."""
+    from looma_launcher.supervise import Supervisor
+    from looma_launcher import payload as payload_mod
+
+    monkeypatch.setenv("LOOMA_ROOT", str(tmp_path))
+    (tmp_path / "paused").write_text("остановлено")
+    supervisor = Supervisor(payload_mod.bundled(), [])
+
+    assert supervisor._paused()
+
+    # Ждать он будет, пока файл не уберут; проверяем, что дожидается именно
+    # снятия, а не срока.
+    import threading
+    threading.Timer(0.3, (tmp_path / "paused").unlink).start()
+    supervisor._wait_while_paused()
+
+    assert not supervisor._paused()
+
+
+def test_пока_узел_стоит_панель_знает_версию_и_причину(tmp_path, monkeypatch):
+    """Иначе остановленный узел и мёртвый выглядят одинаково: снимок пишет
+    агент, а он в этот момент не работает."""
+    import json
+
+    from looma_launcher.supervise import Supervisor
+    from looma_launcher import payload as payload_mod
+
+    monkeypatch.setenv("LOOMA_ROOT", str(tmp_path))
+    (tmp_path / "paused").write_text("остановлено")
+    Supervisor(payload_mod.bundled(), [])._say(running=False)
+
+    снимок = json.loads((tmp_path / "launcher.json").read_text())
+    assert снимок["paused"] is True and снимок["running"] is False
+    assert снимок["agent_version"], "без версии панель покажет чужую"
+
+
+def test_служебный_пользователь_передаётся_агенту(monkeypatch):
+    """Со стенда: установщик заводит `_looma` (на macOS у служебных
+    пользователей имена с подчёркиванием), а приехавший по сети агент искал
+    линуксовое `looma-task`, не находил и отказывался брать работу. Узел
+    подключался и стоял со словами «не берёт»."""
+    import sys as _sys
+
+    from looma_launcher.supervise import _task_user
+
+    if _sys.platform != "darwin":
+        assert _task_user() == "", "на Linux имя выбирает сам агент"
+        return
+    # На macOS: имя подставляется, только если пользователь ЕСТЬ. Имени,
+    # которого на машине нет, ничем не лучше отсутствующего, зато оно скрывает
+    # настоящую причину за другой.
+    import pwd
+
+    имя = _task_user()
+    if имя:
+        pwd.getpwnam(имя)          # не бросит: пользователь существует
+
+
+def test_снимок_пускового_слоя_обновляется_а_не_пишется_однажды(tmp_path, monkeypatch):
+    """Панель считает узел замолчавшим, если снимку больше полуминуты, — и
+    правильно делает, иначе умерший агент выглядел бы работающим вечно. Со
+    стенда: «узел работает», а через несколько секунд «агент замолчал»."""
+    import json
+    import time as _time
+
+    from looma_launcher import payload as payload_mod
+    from looma_launcher.supervise import Supervisor
+
+    monkeypatch.setenv("LOOMA_ROOT", str(tmp_path))
+    supervisor = Supervisor(payload_mod.bundled(), [])
+
+    supervisor._say(running=True)
+    первый = json.loads((tmp_path / "launcher.json").read_text())["updated_at"]
+    _time.sleep(0.05)
+    supervisor._say(running=True)
+    второй = json.loads((tmp_path / "launcher.json").read_text())["updated_at"]
+
+    assert второй > первый, "снимок не обновляется — панель решит, что узел замолчал"

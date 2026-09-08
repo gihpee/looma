@@ -57,6 +57,26 @@ AGENT_CWD = "/"
 AGENT_FLAGS = ["-P"]
 
 
+def _task_user() -> str:
+    """Служебный пользователь этой системы, если он заведён.
+
+    Проверяем существование, а не подставляем вслепую: имя, которого на машине
+    нет, ничем не лучше отсутствующего, зато скрывает настоящую причину за
+    другой.
+    """
+    if sys.platform != "darwin":
+        return ""
+    import pwd
+
+    for name in ("_looma", "looma-task"):
+        try:
+            pwd.getpwnam(name)
+            return name
+        except KeyError:
+            continue
+    return ""
+
+
 def _why_updates_are_off() -> str:
     """Пусто, если обновления возможны."""
     from looma_launcher.signature import public_key_bytes
@@ -80,7 +100,11 @@ class Supervisor:
         self._install_signal_handlers()
         logger.info("launcher starting agent %s", self.payload.describe())
         while not self._stop.is_set():
+            self._wait_while_paused()
+            if self._stop.is_set():
+                return 0
             self._apply_downloaded()
+            self._say(running=True)
             started = time.monotonic()
             code = self._run_once()
             if self._stop.is_set():
@@ -102,6 +126,50 @@ class Supervisor:
                 logger.warning("agent exited with code %s after %.0fs", code, lived)
             time.sleep(RESTART_DELAY_S)
         return 0
+
+    # ------------------------------------------------ разрешение владельца
+    def _paused(self) -> bool:
+        return (payload_mod.root() / "paused").exists()
+
+    def _wait_while_paused(self) -> None:
+        """Стоять, пока владелец машины не разрешит снова.
+
+        ЗДЕСЬ, а не в агенте, и это главное. Агент приезжает по сети, и его
+        версия — та, что выпущена, а не та, что лежит в пакете. Со стенда:
+        кнопка «остановить» появилась в коде агента, узел обновился до релиза
+        без неё, и кнопка перестала действовать — при том, что файл она
+        создавала исправно. Пусковой слой меняется только вместе с пакетом,
+        поэтому управление узлом должно быть в нём.
+        """
+        if not self._paused():
+            return
+        logger.info("узел остановлен владельцем; жду, пока уберут файл paused")
+        while self._paused() and not self._stop.is_set():
+            self._say(running=False)
+            self._stop.wait(2.0)
+        if not self._stop.is_set():
+            logger.info("узел снова разрешён")
+
+    def _say(self, *, running: bool) -> None:
+        """Рассказать панели, что происходит, — от лица пускового слоя.
+
+        Агент пишет свой снимок сам, но только тот, что умеет; вышедший или
+        остановленный не пишет ничего, и панель показывала бы последний
+        снимок вечно. Здесь пишется то, что пусковой слой знает точно:
+        какая версия запущена и работает ли она вообще.
+        """
+        try:
+            from looma_agent import status
+        except ImportError:
+            return
+        status.write(payload_mod.root(), {
+            "launcher": True,
+            "running": running,
+            "paused": self._paused(),
+            "agent_version": self.payload.version,
+            "why": "" if running else "узел остановлен владельцем машины",
+            "updated_at": time.time(),
+        }, name="launcher.json")
 
     # ---------------------------------------------------------------- updates
     def _apply_downloaded(self) -> None:
@@ -136,6 +204,19 @@ class Supervisor:
             return
         logger.error("agent %s never registered and failed %d times; going back",
                      self.payload.version, self.consecutive_failures)
+        # Запомнить отказ ОБЯЗАТЕЛЬНО, иначе откат ничего не решает: агент
+        # прошлой версии поднимется, получит от оркестратора то же предложение,
+        # скачает ту же версию, она снова упадёт три раза — и так по кругу,
+        # вечно. Со стенда: цикл повторялся каждые двенадцать секунд, и со
+        # стороны это выглядело как «узел то появляется, то пропадает».
+        #
+        # Раньше отказ записывался только при неудачной УСТАНОВКЕ — битый архив,
+        # чужая подпись. Версия, которая ставится и падает, не попадала в него
+        # никогда.
+        payload_mod.remember_refusal(
+            self.payload.version,
+            f"версия падала {self.consecutive_failures} раз подряд и ни разу "
+            "не подключилась к оркестратору")
         restored = payload_mod.roll_back()
         if restored is not None:
             self.payload = restored
@@ -153,6 +234,15 @@ class Supervisor:
         # fast exits is what triggers a rollback.
         env["LOOMA_AGENT_HEALTH_FILE"] = str(payload_mod.health_marker(self.payload.version))
         env["LOOMA_AGENT_INCOMING"] = str(payload_mod.incoming_dir())
+        # Под кем агенту запускать чужие задачи. Имя зависит от системы: на
+        # macOS у служебных пользователей оно начинается с подчёркивания, и
+        # установщик заводит `_looma`. Агент, приехавший по сети, может знать
+        # только линуксовое `looma-task` — тогда он не найдёт пользователя и
+        # откажется брать работу совсем. Со стенда именно так и вышло: узел
+        # подключился и стоял со словами «не берёт».
+        task_user = _task_user()
+        if task_user and "LOOMA_TASK_USER" not in env:
+            env["LOOMA_TASK_USER"] = task_user
         # Образ без ключа не примет ни одного релиза. Сказать об этом агенту
         # сейчас — значит увидеть причину в панели; промолчать — значит
         # смотреть, как узел качает, сливается и перезапускается по кругу.
@@ -162,10 +252,47 @@ class Supervisor:
         argv = [sys.executable, *AGENT_FLAGS, "-m", "looma_agent.main", *self.agent_args]
         self._proc = subprocess.Popen(argv, env=env, cwd=AGENT_CWD,
                                       start_new_session=True)
+        # Пока агент работает, следим за файлом paused: остановить его надо и
+        # на ходу, а не только перед запуском. Иначе кнопка действует лишь
+        # после того, как агент почему-то сам перезапустится.
+        watcher = threading.Thread(target=self._stop_when_paused,
+                                   name="pause-watch", daemon=True)
+        watcher.start()
+        heartbeat = threading.Thread(target=self._keep_saying,
+                                     name="launcher-status", daemon=True)
+        heartbeat.start()
         try:
             return self._proc.wait()
         except KeyboardInterrupt:
             return None
+
+    def _keep_saying(self) -> None:
+        """Обновлять снимок, пока агент жив.
+
+        Разово его мало: панель считает узел замолчавшим, если снимку больше
+        полуминуты, — и правильно делает, иначе умерший агент выглядел бы
+        работающим вечно. Со стенда: панель показывала «узел работает», а через
+        несколько секунд «агент замолчал», потому что снимок был написан один
+        раз при запуске.
+        """
+        proc = self._proc
+        while proc is not None and proc.poll() is None and not self._stop.is_set():
+            self._say(running=True)
+            time.sleep(5.0)
+
+    def _stop_when_paused(self) -> None:
+        proc = self._proc
+        while proc is not None and proc.poll() is None:
+            if self._stop.is_set():
+                return
+            if self._paused():
+                logger.info("владелец остановил узел; снимаю агента")
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                return
+            time.sleep(2.0)
 
     # ------------------------------------------------------------- shutdown
     def _install_signal_handlers(self) -> None:

@@ -196,7 +196,12 @@ class TaskRegistry:
                     self.isolation, limit_bytes=spec.resources.disk_bytes))
             task = Task(spec, directory, self.isolation, devices, environment,
                         group=group, channel_url=self.channel_url,
-                        models=self.models)
+                        models=self.models,
+                        # Что песочнице открыть и что закрыть. Корень агента —
+                        # родитель каталога задач: там же лежат кэши, payload
+                        # агента и задачи соседей.
+                        envs_root=self.environments.root,
+                        agent_root=self.root.parent)
             task.start()
         except TaskRefused:
             self._undo(spec.task_id, directory, environment)

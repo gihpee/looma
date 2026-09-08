@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import signal
 import sys
+import tempfile
+from pathlib import Path
 import time
 
 import pytest
@@ -523,7 +525,9 @@ def test_потомки_не_переживают_задачу_вышедшую_
 
         RuntimeError: can't start new thread
     """
-    marker = tmp_path / "потомок-жив"
+    # НЕ в tmp_path: там корень агента, а туда задаче писать нельзя — на macOS
+    # это ловит песочница, и тест падал бы по причине, к делу не относящейся.
+    marker = Path(tempfile.mkdtemp()) / "потомок-жив"
     program = (
         "import subprocess, sys, os;"
         f"subprocess.Popen([sys.executable, '-c', "

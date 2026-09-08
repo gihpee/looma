@@ -1,0 +1,76 @@
+/* Только то, чего нет в общем оформлении: окно панели маленькое и без
+   привычной страницы вокруг. Цвета и шрифты берутся оттуда. */
+.panel {
+  display: flex; flex-direction: column; gap: 14px;
+  padding: 16px 18px 18px;
+  min-height: 100vh; background: var(--bg); color: var(--text);
+}
+/* Заголовок окна скрыт (так задумано — окно маленькое), поэтому тянуть окно
+   можно только за то, что мы сами объявим. Шапка и есть эта область; курсор
+   меняем, чтобы это было видно, а выделение текста отключаем — иначе первый
+   же протяг выделяет надпись вместо переноса окна. */
+.panel header {
+  display: flex; align-items: center; gap: 8px; font-size: 14px;
+  cursor: default; user-select: none; -webkit-user-select: none;
+}
+/* Верхняя полоса окна: до неё дотягиваются мышью чаще, чем до самой надписи,
+   и на неё же приходятся системные кнопки.
+
+   Именно `data-tauri-drag-region` на элементе, а не `-webkit-app-region: drag`
+   в стилях: второе — свойство Electron, в WKWebView его нет вовсе. Стояло оно
+   здесь, и полоса не только не тянула окно, но и перехватывала нажатия у
+   шапки.
+
+   У шапки значение "deep": голый атрибут тянет окно, только когда клик пришёлся
+   ровно на сам элемент (в drag.js Tauri — `el === composedPath[0]`), а в шапке
+   лежат кружок состояния и надпись, по ним и попадает мышь. Полоса пустая, ей
+   хватает и голого. */
+/* Перетаскивается вся панель — атрибутом на корне, — кроме секций с данными и
+   журналом, где текст выделяют мышью. Полоса в сорок пикселей требовала
+   целиться, а попадать в собственное окно человек должен не глядя. */
+.dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.dot.on { background: var(--ok, #4ade80); box-shadow: 0 0 8px var(--ok, #4ade80); }
+.dot.off { background: var(--text-mute); }
+.panel section { display: flex; flex-direction: column; }
+.panel .row {
+  display: flex; justify-content: space-between; gap: 12px;
+  padding: 7px 0; border-bottom: 1px solid var(--line-soft); font-size: 12.5px;
+}
+.panel .row > span:first-child { color: var(--text-mute); }
+.panel .note { font-size: 12px; color: var(--text-dim); margin: 0; }
+.panel .bad { color: var(--bad); }
+.panel footer { margin-top: auto; }
+
+/* Первый экран. Кнопка и поле берут вид из общего оформления, здесь только
+   раскладка: окно узкое, и на нём одна задача. */
+.panel textarea { resize: none; }
+.panel button {
+  padding: 9px 14px; border-radius: var(--r1); cursor: pointer;
+  border: 1px solid var(--accent); background: var(--accent);
+  color: #04141a; font: inherit; font-size: 13px; font-weight: 600;
+}
+.panel button:disabled { opacity: .45; cursor: default; }
+
+/* Остановленный узел — не поломка: жёлтый, а не красный. Красный здесь
+   означал бы, что что-то случилось, тогда как случилось ровно то, что
+   попросил владелец. */
+.dot.paused { background: var(--warn, #fbbf24); }
+.panel button.wide { width: 100%; margin-top: auto; }
+.panel button.wide + .note { margin-top: -6px; text-align: center; }
+
+
+/* Журнал: место, куда смотрят, когда узел не поднимается. Моноширинный и с
+   переносом — строки там длинные, а горизонтальная прокрутка в окне шириной в
+   ладонь не работает. */
+.panel .log {
+  max-height: 260px; overflow: auto; margin: 0;
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.45;
+  white-space: pre-wrap; word-break: break-word;
+  background: var(--bg-soft, rgba(255,255,255,.04));
+  border: 1px solid var(--line-soft); border-radius: var(--r1); padding: 8px;
+  user-select: text; -webkit-user-select: text;
+}
+.panel button.link {
+  background: none; border: none; color: var(--text-dim);
+  padding: 0; font-size: 12px; text-align: left; text-decoration: underline;
+}

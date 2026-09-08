@@ -1,0 +1,21 @@
+[package]
+name = "looma-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Панель провайдера Looma"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Приложение живёт в меню-баре и большую часть времени ничего не делает.
+# Размер здесь важнее скорости сборки: провайдер скачивает его вручную.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

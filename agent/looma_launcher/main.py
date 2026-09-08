@@ -33,13 +33,37 @@ def _prepare_root() -> Path:
     return root
 
 
+def _with_key(args: list, root: Path) -> list:
+    """Подставить ключ узла из файла, если его не передали при запуске.
+
+    Ключ читает и сам агент — но только тот, что умеет. Со стенда: узел,
+    поставленный пакетом на macOS, получил по сети релиз, собранный без этой
+    возможности, и упал на «no join key» три раза подряд; дальше пошёл откат,
+    повторное скачивание того же релиза и круг длиной в двенадцать секунд.
+
+    Здесь, в пусковом слое, это чинится раз и навсегда: агент любой версии
+    получает ключ аргументом, как в контейнере, и о файле знать не обязан.
+    """
+    if any(arg == "--key" or arg.startswith("--key=") for arg in args):
+        return args
+    key_file = root / "join.key"
+    try:
+        key = key_file.read_text().strip()
+    except OSError:
+        return args
+    if not key:
+        return args
+    logging.getLogger("looma_launcher").info("ключ узла взят из %s", key_file)
+    return [*args, "--key", key]
+
+
 def main(argv=None) -> int:
     _setup_logging()
     logger = logging.getLogger("looma_launcher")
     root = _prepare_root()
     chosen = payload_mod.resolve()
     logger.info("data root %s, agent payload %s", root, chosen.describe())
-    args = list(sys.argv[1:] if argv is None else argv)
+    args = _with_key(list(sys.argv[1:] if argv is None else argv), root)
     return Supervisor(chosen, args).run_forever()
 
 

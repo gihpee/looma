@@ -132,6 +132,46 @@ def needed_weight_files(
     return sorted(files)
 
 
+def _allow_mps_fallback() -> None:
+    """Разрешить редким операциям уходить на процессор.
+
+    Metal покрывает не весь torch: у трансформеров время от времени попадается
+    операция, которой в нём нет, и без этой переменной стадия падает посреди
+    загрузки с сообщением про неподдерживаемый оператор. Медленный проход по
+    одной операции лучше, чем остановленная модель, — а какой именно операции
+    не хватило, torch скажет предупреждением.
+
+    Не перекрываем, если оператор задал своё: он мог выключить это нарочно,
+    чтобы увидеть, где именно упирается.
+    """
+    if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") is None:
+        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+        logger.info("операции, которых нет в Metal, пойдут на процессор "
+                    "(PYTORCH_ENABLE_MPS_FALLBACK=1)")
+
+
+def best_device() -> str:
+    """Чем считать на ЭТОЙ машине. Порядок — по скорости, а не по популярности.
+
+    Metal здесь не «запасной вариант»: на Apple Silicon это единственный
+    ускоритель, и без него узел считает процессором, то есть в десятки раз
+    медленнее при полностью свободной карте.
+    """
+    import torch
+
+    try:
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    try:
+        if torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def resolve_devices(device: str) -> list:
     """Every card this stage may use, in order.
 
@@ -140,6 +180,12 @@ def resolve_devices(device: str) -> list:
     exactly that card, which is how an operator splits a machine between two
     workers, and how a test asks for one device on a multi-card box.
 
+    "auto" — каждая стадия решает за себя, и без этого смешанный конвейер
+    невозможен в принципе: устройство приходит одним флагом на всю модель, а
+    Mac и машина с NVIDIA стоят в ней рядом. Со стенда: активации между Metal и
+    CUDA ходят байт-в-байт через тот же провод (wire.py), так что мешать их
+    можно — мешало только то, что обеим стадиям называли одно устройство.
+
     LOOMA_SHARD_DEVICES overrides both, as a comma-separated list.
     """
     import torch
@@ -147,6 +193,10 @@ def resolve_devices(device: str) -> list:
     override = os.environ.get("LOOMA_SHARD_DEVICES", "").strip()
     if override:
         return [torch.device(d.strip()) for d in override.split(",") if d.strip()]
+    if device in ("", "auto"):
+        device = best_device()
+    if device == "mps":
+        _allow_mps_fallback()
     if device != "cuda":
         return [torch.device(device)]
     try:
@@ -236,6 +286,12 @@ class ShardModel:
         # stage was not pinned to one of them.
         self.devices = resolve_devices(spec.device)
         self.device = self.devices[0]
+        # Вслух: со «auto» устройство выбирает сама стадия, и на смешанном
+        # конвейере оно у соседей разное. Молчаливый выбор означал бы, что
+        # «модель считается втрое медленнее» и «одна стадия ушла на процессор»
+        # выглядят одинаково.
+        logger.info("стадия считает на %s (просили %r)",
+                    ", ".join(str(d) for d in self.devices), spec.device)
         self.num_layers = spec.end_layer - spec.start_layer
         # Which card each of this stage's layers lives on. Filled at build.
         self.layer_devices: List = []

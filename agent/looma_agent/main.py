@@ -24,6 +24,8 @@ import threading
 import time
 
 from looma_agent import __version__
+from dataclasses import replace
+
 from looma_agent.config import Config, parse_args
 from looma_agent.control.client import ControlClient
 from looma_agent.control.handlers import CommandHandlers
@@ -34,6 +36,7 @@ from looma_agent.hwinfo import (
     free_vram_bytes,
 )
 from looma_agent.identity import BadJoinKey, default_node_id, parse_join_key
+from looma_agent import status
 from looma_agent.p2p.layer import PeerLayer
 from looma_agent.tasks.env import EnvironmentCache
 from looma_agent.tasks.env.cache import BUILDERS as ENVIRONMENT_KINDS
@@ -279,9 +282,37 @@ class Agent:
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(self.config.heartbeat_interval_s):
+            if self.config.pause_file.exists():
+                # Уходим тем же путём, что и при обновлении: задачи сливаются,
+                # выход помечен плановым. Пусковой слой поднимет нас заново, и
+                # при старте мы увидим тот же файл и будем ждать. Отдельного
+                # состояния «работаю, но сплю» тут не нужно — оно было бы
+                # четвёртым способом ничего не делать.
+                self.updater.step_aside("остановлен владельцем машины")
+                return
             self._refresh_vram()
+            self._save_status()
             if self.client.registered:
                 self.client.send(self._telemetry())
+
+    def _save_status(self) -> None:
+        """Снимок для панели провайдера — рядом с ударом сердца, а не отдельным
+        потоком: показывать надо ровно то, что в эту минуту уходит наверх."""
+        snapshot = self.tasks.snapshot()
+        status.write(self.config.root, {
+            "running": True,
+            "node_id": self.node_id,
+            "agent_version": __version__,
+            "device": self.hardware.device,
+            "gpu_name": self.hardware.gpu_name,
+            "gpus_total": self.hardware.num_gpus,
+            "tasks_running": snapshot["running"],
+            "accepts_tasks": not self.tasks.unusable,
+            "refusal": self.tasks.unusable or "",
+            # По нему панель понимает, что агент замолчал. Без него последний
+            # снимок жил бы вечно и показывал работающий узел, которого нет.
+            "updated_at": time.time(),
+        })
 
     def _refresh_vram(self) -> None:
         """Пересчитать свободную VRAM: снимок при старте устареет за минуту.
@@ -333,11 +364,63 @@ class Agent:
         self.client.stop()
 
 
+# Сколько ждать ключ, прежде чем сдаться. Не бесконечно: демон, который стоит
+# молча и никогда не выходит, выглядит работающим, и launchd о нём ничего не
+# скажет. Час — это время, за которое человек успевает дойти до панели
+# оператора, скопировать ключ и вернуться, но не время, за которое забывают.
+KEY_WAIT_S = float(os.environ.get("LOOMA_KEY_WAIT_S", "3600"))
+
+
+def _wait_while_paused(config: Config, poll_s: float = 2.0) -> None:
+    """Стоять, пока владелец машины не разрешит снова.
+
+    Здесь, до всего остального: подключаться к оркестратору, чтобы тут же
+    отключиться, — значит показывать узел в списке живых и не давать ему
+    работы. Снаружи это неотличимо от поломки.
+    """
+    if not config.pause_file.exists():
+        return
+    logger.info("узел остановлен владельцем; жду, пока уберут %s", config.pause_file)
+    while config.pause_file.exists():
+        status.write(config.root, {
+            "running": False, "paused": True,
+            "why": "узел остановлен владельцем машины",
+            "updated_at": time.time(),
+        })
+        time.sleep(poll_s)
+    logger.info("узел снова разрешён")
+
+
+def _with_key_from_file(config: Config, wait_s: float = KEY_WAIT_S) -> Config:
+    """Дождаться ключа, который провайдер введёт в панели.
+
+    На пользовательской машине установщик кладёт демон и уходит; ключ вводится
+    потом. Выйти сразу значило бы, что launchd поднимет нас снова через десять
+    секунд, снова без ключа, — и так до вечера, засоряя журнал системы
+    сообщениями, из которых ничего не следует.
+    """
+    if config.key_file.exists():
+        return replace(config, join_key=config.key_file.read_text().strip())
+    logger.info("ключа нет; жду до %.0f мин, пока он появится в %s",
+                wait_s / 60, config.key_file)
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if config.key_file.exists():
+            logger.info("ключ появился")
+            return replace(config, join_key=config.key_file.read_text().strip())
+        time.sleep(2.0)
+    return config
+
+
 def main(argv=None) -> int:
     _setup_logging()
     config = parse_args(argv)
+    _wait_while_paused(config)
     if not config.join_key:
-        logger.error("no join key: pass --key looma_... (get one from the admin page)")
+        config = _with_key_from_file(config)
+    if not config.join_key:
+        logger.error("no join key: pass --key looma_... (get one from the admin page), "
+                     "or put it in %s", config.key_file)
         return 2
     try:
         agent = Agent(config)
