@@ -127,7 +127,8 @@ class Agent:
             stop=self.stop,
         )
         self.handlers = CommandHandlers(tasks=self.commands, telemetry=self._telemetry,
-                                        on_release=lambda r: self.updater.on_release(r))
+                                        on_release=lambda r: self.updater.on_release(r),
+                                        on_node_command=self._node_command)
 
     def _on_registered(self, ack: agent_pb2.RegisterAck) -> None:
         """The ack carries the one address this node needs to reach every other.
@@ -179,6 +180,64 @@ class Agent:
             environment_kinds=sorted(["none", *ENVIRONMENT_KINDS]),
         )
 
+    # -------------------------------------------------------- команды узлу
+    def _node_command(self, command: agent_pb2.NodeCommand) -> None:
+        """Что оператор попросил сделать с самим узлом.
+
+        На своей нити: детект железа ходит к nvidia-smi, а перезапуск сливает
+        задачи минутами. Держать этим управляющий стрим нельзя — узел, который
+        перестал читать команды, снаружи неотличим от мёртвого.
+        """
+        threading.Thread(target=self._do_node_command, args=(command,),
+                         name="node-command", daemon=True).start()
+
+    def _do_node_command(self, command: agent_pb2.NodeCommand) -> None:
+        action = (command.action or "").strip()
+        if action == "restart":
+            # Ответ ДО слива задач, а не после: слив длится до десяти минут, и
+            # оператор всё это время не знал бы даже, дошла ли команда. Уехать
+            # он успевает: остановка кладёт своё «закрываемся» в ТУ ЖЕ очередь,
+            # а отправитель выгребает её по порядку.
+            self._answer(command, True, "")
+            self.updater.step_aside("перезапуск по команде оператора")
+            return
+        if action == "rescan":
+            self._answer(command, *self._rescan())
+            return
+        # Узел старее оркестратора: молча принять незнакомое действие значит
+        # оставить оператора с кнопкой, которая ничего не делает и об этом не
+        # говорит.
+        self._answer(command, False,
+                     f"этот агент не знает действия {action!r}; нужна версия новее")
+
+    def _answer(self, command: agent_pb2.NodeCommand, ok: bool, why: str) -> None:
+        if not ok:
+            logger.warning("отказ на %s: %s", command.action, why)
+        self.client.send(agent_pb2.AgentMessage(ack=agent_pb2.Ack(
+            command_id=command.command_id, ok=ok, error=why)))
+
+    def _rescan(self) -> tuple:
+        """Перечитать железо, не останавливая ничего.
+
+        Ради этого всё и делалось: детект идёт один раз, в конструкторе, и
+        живёт до конца процесса. Карта, вернувшаяся после того, как её хозяин
+        пересобрал драйвер, не появлялась нигде — а единственным способом
+        перезапустить агента на ЧУЖОЙ машине была выкатка релиза.
+        """
+        fresh = hardware_message()
+        refusal = self.tasks.recount_devices(fresh.num_gpus)
+        if refusal:
+            return False, refusal
+        было = f"{self.hardware.device} x{self.hardware.num_gpus}"
+        self.hardware = fresh
+        logger.info("железо перечитано по команде: было %s, стало %s x%d (%s)",
+                    было, fresh.device, fresh.num_gpus, fresh.detection_source)
+        # Сразу, а не со следующим ударом сердца: оператор нажал кнопку и
+        # смотрит на экран именно теперь.
+        if self.client.registered:
+            self.client.send(self._telemetry())
+        return True, ""
+
     def _telemetry(self) -> agent_pb2.AgentMessage:
         snapshot = self.tasks.snapshot()
         # Про том, где лежат кэши и задачи, а не про машину: вытеснение считает
@@ -195,6 +254,10 @@ class Agent:
             model_cache_bytes=(snapshot["models"] or {}).get("bytes", 0),
             disk_free_bytes=free_disk,
             disk_total_bytes=total_disk,
+            # Железо в каждой телеметрии, а не только при регистрации: иначе
+            # панель показывает машину такой, какой она была в минуту
+            # подключения, и пересчёт по кнопке некуда было бы доложить.
+            hardware=self.hardware,
             # Идёт ли трафик к соседям напрямую. Без этого «конвейер тормозит»
             # и «каждая активация едет длинным путём» выглядят одинаково.
             peer=self.peers.status(),

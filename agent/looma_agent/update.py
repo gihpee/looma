@@ -118,6 +118,28 @@ class Updater:
         # Ноль, пока выход не запланирован ради обновления.
         self.exit_code = 0
 
+    def step_aside(self, reason: str, *, drain_s: float = DRAIN_TIMEOUT_S) -> None:
+        """Выйти нарочно, чтобы пусковой слой поднял агента заново.
+
+        Здесь, а не у того, кто просит: код выхода и остановка живут в этом
+        объекте, и растащить их значит однажды выйти обычным нулём. Пусковой
+        слой отличает плановый уход от падения ТОЛЬКО по коду: обычный выход
+        раньше тридцатой секунды идёт в счёт неудач, а три неудачи подряд у
+        версии без отметки о здоровье означают откат. Перезапуск по кнопке
+        оператора — не повод откатывать исправную версию.
+
+        Задачи сливаются, а не убиваются: они чья-то работа, за электричество
+        уже заплачено. Не успевшие — переживут перезапуск как обрыв, о чём
+        сказано в логе, потому что молча оборванная задача выглядит как
+        поломка узла.
+        """
+        logger.info("agent is stepping aside: %s", reason)
+        if not self._drain(drain_s):
+            logger.warning("tasks were still running after %.0fs; restarting anyway",
+                           drain_s)
+        self.exit_code = UPDATE_EXIT_CODE
+        self._stop()
+
     def status(self):
         from looma_agent.proto import agent_pb2
 
@@ -181,11 +203,7 @@ class Updater:
             self.state = "downloaded"
             logger.info("agent %s is downloaded; draining before restart",
                         release.version)
-            if not self._drain(DRAIN_TIMEOUT_S):
-                logger.warning("tasks were still running after %.0fs; restarting anyway",
-                               DRAIN_TIMEOUT_S)
-            self.exit_code = UPDATE_EXIT_CODE
-            self._stop()
+            self.step_aside(f"обновление до {release.version}")
         finally:
             self._working.release()
 

@@ -27,7 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from looma_ray import cluster
-from looma_ray.ports import crossing_for_group, hosts_for_group, ports_for
+from looma_ray.ports import (client_env, crossing_for_group, hosts_for_group,
+                             ports_for)
 
 logging.basicConfig(level=os.environ.get("LOOMA_LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -213,6 +214,12 @@ def main(argv=None) -> int:
         if bridged.get("listening"):
             logger.info("агент слушает %d чужих портов для рангов %s",
                         bridged["listening"], bridged.get("ranks"))
+        # ДО `ray start`, а не после: воркеры Ray наследуют окружение своего
+        # raylet, и это единственный момент, когда мы можем в него что-то
+        # положить. После запуска актора его окружение уже не наше.
+        os.environ.update(client_env(args.size, args.rank))
+        logger.info("соседи для клиентского кода: %s; свои порты %s",
+                    os.environ["LOOMA_RANK_ADDRS"], os.environ["LOOMA_PORTS"])
         STATE["phase"] = "поднимаю ray"
         address = cluster.start_node(args.rank, args.size, gpus=args.gpus,
                                      temp_dir=temp_dir)

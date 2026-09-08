@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { get } from "../lib/api";
+import { get, send } from "../lib/api";
 import { gb } from "../lib/format";
 import type { Connect, Node } from "../lib/types";
 import {
@@ -167,7 +167,11 @@ export function Nodes() {
           </div>
 
           <section>
-            <h2>Железо</h2>
+            {/* Агент определяет железо один раз, при запуске. Карта, ушедшая
+                вместе с драйвером или вернувшаяся с ним, до этой кнопки не
+                появлялась в панели никак. */}
+            <NodeAction title="Железо" nodeId={current.node_id} action="rescan"
+                        idle="перечитать" busy="читаем…" done="перечитано" />
             <div className="card">
               <Row k="карта" v={current.gpu_name || "—"} />
               <Row k="устройство" v={current.device} />
@@ -209,7 +213,13 @@ export function Nodes() {
           </section>
 
           <section>
-            <h2>Агент</h2>
+            {/* Раньше перезапустить агента на чужой машине можно было только
+                выкаткой релиза — обновлением всего парка ради одного узла. */}
+            <NodeAction title="Агент" nodeId={current.node_id} action="restart"
+                        idle="перезапустить" busy="уходит…" done="перезапускается"
+                        confirm={"Перезапустить агента на этом узле?\n\n" +
+                                 "Работающие задачи будут слиты, узел пропадёт " +
+                                 "со связи на несколько секунд."} />
             <div className="card">
               <Row k="версия" v={<code>{current.agent_version}</code>} />
               <Row k="обновление" v={current.update_state || "молчит"} />
@@ -236,6 +246,49 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
       <span style={{ color: "var(--text-mute)", minWidth: 180, fontSize: 12.5 }}>{k}</span>
       <span style={{ flex: 1 }}>{v}</span>
     </div>
+  );
+}
+
+
+/** Кнопка, которая просит сам УЗЕЛ что-то сделать.
+
+ *  Отказ показывается рядом с кнопкой, а не проглатывается: у обеих команд он
+ *  осмысленный — «на узле работают задачи» у одной, «агент не знает такого
+ *  действия» у другой (узел старее оркестратора). Молча погасшая кнопка
+ *  читается как сломанная.
+ */
+function NodeAction({ title, nodeId, action, idle, busy, done, confirm }: {
+  title: string; nodeId: string; action: string;
+  idle: string; busy: string; done: string; confirm?: string;
+}) {
+  const [state, setState] = useState<"idle" | "busy" | "done">("idle");
+  const [error, setError] = useState("");
+
+  const run = async () => {
+    if (confirm && !window.confirm(confirm)) return;
+    setState("busy");
+    setError("");
+    try {
+      await send(`/admin/agents/${encodeURIComponent(nodeId)}/${action}`, "POST");
+      setState("done");
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : String(exc));
+      setState("idle");
+    }
+  };
+
+  // Заголовок целиком, а не одна кнопка: h2 здесь — flex-строка, и карточка
+  // с ошибкой внутри неё встала бы в ряд с текстом и растянула его.
+  return (
+    <>
+      <h2>
+        {title}
+        <Button size="sm" kind="ghost" disabled={state === "busy"} onClick={run}>
+          {state === "busy" ? busy : state === "done" ? done : idle}
+        </Button>
+      </h2>
+      {error && <ErrorLine error={error} />}
+    </>
   );
 }
 

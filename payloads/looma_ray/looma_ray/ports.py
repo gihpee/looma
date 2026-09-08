@@ -48,6 +48,14 @@ STRIDE = int(os.environ.get("LOOMA_RAY_PORT_STRIDE", "100"))
 # Сколько в конце диапазона отдать рабочим процессам Ray. Их много и они
 # приходят-уходят, поэтому им отдаётся всё, что осталось после служебных.
 FIRST_WORKER_OFFSET = 10
+# Сколько портов в конце окна отдать КЛИЕНТУ, а не Ray.
+#
+# Ради того, чтобы межузловой обмен был не только у Ray. Всё, что клиент
+# захочет связать между узлами сам — TCPStore у torch, свой сокет, gRPC, —
+# упирается в один и тот же вопрос: какой порт видно с соседней машины.
+# Ответ должен существовать заранее, потому что проброс поднимается ДО того,
+# как клиентский код вообще запустится.
+CLIENT_PORTS = int(os.environ.get("LOOMA_RAY_CLIENT_PORTS", "30"))
 # Верхняя граница окна: выше начинается эфемерный диапазон Linux, и занимать
 # оттуда — значит однажды столкнуться с чужим исходящим соединением.
 WINDOW_END = int(os.environ.get("LOOMA_RAY_PORT_WINDOW_END", "32000"))
@@ -77,15 +85,25 @@ class RankPorts:
     client_server: int      # зарезервирован; см. cluster.py
     worker_first: int
     worker_last: int
+    # Хвост окна, отданный клиентскому коду. Ray сюда не лезет: его верхняя
+    # граница рабочих портов подрезана ровно на это.
+    client_first: int
+    client_last: int
 
     def crossing(self) -> List[int]:
         """Порты, до которых обязаны дотянуться ДРУГИЕ узлы.
 
         Только они нуждаются в туннеле; остальное Ray дергает у себя же на
         локалхосте, и проброс для них был бы работой впустую.
+
+        Клиентское окно тоже здесь, и это не щедрость: связать что-то между
+        узлами САМОМУ клиенту иначе нечем. Проброс поднимается до запуска его
+        кода, значит порты обязаны быть известны заранее — выбрать их потом
+        уже нельзя.
         """
         return [self.gcs, self.node_manager, self.object_manager,
-                *range(self.worker_first, self.worker_last + 1)]
+                *range(self.worker_first, self.worker_last + 1),
+                *range(self.client_first, self.client_last + 1)]
 
     def local_only(self) -> List[int]:
         return [self.runtime_env_agent, self.dashboard_listen,
@@ -124,10 +142,11 @@ def ports_for(rank: int, *, base: int = 0, stride: int = 0) -> RankPorts:
         raise PortsRefused(f"ранг не может быть отрицательным ({rank})")
     base = base or BASE
     stride = stride or STRIDE
-    if stride <= FIRST_WORKER_OFFSET:
+    if stride <= FIRST_WORKER_OFFSET + CLIENT_PORTS:
         raise PortsRefused(
             f"шаг {stride} не оставляет места рабочим портам: служебные "
-            f"занимают первые {FIRST_WORKER_OFFSET}")
+            f"занимают первые {FIRST_WORKER_OFFSET}, клиентские — последние "
+            f"{CLIENT_PORTS}")
     start = base + rank * stride
     if start + stride > 65536:
         raise PortsRefused(
@@ -144,7 +163,12 @@ def ports_for(rank: int, *, base: int = 0, stride: int = 0) -> RankPorts:
         metrics=start + 6,
         client_server=start + 7,
         worker_first=start + FIRST_WORKER_OFFSET,
-        worker_last=start + stride - 1,
+        # Подрезано на клиентское окно: Ray занимает порты из своего диапазона
+        # по мере надобности, и пересечение выглядело бы как случайный отказ
+        # клиентского сокета раз в несколько запусков.
+        worker_last=start + stride - 1 - CLIENT_PORTS,
+        client_first=start + stride - CLIENT_PORTS,
+        client_last=start + stride - 1,
     )
 
 
@@ -176,6 +200,44 @@ def head_address(base: int = 0, stride: int = 0) -> str:
     """Куда подключаются все. Голова — всегда ранг 0, и это не соглашение
     между узлами, а следствие того же расчёта."""
     return f"{loopback_for(0)}:{ports_for(0, base=base, stride=stride).gcs}"
+
+
+def client_env(size: int, rank: int, *, base: int = 0, stride: int = 0) -> dict:
+    """Чем клиентский код найдёт соседей. Всё, что для этого нужно, и ничего
+    сверх.
+
+    Выставляется ДО `ray start` — и в этом весь смысл. Воркеры Ray наследуют
+    окружение своего raylet, а raylet запускается нашим подпроцессом; значит
+    переменная, поставленная здесь, доедет до каждого актора на этом узле.
+    Поставить её позже было бы некуда: у актора своё окружение, и мы в него не
+    входим.
+
+    `MASTER_ADDR` и `MASTER_PORT` названы так, как их ищет torch: это его
+    соглашение, и переименовывать его в своё значило бы заставить клиента
+    писать лишнюю строку ради ничего. Граница у них честная и описана в
+    docs/RAY_DEMO.md: точка встречи через них работает, а коллективы gloo и
+    NCCL между МАШИНАМИ — нет, потому что свои сокеты они открывают на
+    случайных портах, которые нельзя пробросить заранее.
+    """
+    base = base or group_base(size, stride=stride)
+    ports = ports_for(rank, base=base, stride=stride)
+    head = ports_for(0, base=base, stride=stride)
+    return {
+        "MASTER_ADDR": loopback_for(0),
+        "MASTER_PORT": str(head.client_first),
+        "WORLD_SIZE": str(size),
+        # Ранг Ray, а не ранг процесса torch: совпадают они только пока на узле
+        # один воркер. Клиенту, который поднимает несколько, считать свой ранг
+        # придётся самому — отсюда и NODE_RANK рядом.
+        "RANK": str(rank),
+        "NODE_RANK": str(rank),
+        # Адрес каждого ранга — тот же на всех машинах группы (см. loopback_for).
+        "LOOMA_RANK_ADDRS": ",".join(
+            f"{r}={loopback_for(r)}" for r in range(size)),
+        # Порты, которые на этом узле ВИДНЫ соседям. Занимать другие можно, но
+        # достучаться до них будет нельзя, и выглядеть это будет как обрыв.
+        "LOOMA_PORTS": f"{ports.client_first}-{ports.client_last}",
+    }
 
 
 def crossing_for_group(size: int, *, base: int = 0, stride: int = 0) -> dict:

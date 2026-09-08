@@ -373,6 +373,10 @@ class AgentHub:
         # answers leaves a future nobody resolves, which is why every wait has
         # a timeout.
         self._pending_logs: Dict[str, asyncio.Future] = {}
+        # Кто ждёт подтверждения на команду узлу. Отдельно от логов: там ответ
+        # приходит текстом, здесь — обычным Ack, тем же, каким узел отвечает
+        # на всё остальное.
+        self._pending_acks: Dict[str, asyncio.Future] = {}
         self._collecting: Dict[str, Tuple[bytearray, asyncio.Future]] = {}
         # Очередь, а не future: ответ может прийти частями, и собрать его
         # целиком — частный случай, а не наоборот.
@@ -615,6 +619,39 @@ class AgentHub:
             raise AgentError(f"узел {node_id} не ответил вовремя") from None
         finally:
             self._pending_logs.pop(command_id, None)
+
+    async def node_command(self, node_id: str, action: str) -> None:
+        """Попросить сам узел что-то сделать: перечитать железо или уйти на
+        перезапуск.
+
+        Ждём подтверждения, а не отправляем и забываем: у обеих команд есть
+        отказ по делу — «на узле работают задачи» у одной, «агент не знает
+        такого действия» у другой, — и оператор, не увидевший его, решит, что
+        кнопка сломана.
+        """
+        session = self.sessions.get(node_id)
+        if session is None:
+            raise AgentError(f"узел {node_id} сейчас не на связи")
+        command_id = f"node-{action}-{node_id}-{uuid.uuid4().hex[:6]}"
+        waiter: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending_acks[command_id] = waiter
+        session.send(agent_pb2.ServerMessage(node_command=agent_pb2.NodeCommand(
+            command_id=command_id, action=action)))
+        try:
+            await asyncio.wait_for(waiter, NODE_REPLY_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            raise AgentError(f"узел {node_id} не ответил вовремя") from None
+        finally:
+            self._pending_acks.pop(command_id, None)
+
+    def on_ack(self, ack: agent_pb2.Ack) -> None:
+        waiter = self._pending_acks.get(ack.command_id)
+        if waiter is None or waiter.done():
+            return
+        if ack.ok:
+            waiter.set_result(None)
+        else:
+            waiter.set_exception(AgentError(ack.error or "узел отказал без объяснения"))
 
     async def collect(self, task_id: str, name: str) -> bytes:
         record, session = self._locate(task_id)
@@ -1083,6 +1120,11 @@ class AgentHub:
         node.gpus_free = report.gpus_free
         node.tasks_running = report.tasks_running
         node.env_cache_bytes = report.env_cache_bytes
+        # Железо приезжает теперь в каждой телеметрии, а не только при
+        # регистрации. Агент постарше поля не заполняет — тогда остаётся то,
+        # что он назвал при подключении, и это лучше, чем пустая карточка.
+        if report.HasField("hardware"):
+            node.hardware = report.hardware
         node.model_cache_bytes = report.model_cache_bytes
         node.disk_free_bytes = report.disk_free_bytes
         node.disk_total_bytes = report.disk_total_bytes
@@ -1212,9 +1254,13 @@ class AgentGatewayServicer(agent_pb2_grpc.AgentGatewayServicer):
                     self.hub.on_task_response(message.task_response)
                 elif kind == "tunnel_chunk":
                     self.hub.on_tunnel_chunk(message.tunnel_chunk)
-                elif kind == "ack" and not message.ack.ok:
-                    logger.warning("node %s refused %s: %s", session.node.node_id,
-                                   message.ack.command_id, message.ack.error)
+                elif kind == "ack":
+                    if not message.ack.ok:
+                        logger.warning("node %s refused %s: %s", session.node.node_id,
+                                       message.ack.command_id, message.ack.error)
+                    # И после записи в лог: отказ — такой же ответ, как согласие,
+                    # и тот, кто его ждёт, должен увидеть причину, а не таймаут.
+                    self.hub.on_ack(message.ack)
         except Exception:
             logger.debug("agent stream ended", exc_info=True)
         finally:

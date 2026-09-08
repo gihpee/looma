@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from looma_ray.ports import (BASE, PortsRefused, crossing_for_group,
-                            head_address, hosts_for_group, loopback_for,
-                            ports_for)
+from looma_ray.ports import (BASE, CLIENT_PORTS, PortsRefused, client_env,
+                            crossing_for_group, head_address, hosts_for_group,
+                            loopback_for, ports_for)
 
 
 def test_диапазоны_рангов_не_пересекаются():
@@ -43,8 +43,15 @@ def test_наружу_смотрят_только_те_порты_которым
 
 
 def test_рабочих_портов_остаётся_достаточно():
+    """Порт на воркер-процесс, а воркеров Ray заводит по числу слотов CPU —
+    его мы и так ограничиваем долей узла (см. cluster._own_cpus). Полсотни на
+    домашнюю машину — запас, а не впритык.
+
+    Порог опустился с 80, когда хвост окна ушёл клиенту. Это осознанная плата:
+    без своих портов у клиента нет межузлового обмена вообще, а рабочих портов
+    Ray столько никогда и не занимал."""
     ports = ports_for(0)
-    assert ports.worker_last - ports.worker_first + 1 >= 80
+    assert ports.worker_last - ports.worker_first + 1 >= 50
 
 
 def test_слишком_мелкий_шаг_отвергается_сразу():
@@ -141,3 +148,45 @@ def test_адреса_кончаются_понятным_отказом():
     """Молча завернуть ранг на 127.0.1.0 нельзя: это уже не петля."""
     with pytest.raises(PortsRefused):
         loopback_for(1000)
+
+
+def test_клиенту_достаётся_окно_портов_и_ray_в_него_не_лезет():
+    """Иначе связать что-то между узлами клиент не может вовсе: проброс
+    поднимается ДО запуска его кода, значит порты обязаны быть известны
+    заранее. А пересекись они с рабочими портами Ray — это выглядело бы как
+    случайный отказ сокета раз в несколько запусков."""
+    ports = ports_for(0)
+
+    assert ports.client_first > ports.worker_last
+    assert ports.client_last == ports.client_first + CLIENT_PORTS - 1
+    # И то и другое видно соседям: смысл окна ровно в этом.
+    crossing = set(ports.crossing())
+    assert ports.client_first in crossing and ports.client_last in crossing
+
+
+def test_окна_клиента_у_разных_рангов_не_пересекаются():
+    занято = set()
+    for rank in range(8):
+        мои = set(range(ports_for(rank).client_first, ports_for(rank).client_last + 1))
+        assert not (мои & занято), f"клиентское окно ранга {rank} налезает на чужое"
+        занято |= мои
+
+
+def test_соседи_называются_одинаково_на_всех_машинах():
+    """Клиентский код на РАЗНЫХ узлах обязан прийти к одному и тому же ответу
+    о том, где кто живёт, — иначе половина группы звонит не туда."""
+    у_нулевого = client_env(3, 0)
+    у_второго = client_env(3, 2)
+
+    assert у_нулевого["LOOMA_RANK_ADDRS"] == у_второго["LOOMA_RANK_ADDRS"]
+    assert у_нулевого["MASTER_ADDR"] == у_второго["MASTER_ADDR"] == loopback_for(0)
+    assert у_нулевого["MASTER_PORT"] == у_второго["MASTER_PORT"]
+    # А своё окно у каждого своё, иначе два ранга на одной машине столкнутся.
+    assert у_нулевого["LOOMA_PORTS"] != у_второго["LOOMA_PORTS"]
+
+
+def test_точка_встречи_лежит_в_проброшенном_окне():
+    """MASTER_PORT, до которого не дотянуться с соседней машины, — это
+    зависание на init_process_group без единого слова о причине."""
+    порт = int(client_env(2, 1)["MASTER_PORT"])
+    assert порт in set(ports_for(0).crossing())

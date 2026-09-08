@@ -311,6 +311,24 @@ class TaskRegistry:
         if self.models is not None:
             self.models.sweep()
 
+    def recount_devices(self, total: int) -> str:
+        """Переучесть карты узла. Пусто — получилось; иначе причина отказа.
+
+        Под тем же замком, что и выдача устройств, и с проверкой занятости
+        внутри него: индексы уже выданных задач считаются от этого числа, и
+        уменьшить его под работающей задачей значит отдать её карту второму
+        желающему. Проверять снаружи было бы тем же самым с окном между
+        проверкой и присвоением.
+        """
+        with self._lock:
+            busy = len([t for t in self._tasks.values() if not t.finished])
+            busy += len([t for t in self._claimed if t not in self._tasks])
+            if busy:
+                return (f"на узле {busy} задач(и): пересчёт карт сменил бы учёт "
+                        "устройств под ними. Дождитесь окончания или снимите их")
+            self.total_gpus = max(0, int(total))
+            return ""
+
     def drain(self, timeout_s: float, *, reason: str = "this node is restarting") -> bool:
         """Take no new work and let what is running finish.
 

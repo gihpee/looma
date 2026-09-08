@@ -219,6 +219,7 @@ export function Ray() {
   const [gpus, setGpus] = useState("1");
   const [label, setLabel] = useState("");
   const [version, setVersion] = useState("");
+  const [reqs, setReqs] = useState("");
   const [script, setScript] = useState("");
   const [scriptName, setScriptName] = useState("");
   const [stopping, setStopping] = useState<Group | null>(null);
@@ -258,6 +259,10 @@ export function Ray() {
       script: script || undefined,
       label: label || undefined,
       ray_version: version || undefined,
+      // Столбиком, как в requirements.txt: человек копирует его целиком, и
+      // заставлять его переделывать список в строку через запятую — работа
+      // на ровном месте. Разбирает это API.
+      requirements: reqs.trim() || undefined,
     });
     setScript(""); setScriptName(""); setLabel("");
   }, script ? "кластер поднимается, скрипт запустится сам" : "кластер поднимается");
@@ -337,6 +342,12 @@ export function Ray() {
             <Field label="метка" hint="чтобы найти его потом">
               <input value={label} onChange={(e) => setLabel(e.target.value)}
                      placeholder="перебор-гиперпараметров" />
+            </Field>
+            <Field label="библиотеки"
+                   hint="по строке на пакет, как в requirements.txt — ставятся на каждый узел">
+              <textarea className="mono" value={reqs} rows={4} spellCheck={false}
+                        onChange={(e) => setReqs(e.target.value)}
+                        placeholder={"torch\nnumpy"} />
             </Field>
             <Field label="версия ray" hint="пусто — последняя">
               <input className="mono" value={version}

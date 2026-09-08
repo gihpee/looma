@@ -261,6 +261,23 @@ message Probe {
   string command_id = 1;
 }
 
+// Команда самому УЗЛУ, а не задаче на нём.
+//
+// Появилась ради одной вещи, которую иначе было не сделать. Агент выясняет,
+// что за железо на машине, один раз — в конструкторе — и держит этот ответ до
+// конца процесса. Карта, вернувшаяся после того, как её хозяин пересобрал
+// драйвер, не появлялась нигде; единственным рычагом для ЧУЖОЙ машины была
+// выкатка релиза, то есть обновление всего парка ради одного узла.
+message NodeCommand {
+  string command_id = 1;
+  // "rescan"  — перечитать железо, ничего не останавливая
+  // "restart" — слить задачи и выйти, дав пусковому слою поднять себя заново
+  //
+  // Строкой, а не перечислением: узел старее оркестратора обязан внятно
+  // отказать в незнакомом действии, а не молча принять чужой номер за своё.
+  string action = 2;
+}
+
 // Whether this node actually talks to its neighbours directly, and how often.
 // Reported because "the pipeline is slow" and "every activation is going the
 // long way round" look identical from the outside, and only this tells them
@@ -305,6 +322,11 @@ message Telemetry {
   // не поместиться вовсе.
   uint64 disk_free_bytes = 12;
   uint64 disk_total_bytes = 13;
+  // Железо, каким узел видит его СЕЙЧАС. Прежде оно приезжало только при
+  // регистрации и после этого не менялось никогда: карта, пропавшая вместе с
+  // драйвером или вернувшаяся с ним, оставалась в панели такой, какой была в
+  // минуту подключения. Отсюда же приходит ответ на команду "rescan".
+  Hardware hardware = 14;
 }
 
 message UpdateStatus {
@@ -361,6 +383,7 @@ message ServerMessage {
     AgentRelease release = 11;
     TunnelOpen tunnel_open = 12;
     TunnelChunk tunnel_chunk = 13;
+    NodeCommand node_command = 14;
   }
 }
 

@@ -285,3 +285,69 @@ def test_кластер_ставит_ray_с_клиентским_входом(tw
     client(hub).post("/admin/ray", json={"node_ids": ["node-1"],
                                          "ray_version": "2.58.0"})
     assert asked["environment"]["requirements"] == ["ray[client]==2.58.0"]
+
+
+def test_просимые_библиотеки_доезжают_до_узлов(two_nodes, monkeypatch):
+    """Через ту же дорогу, что и сам Ray: одно окружение на узел, поставленное
+    до запуска. Ставить их потом было бы некуда — воркеры Ray наследуют то,
+    что уже есть."""
+    hub = two_nodes.hub
+    asked = {}
+    original = hub.submit_group
+
+    def watch(**kwargs):
+        asked.update(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(hub, "submit_group", watch)
+    answer = client(hub).post("/admin/ray", json={
+        "node_ids": ["node-0"], "requirements": "torch\nnumpy"})
+
+    assert answer.status_code == 200, answer.text
+    assert asked["environment"]["requirements"] == ["ray[client]", "torch", "numpy"]
+
+
+def test_негодные_требования_отвергаются_до_запуска(two_nodes):
+    """После запуска это стоило бы установки окружения на чужой машине и
+    отказа, который человек увидел бы минутами позже и в логе задачи."""
+    answer = client(two_nodes.hub).post("/admin/ray", json={
+        "node_ids": ["node-0"], "requirements": ["--index-url https://example.invalid"]})
+
+    assert answer.status_code == 400
+    assert "флаги pip" in answer.json()["error"]["message"]
+
+
+# ------------------------------------------------------- библиотеки клиента
+def test_библиотеки_клиента_едут_вместе_с_ray():
+    """Без этого клиент получал голый Ray и не мог привезти ни торч, ни свою
+    библиотеку — а распараллеливать чем-то надо. Механизм окружений умеет это
+    давно; к форме Ray он просто не был подключён."""
+    from looma.api.app import _requirements_of
+
+    assert _requirements_of("torch\nnumpy>=1.2") == ["torch", "numpy>=1.2"]
+
+
+def test_requirements_txt_копируется_целиком():
+    """Человек копирует свой файл как есть. Отвергать его из-за комментария
+    или пустой строки — придирка, из-за которой он пойдёт их вычищать вручную."""
+    from looma.api.app import _requirements_of
+
+    assert _requirements_of("# нужное\ntorch\n\n  numpy  \n") == ["torch", "numpy"]
+
+
+def test_флаги_pip_не_принимаются():
+    """Они меняют не пакет, а откуда и как он ставится, — вплоть до чужого
+    индекса. На чужой машине это решает её владелец, а не арендатор."""
+    import pytest as _pytest
+
+    from looma.api.app import _requirements_of
+
+    with _pytest.raises(ValueError, match="флаги pip"):
+        _requirements_of(["--index-url", "https://example.invalid"])
+
+
+def test_список_принимается_наравне_с_текстом():
+    """Форма шлёт текст в столбик, а те, кто ходит в API напрямую, — список."""
+    from looma.api.app import _requirements_of
+
+    assert _requirements_of(["torch"]) == _requirements_of("torch") == ["torch"]

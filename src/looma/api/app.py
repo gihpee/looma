@@ -86,6 +86,50 @@ def _inputs_of(raw: dict) -> dict:
     return decoded
 
 
+# Сколько строк требований принимать и какой длины. Не из осторожности к
+# клиенту, а потому что этот список едет в отпечаток окружения и оттуда — в
+# имя каталога на ЧУЖОЙ машине.
+MAX_REQUIREMENTS = 100
+MAX_REQUIREMENT_LEN = 200
+
+
+def _requirements_of(raw) -> list:
+    """Что клиент просит поставить рядом с Ray.
+
+    Принимается и список, и текст в столбик — форма отдаёт второе, а те, кто
+    ходит в API напрямую, обычно шлют первое. Разбирать это здесь дешевле, чем
+    объяснять разницу в документации.
+
+    Строки не проверяются на осмысленность: их разберёт pip, и его сообщение
+    об ошибке точнее любого, которое мы бы придумали. Проверяется только то,
+    из-за чего сломались бы МЫ.
+    """
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        raw = raw.replace(",", "\n").splitlines()
+    if not isinstance(raw, list):
+        raise ValueError("'requirements' — список строк или текст в столбик")
+    lines = []
+    for item in raw:
+        line = str(item).strip()
+        # Комментарии и пустые строки: человек копирует свой requirements.txt
+        # целиком, и отвергать его из-за решётки было бы придиркой.
+        if not line or line.startswith("#"):
+            continue
+        if len(line) > MAX_REQUIREMENT_LEN:
+            raise ValueError(f"слишком длинная строка требований: {line[:60]}…")
+        # Флаги pip меняют не пакет, а то, откуда и как он ставится, — вплоть
+        # до чужого индекса. На чужой машине это решает её владелец, а не тот,
+        # кто её арендовал.
+        if line.startswith("-"):
+            raise ValueError(f"флаги pip здесь не принимаются: {line}")
+        lines.append(line)
+    if len(lines) > MAX_REQUIREMENTS:
+        raise ValueError(f"требований больше {MAX_REQUIREMENTS}; это похоже на ошибку")
+    return lines
+
+
 def create_app(*, agents=None, releases=None, keystore=None, config=None,
                public_address=None, accounts=None, ledger=None,
                deployments=None) -> FastAPI:
@@ -742,6 +786,43 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         except AgentError as exc:
             return _error(409, str(exc))
 
+    @app.post("/admin/agents/{node_id}/rescan")
+    async def admin_agent_rescan(node_id: str,
+                                 x_looma_admin_token: str | None = Header(default=None)):
+        """Перечитать железо узла, ничего не останавливая.
+
+        Агент выясняет, что за машина под ним, один раз — при запуске — и
+        держит этот ответ до конца процесса. Со стенда: у узла пропали карты,
+        потому что его хозяин пересобирал драйвер; вернуть их в панель было
+        нечем, кроме выкатки релиза, то есть обновления всего парка ради
+        одного узла.
+        """
+        if agents is None:
+            return need_agents()
+        try:
+            await agents.node_command(node_id, "rescan")
+        except AgentError as exc:
+            return _error(409, str(exc))
+        return {"node_id": node_id, "rescanned": True}
+
+    @app.post("/admin/agents/{node_id}/restart")
+    async def admin_agent_restart(node_id: str,
+                                  x_looma_admin_token: str | None = Header(default=None)):
+        """Перезапустить агента на узле.
+
+        Задачи сливаются, а не убиваются; узел уходит и возвращается сам —
+        пусковой слой поднимает его заново и отличает это от падения, поэтому
+        версия не откатывается. Ответ приходит ДО слива: он длится минутами, и
+        ждать его здесь значило бы оборвать запрос по таймауту.
+        """
+        if agents is None:
+            return need_agents()
+        try:
+            await agents.node_command(node_id, "restart")
+        except AgentError as exc:
+            return _error(409, str(exc))
+        return {"node_id": node_id, "restarting": True}
+
     @app.get("/admin/tasks/{task_id}/results/{name:path}")
     async def admin_task_result(task_id: str, name: str,
                                 x_looma_admin_token: str | None = Header(default=None)):
@@ -1110,6 +1191,14 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
 
         version = (raw.get("ray_version") or "").strip()
         label = (raw.get("label") or "ray").strip()
+        # Что ещё поставить на КАЖДЫЙ узел кластера. Без этого клиент получал
+        # голый Ray и не мог привезти ни торч, ни свою библиотеку — а
+        # распараллелить чем-то надо. Механизм окружений умеет это давно; сюда
+        # он просто не был подключён.
+        try:
+            extra = _requirements_of(raw.get("requirements"))
+        except ValueError as exc:
+            return _error(400, str(exc))
         # Свой ранг задача узнаёт из окружения, которое ставит агент, поэтому
         # команда у всех одна. Отличается только нулевой: ему запускать код.
         # Сколько карт получит каждый ранг. Ноль — процессорный кластер: он
@@ -1141,6 +1230,7 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
                 # не игнорируется, а роняет `ray start` целиком.
                 environment={"kind": "python", "requirements": [
                     f"ray[client]=={version}" if version else "ray[client]",
+                    *extra,
                 ]},
                 resources=raw.get("resources") or None,
                 # Скрипт кончается сам; стоящий кластер живёт, пока не снимут.

@@ -17,12 +17,17 @@ logger = logging.getLogger("looma_agent.handlers")
 
 
 class CommandHandlers:
-    def __init__(self, *, tasks: TaskCommands, telemetry, on_release=None) -> None:
+    def __init__(self, *, tasks: TaskCommands, telemetry, on_release=None,
+                 on_node_command=None) -> None:
         self.tasks = tasks
         self._telemetry = telemetry
         # Подсказка «посмотри на версию сейчас». Приходит, когда оператор
         # перевёл ступень, а этот узел никуда не переподключался.
         self.on_release = on_release or (lambda _release: None)
+        # Команда узлу, а не задаче: перечитать железо или перезапуститься.
+        # Мимо задач, поэтому и мимо TaskCommands — распоряжается этим сам
+        # агент, у которого и железо, и код выхода.
+        self.on_node_command = on_node_command or (lambda _command: None)
 
     def handle(self, message: agent_pb2.ServerMessage) -> None:
         kind = message.WhichOneof("msg")
@@ -48,6 +53,8 @@ class CommandHandlers:
             self.tasks.tunnel_chunk(message.tunnel_chunk)
         elif kind == "release":
             self.on_release(message.release)
+        elif kind == "node_command":
+            self.on_node_command(message.node_command)
         elif kind == "probe":
             self.tasks.send(self._telemetry())
         else:
