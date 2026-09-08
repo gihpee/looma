@@ -100,7 +100,9 @@ function Deploy({ nodes, onClose, onDone }: {
   const [repo, setRepo] = useState("");
   const [label, setLabel] = useState("");
   const [dtype, setDtype] = useState("bfloat16");
-  const [device, setDevice] = useState("cuda");
+  // "auto" по умолчанию: на смешанном конвейере — Mac рядом с машиной
+  // NVIDIA — любое жёсткое значение неверно для половины стадий.
+  const [device, setDevice] = useState("auto");
   const [engine, setEngine] = useState("torch");
   const [stages, setStages] = useState("2");
   const [byVram, setByVram] = useState(true);
@@ -144,7 +146,7 @@ function Deploy({ nodes, onClose, onDone }: {
   // оркестратору отказать после нажатия: сочетание видно на экране целиком,
   // и объяснять его лучше рядом с тем, что его создало.
   const clash = engine !== "vllm" ? ""
-    : device !== "cuda" ? "vLLM работает только на cuda"
+    : !["cuda", "auto"].includes(device) ? "vLLM работает только на cuda"
     : blocking.length ? `${blocking.map((n) => n.node_id + " (CUDA " +
         (n.cuda_version || "?") + ")").join(", ")} — нужна CUDA ${MIN_CUDA_VLLM}` : "";
 
@@ -172,9 +174,15 @@ function Deploy({ nodes, onClose, onDone }: {
             <option>bfloat16</option><option>float16</option><option>float32</option>
           </select>
         </Field>
-        <Field label="Устройство">
+        <Field label="Устройство"
+               hint={device === "auto"
+                 ? "каждая стадия берёт ускоритель своей машины: карту, Metal или процессор"
+                 : "одно на все стадии — на смешанных узлах половина уйдёт не туда"}>
           <select value={device} onChange={(e) => setDevice(e.target.value)}>
-            <option>cuda</option><option>cpu</option>
+            <option value="auto">авто — по железу узла</option>
+            <option value="cuda">cuda</option>
+            <option value="mps">mps — Metal на Apple</option>
+            <option value="cpu">cpu</option>
           </select>
         </Field>
         <Field label="Движок"
@@ -206,16 +214,31 @@ function Deploy({ nodes, onClose, onDone }: {
         <Field label="Узлы"
                hint={stale.length
                  ? `нет vLLM на: ${stale.map((n) => n.node_id).join(", ")} — драйвер старше CUDA ${MIN_CUDA_VLLM}`
-                 : "ничего не выбрано — возьмёт самые свободные"}>
-          <select multiple size={4} value={picked}
-                  onChange={(e) => setPicked(
-                    Array.from(e.target.selectedOptions, (o) => o.value))}>
-            {takers.map((n) => (
-              <option key={n.node_id} value={n.node_id}>
-                {n.node_id} — {gb(n.vram_free_bytes)} GB, {n.gpus_free} GPU
-              </option>
-            ))}
-          </select>
+                 : picked.length
+                   ? "порядок отметок — порядок стадий; первому достаётся начало модели"
+                   : "ничего не выбрано — возьмёт самые свободные"}>
+          {/* Не <select multiple>: там обычный клик выделяет ДИАПАЗОН, а для
+              несмежных нужен ctrl или cmd. На смешанном конвейере выбирают как
+              раз несмежные — Mac и машину с картой, — и вместо двух узлов
+              выделялись все, что между ними. Здесь клик переключает один. */}
+          <div className="picklist">
+            {takers.map((n) => {
+              const on = picked.includes(n.node_id);
+              return (
+                <label key={n.node_id} className="pickrow" data-on={on}>
+                  <input type="checkbox" checked={on}
+                         onChange={() => setPicked(on
+                           ? picked.filter((x) => x !== n.node_id)
+                           // В конец, а не по порядку списка: порядок выбора и
+                           // есть порядок стадий, и первым отмеченный получает
+                           // начало модели вместе с эмбеддингами.
+                           : [...picked, n.node_id])} />
+                  <span>{n.node_id}</span>
+                  <b>{gb(n.vram_free_bytes)} GB, {n.gpus_free} GPU</b>
+                </label>
+              );
+            })}
+          </div>
         </Field>
         <div style={{ display: "grid", gap: 12, alignContent: "start" }}>
           <Field label="Стадий" hint="если узлы не выбраны">
