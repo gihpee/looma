@@ -284,7 +284,8 @@ def main(argv=None) -> int:
         logger.error("%s", exc)
         code = 1
     finally:
-        cluster.stop_node()
+        # С каталогом: по нему отличаются процессы ЭТОЙ сессии от соседских.
+        cluster.stop_node(temp_dir)
         if health is not None:
             health.shutdown()
     return code

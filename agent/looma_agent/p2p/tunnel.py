@@ -37,6 +37,10 @@ CHUNK = 64 * 1024
 # Сколько ждать локальное соединение на той стороне. Целевой процесс — сосед по
 # машине, так что это либо мгновенно, либо не будет вовсе.
 CONNECT_TIMEOUT_S = 5.0
+# Сколько ждать ЗАПАСНОЙ адрес. Втрое меньше того, что даёт Ray на всё
+# соединение: запасные — это догадки о том, где ещё мог оказаться слушатель, и
+# платить за каждую догадку полным сроком значит не оставить времени на дело.
+SPARE_TIMEOUT_S = 0.5
 # Сколько ждать ответа соседа на унарный вызов. Целые секунды: привязка
 # отвергает дробные, а мок, который их принимает, прячет это до первой встречи
 # с настоящим пиром.
@@ -85,10 +89,16 @@ class Endpoint:
         # 127.0.0.1 отвергается, а выглядит это как «сосед не отвечает».
         self.host_for = host_for or (lambda _port: "127.0.0.1")
         self._conns: Dict[str, socket.socket] = {}
+        # Чьё это соединение. Без владельца снятый кластер оставляет свои
+        # туннели висеть навсегда: закрыть их некому, а потолок на узле общий —
+        # через несколько кластеров он выбирается целиком, и следующий получает
+        # «слишком много туннелей». Со стенда: после релиза агента всё работает,
+        # а спустя несколько созданий и снятий — перестаёт.
+        self._owner: Dict[str, str] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------- вызовы соседа
-    def connect(self, conn_id: str, port: int) -> dict:
+    def connect(self, conn_id: str, port: int, task_id: str = "") -> dict:
         """Открыть локальное соединение. Отдельным вызовом, а не внутри стрима:
         так сосед узнаёт об отказе сразу и не пишет в никуда."""
         if not self.allow(port):
@@ -112,10 +122,19 @@ class Endpoint:
             if спутник and спутник not in candidates:
                 candidates.append(спутник)
         sock, refusals = None, []
-        for host in candidates:
+        for место, host in enumerate(candidates):
+            # Первому — полный срок, запасным — короткий, и вот почему.
+            #
+            # Ray ждёт соединения ПЯТЬ секунд и потом объявляет узел
+            # недоступным. На адресе, где никто не слушает, отказ приходит
+            # мгновенно, а вот на чужом адресе машины — не приходит вовсе, там
+            # таймаут. Со стенда: третий кандидат съедал весь срок Ray, и тот
+            # сдавался, ни разу не попав в окно, когда голова уже готова.
+            # Раньше отказ был мгновенным, Ray переоткрывал соединение сотни
+            # раз за минуту и попадал.
+            срок = CONNECT_TIMEOUT_S if место == 0 else SPARE_TIMEOUT_S
             try:
-                sock = socket.create_connection((host, port),
-                                                timeout=CONNECT_TIMEOUT_S)
+                sock = socket.create_connection((host, port), timeout=срок)
                 break
             except OSError as exc:
                 refusals.append(f"{host} ({exc.strerror or exc})")
@@ -129,6 +148,8 @@ class Endpoint:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         with self._lock:
             self._conns[conn_id] = sock
+            if task_id:
+                self._owner[conn_id] = task_id
         return {"ok": True}
 
     def read(self, conn_id: str):
@@ -161,8 +182,25 @@ class Endpoint:
     def close(self, conn_id: str) -> dict:
         with self._lock:
             sock = self._conns.pop(conn_id, None)
+            self._owner.pop(conn_id, None)
         _shutdown(sock)
         return {"ok": True}
+
+    def close_task(self, task_id: str) -> int:
+        """Закрыть всё, что открывала эта задача. Возвращает сколько.
+
+        Вызывается при снятии: сосед по мёртвому кластеру уже не пришлёт
+        `tunnel_close`, а его сторона могла умереть молча — тогда запись висит
+        до конца жизни агента и занимает место под потолком.
+        """
+        with self._lock:
+            свои = [c for c, owner in self._owner.items() if owner == task_id]
+            socks = [self._conns.pop(c, None) for c in свои]
+            for c in свои:
+                self._owner.pop(c, None)
+        for sock in socks:
+            _shutdown(sock)
+        return len(свои)
 
     def close_all(self) -> None:
         with self._lock:
@@ -258,15 +296,19 @@ def pump(local: socket.socket, remote: "RemoteSide", *, closed: threading.Event)
 class RemoteSide:
     """Сосед на том конце. Тонкая обёртка над стабом lattica."""
 
-    def __init__(self, stub, conn_id: str, port: int) -> None:
+    def __init__(self, stub, conn_id: str, port: int, task_id: str = "") -> None:
         self.stub = stub
         self.conn_id = conn_id
         self.port = port
+        # Чьё это соединение — чтобы на том конце его было чем закрыть, когда
+        # задачу снимут. Сосед по снятому кластеру `tunnel_close` уже не
+        # пришлёт, и без имени задачи запись у него висит до конца дней.
+        self.task_id = task_id
         self._closed = False
 
     def open(self) -> None:
         answer = _settled(self.stub.tunnel_connect(
-            {"conn": self.conn_id, "port": self.port}))
+            {"conn": self.conn_id, "port": self.port, "task": self.task_id}))
         if not answer.get("ok", False):
             raise TunnelRefused(answer.get("error") or "сосед отказал без причины")
 

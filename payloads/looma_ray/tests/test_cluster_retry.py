@@ -289,3 +289,68 @@ def test_вход_принимает_молча(monkeypatch):
     monkeypatch.setattr(cluster, "_reachable", lambda *a, **kw: True)
 
     assert cluster.client_entry_ready(31807, wait_s=5.0) == ""
+
+
+def test_уборка_не_трогает_посторонних(monkeypatch):
+    """Проверено на стенде и стоило испуга: путь сессии стоит в командной
+    строке у кого угодно, кто про неё говорит, — у агента, который запустил
+    задачу, и даже у оболочки, где набрали команду. Первая версия уборки нашла
+    такой процесс и сняла его.
+    """
+    import os
+
+    from looma_ray import cluster
+
+    снятые = []
+
+    class Процесс:
+        def __init__(self, pid, name, cmdline):
+            self.pid = pid
+            self.info = {"pid": pid, "name": name, "cmdline": cmdline}
+
+        def terminate(self):
+            снятые.append(self.info["name"])
+
+    посторонние = [
+        Процесс(1, "zsh", ["zsh", "-c", "echo /tmp/session-1"]),
+        Процесс(2, "python", ["python", "-m", "looma_agent.main", "--root", "/tmp/session-1"]),
+    ]
+    рэй = Процесс(3, "raylet", ["raylet", "--session_dir=/tmp/session-1"])
+
+    monkeypatch.setattr(cluster, "os", os)
+    import psutil
+    monkeypatch.setattr(psutil, "process_iter", lambda _f: [*посторонние, рэй])
+    monkeypatch.setattr(psutil, "wait_procs", lambda p, timeout=0: (p, []))
+
+    cluster.stop_node("/tmp/session-1")
+
+    assert снятые == ["raylet"], f"сняли лишнее: {снятые}"
+
+
+def test_уборка_снимает_демоны_ray(monkeypatch):
+    """Ray заводит их в отдельной сессии, и SIGTERM группе задачи до них не
+    доходит. Пережившие уборку gcs и raylet держат порты своего окна, и
+    следующий кластер с тем же окном встать уже не может — снаружи это
+    выглядит как «оба узла running, а рангов нет»."""
+    from looma_ray import cluster
+
+    снятые = []
+
+    class Процесс:
+        def __init__(self, pid, name):
+            self.pid = pid
+            self.info = {"pid": pid, "name": name,
+                         "cmdline": [name, "--temp-dir=/tmp/session-9"]}
+
+        def terminate(self):
+            снятые.append(self.info["name"])
+
+    демоны = [Процесс(11, "raylet"), Процесс(12, "gcs_server"),
+              Процесс(13, "plasma_store")]
+    import psutil
+    monkeypatch.setattr(psutil, "process_iter", lambda _f: list(демоны))
+    monkeypatch.setattr(psutil, "wait_procs", lambda p, timeout=0: (p, []))
+
+    cluster.stop_node("/tmp/session-9")
+
+    assert sorted(снятые) == ["gcs_server", "plasma_store", "raylet"]

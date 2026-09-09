@@ -46,6 +46,14 @@ START_TIMEOUT_S = float(os.environ.get("LOOMA_RAY_START_TIMEOUT_S", "60"))
 HEAD_START_TIMEOUT_S = float(os.environ.get("LOOMA_RAY_HEAD_START_TIMEOUT_S", "300"))
 
 
+# По чему узнаётся процесс Ray. Список, а не догадка по имени питона: Ray
+# запускает и свои двоичные файлы (raylet, gcs_server), и питоновские модули, и
+# воркеры с переименованным процессом.
+RAY_PROCESSES = ("raylet", "gcs_server", "plasma_store", "ray::",
+                 "ray/dashboard", "log_monitor", "ray.scripts",
+                 "ray/_private", "runtime_env_agent")
+
+
 # Взводится, когда задачу снимают. Ожидания смотрят на него, иначе SIGTERM во
 # время сборки не прерывал бы её, а просто убивал процесс — и `ray stop` не
 # успевал бы отработать, оставляя чужой машине работающий кластер.
@@ -499,15 +507,66 @@ def registered_addresses() -> str:
         return f"спросить не вышло: {exc}"
 
 
-def stop_node() -> None:
-    """Ничего не делать — и это осознанно.
+def stop_node(temp_dir: str = "") -> None:
+    """Снять процессы Ray ЭТОЙ сессии — и только их.
 
-    Напрашивается `ray stop --force`, и он ЛОМАЕТ соседей: команда снимает все
-    процессы Ray этого пользователя на машине, а не наши. Два ранга на одном
-    узле работают под одним uid, так что упавший ранг своей уборкой убивал
-    голову живого — тот потом стоял и ждал кластер, которого уже нет.
+    `ray stop --force` здесь не годится: он снимает все процессы Ray этого
+    пользователя на машине, а два ранга на одном узле работают под одним uid.
+    Упавший ранг такой уборкой убивал бы голову живого соседа, и тот потом
+    стоял бы, ожидая кластер, которого уже нет.
 
-    Убирает за нами агент: задача работает в своей группе процессов, и снятие
-    задачи сносит её целиком вместе со всем, что Ray наплодил.
+    Полагаться на агента тоже нельзя, хотя раньше так и было. Он снимает группу
+    процессов задачи, а Ray заводит свои демоны в отдельной сессии — SIGTERM
+    группе до них не доходит. Пережившие уборку gcs и raylet держат порты
+    своего окна, и следующий кластер, которому досталось то же окно, встать уже
+    не может: снаружи это выглядит как «оба узла running, а рангов нет».
+
+    Отличаем своих по временному каталогу: он у каждой задачи свой, и Ray
+    вписывает путь к сессии в командную строку каждого своего процесса.
     """
-    return
+    маркер = temp_dir or os.environ.get("RAY_TMPDIR") or os.environ.get("LOOMA_TASK_TMP")
+    if not маркер:
+        return
+    try:
+        import psutil
+    except ImportError:
+        logger.debug("psutil недоступен: процессы Ray останутся агенту")
+        return
+    # Мимо: свой процесс и всё его дерево вверх. Путь сессии стоит в командной
+    # строке и у нас самих, и у агента, который нас запустил, — а найденное
+    # здесь снимается без разговоров.
+    родня = {os.getpid()}
+    try:
+        родня |= {p.pid for p in psutil.Process().parents()}
+    except Exception:
+        pass
+    свои = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            pid = proc.info["pid"]
+            cmdline = " ".join(proc.info.get("cmdline") or ())
+            name = proc.info.get("name") or ""
+        except Exception:
+            continue
+        if pid in родня or маркер not in cmdline:
+            continue
+        # Одного маркера мало: путь сессии упоминает кто угодно, кто про неё
+        # говорит, — вплоть до оболочки, в которой набрали команду. Проверено:
+        # без этого условия уборка сняла посторонний процесс.
+        if not any(знак in name or знак in cmdline for знак in RAY_PROCESSES):
+            continue
+        свои.append(proc)
+    if not свои:
+        return
+    logger.info("снимаю %d процессов Ray этой сессии", len(свои))
+    for proc in свои:
+        try:
+            proc.terminate()
+        except Exception:
+            continue
+    _, живые = psutil.wait_procs(свои, timeout=10)
+    for proc in живые:
+        try:
+            proc.kill()
+        except Exception:
+            continue

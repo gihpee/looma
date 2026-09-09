@@ -779,7 +779,8 @@ def _make_handler(lattica, deliver: Callable[[dict], dict], endpoint=None):
             if endpoint is None:
                 return {"ok": False, "error": "на этом узле туннели выключены"}
             return endpoint.connect(str(message.get("conn") or ""),
-                                    int(message.get("port") or 0))
+                                    int(message.get("port") or 0),
+                                    str(message.get("task") or ""))
 
         @rpc_stream_iter
         def tunnel_open(self, message):

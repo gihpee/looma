@@ -68,6 +68,11 @@ class TaskCommands:
         # где её ждать, — так делает кластер Ray, у которого каждый ранг живёт
         # на своём адресе петли.
         self.inbound_host: Dict[int, str] = {}
+        # Какие порты открыла каждая задача. Без этого разрешения и адреса
+        # копятся на весь век агента: снятый кластер оставляет свои порты
+        # открытыми для соседей, а их адреса — в подсказке для входящих. Через
+        # несколько кластеров там мусор от всех прошлых.
+        self._task_ports: Dict[str, List[int]] = {}
         # Наша сторона канала по управляющему стриму.
         self.tunnels = Endpoint(allow=lambda port: port in self.allowed_ports,
                                 host_for=self.inbound_host.get)
@@ -142,6 +147,7 @@ class TaskCommands:
 
     def release(self, command: agent_pb2.ReleaseTask) -> None:
         self.forward.close(command.task_id)
+        self.forget_task(command.task_id)
         self.groups.leave(command.task_id)
         self._close_input(command.task_id)
         self.registry.release(command.task_id)
@@ -194,6 +200,7 @@ class TaskCommands:
         # Слушатели живут ровно столько, сколько задача: оставить их — значит
         # держать чужие порты занятыми на машине владельца.
         self.forward.close(spec.task_id)
+        self.forget_task(spec.task_id)
         self.groups.leave(spec.task_id)
 
     def _deliver(self, task_id: str, expected: List[agent_pb2.InputFile]):
@@ -345,6 +352,9 @@ class TaskCommands:
         if not ports and not external:
             raise TaskRefused("в раскладке нет ни одного порта")
         own = hosts.get(group.rank, "")
+        мои = list(ports.get(group.rank, [])) + list(external)
+        if мои:
+            self._task_ports.setdefault(task_id, []).extend(мои)
         # Свой адрес нужен раньше слушателей: на нём поднимется САМ Ray этого
         # ранга, а не наш проброс. Без него `ray start --node-ip-address` падает
         # на «Can't assign requested address» — там, где адреса на петле не
@@ -372,6 +382,30 @@ class TaskCommands:
             remote[rank] = member.peer_id
         return self.forward.open(task_id, mine=ports.get(group.rank, []),
                                  remote=remote, ports=ports, hosts=hosts)
+
+    def forget_task(self, task_id: str) -> None:
+        """Убрать за задачей всё, что она оставила на узле.
+
+        Слушатели и живые туннели закрывает форвардер; здесь — то, что живёт в
+        агенте и переживает любую задачу: разрешения на порты, подсказки об
+        адресах и входящие соединения соседей по этому кластеру.
+
+        Без этого узел работает после релиза агента и портится по мере того,
+        как на нём создают и снимают кластеры: у входящих туннелей общий на
+        узел потолок, и мёртвые записи занимают его наравне с живыми.
+        """
+        ports = self._task_ports.pop(task_id, [])
+        if ports:
+            self.allowed_ports.difference_update(ports)
+            for порт in ports:
+                self.inbound_host.pop(порт, None)
+        закрыто = self.tunnels.close_task(task_id)
+        endpoint = getattr(self._peer_node(), "tunnels", None)
+        if endpoint is not None and endpoint is not self.tunnels:
+            закрыто += endpoint.close_task(task_id)
+        if ports or закрыто:
+            logger.info("задача %s: убрал %d разрешённых портов и %d входящих "
+                        "туннелей", task_id, len(ports), закрыто)
 
     def _allow_inbound(self, ports: List[int], host: str = "") -> None:
         """Открыть НАШИ порты снаружи. По умолчанию закрыто всё: иначе через

@@ -96,6 +96,11 @@ class Forwarder:
         self.allow_local = allow_local or (lambda _ports: None)
         self._sel = selectors.DefaultSelector()
         self._by_task: Dict[str, List[socket.socket]] = {}
+        # Живые соединения задачи. Закрыть слушатели мало: то, что уже течёт
+        # через них, продолжает жить и после снятия кластера — до тех пор, пока
+        # не оборвётся само. На узле это выглядит как чужие туннели, которых
+        # никто не открывал.
+        self._carrying: Dict[str, List[socket.socket]] = {}
         self._targets: Dict[socket.socket, str] = {}   # слушатель → peer_id
         self._ports: Dict[socket.socket, int] = {}
         self._lock = threading.RLock()
@@ -170,8 +175,22 @@ class Forwarder:
     def close(self, task_id: str) -> None:
         with self._lock:
             socks = self._by_task.pop(task_id, [])
+            живые = self._carrying.pop(task_id, [])
         for sock in socks:
             self._drop(sock)
+        # И то, что уже течёт: иначе снятый кластер оставляет за собой открытые
+        # туннели, а потолок на узле общий.
+        for sock in живые:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if живые:
+            logger.info("задача %s: закрыл %d живых туннелей", task_id, len(живые))
         self._wake()
 
     def close_all(self) -> None:
@@ -290,16 +309,31 @@ class Forwarder:
             return
         client.setblocking(True)
         client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        threading.Thread(target=self._carry, args=(client, peer_id, port),
+        threading.Thread(target=self._carry,
+                         args=(client, peer_id, port, self._task_of(listener)),
                          name=f"forward-{port}", daemon=True).start()
 
-    def _carry(self, client: socket.socket, peer_id: str, port: int) -> None:
+    def _task_of(self, listener: socket.socket) -> str:
+        """Чей это слушатель. Нужно, чтобы туннель на том конце знал, кого
+        закрывать при снятии задачи."""
+        with self._lock:
+            for task_id, socks in self._by_task.items():
+                if listener in socks:
+                    return task_id
+        return ""
+
+    def _carry(self, client: socket.socket, peer_id: str, port: int,
+               task_id: str = "") -> None:
+        if task_id:
+            with self._lock:
+                self._carrying.setdefault(task_id, []).append(client)
         try:
             # Внутри try, а не снаружи: получение стаба тоже отказывает — на
             # узле без p2p, например. Снаружи такой отказ улетал в поток приёма
             # незамеченным: ни строчки в логе, ни закрытого сокета, а Ray
             # ждал ответа от соединения, которое никто уже не обслуживает.
-            remote = RemoteSide(self.stub_for(peer_id), uuid.uuid4().hex[:12], port)
+            remote = RemoteSide(self.stub_for(peer_id), uuid.uuid4().hex[:12],
+                                port, task_id)
             remote.open()
         except (TunnelRefused, Exception) as exc:
             # Отказ соседа — не наша поломка: Ray переоткроет соединение.
@@ -320,7 +354,14 @@ class Forwarder:
         # именно ими. Их обрыв разваливает кластер, и знать о нём надо. Короткие
         # Ray открывает и закрывает пачками, они в лог не идут.
         started = time.monotonic()
-        why = pump(client, remote, closed=threading.Event())
+        try:
+            why = pump(client, remote, closed=threading.Event())
+        finally:
+            if task_id:
+                with self._lock:
+                    живые = self._carrying.get(task_id)
+                    if живые and client in живые:
+                        живые.remove(client)
         lived = time.monotonic() - started
         говорить = logger.info if lived >= 10 else logger.debug
         говорить("туннель к %s:%d прожил %.0f с и закрылся: %s",
