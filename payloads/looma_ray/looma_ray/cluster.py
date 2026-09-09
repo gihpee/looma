@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import socket
 import subprocess
 import sys
@@ -127,9 +128,37 @@ def _own_cpus() -> int:
     return max(1, int(share)) if share > 0 else 0
 
 
+def allow_cluster_here() -> None:
+    """Снять запрет Ray на многоузловой кластер под macOS.
+
+    Ray отказывается собирать такой кластер и говорит это прямо:
+
+        PANIC -- Multi-node Ray clusters are not supported on Windows and OSX.
+        Restart the Ray cluster with the environment variable
+        RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
+
+    Запрет предупредительный, а не следствие отсутствующей возможности: сам Ray
+    тут же называет переменную, которая его снимает. Мы её и ставим — на узле,
+    который согласился отдать машину под кластер, отказ ради осторожности
+    решает не за нас.
+
+    Только на macOS и только если оператор не сказал своего: он мог выставить
+    ноль нарочно, чтобы увидеть этот отказ вместо неизвестно чего дальше.
+    """
+    if platform.system() != "Darwin":
+        return
+    if os.environ.get("RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER") is None:
+        os.environ["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] = "1"
+        logger.info("macOS: включаю многоузловой режим Ray, который он держит "
+                    "выключенным по умолчанию (RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1)")
+
+
 def start_node(rank: int, size: int, *, gpus: Optional[int] = None,
                base: int = 0, stride: int = 0, temp_dir: str = "") -> str:
     """Поднять узел Ray для этого ранга. Возвращает адрес головы."""
+    # До запуска: подпроцесс наследует окружение этого процесса, и переменная,
+    # поставленная позже, до `ray start` уже не доедет.
+    allow_cluster_here()
     # Окно группы, а не общее для всех: брошенный кластер занимает СВОИ порты,
     # и новый его больше не встречает.
     base = base or group_base(size, stride=stride)

@@ -183,3 +183,58 @@ def test_ранг_поднимается_на_своём_адресе_а_не_н
         адрес = flags[flags.index("--node-ip-address") + 1]
         assert адрес != "127.0.0.1"
         assert адрес == f"127.0.0.{2 + rank}"
+
+
+def test_на_macos_снимается_запрет_на_многоузловой_кластер(monkeypatch):
+    """Ray отказывается собирать такой кластер под macOS и говорит это прямо:
+
+        PANIC -- Multi-node Ray clusters are not supported on Windows and OSX.
+        Restart the Ray cluster with the environment variable
+        RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
+
+    Запрет предупредительный: сам Ray тут же называет переменную, которая его
+    снимает. Со стенда — семь попыток подряд с этим текстом, при том что
+    проброс портов уже работал."""
+    import os
+    import platform
+
+    from looma_ray.cluster import allow_cluster_here
+
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.delenv("RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER", raising=False)
+
+    allow_cluster_here()
+
+    assert os.environ["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "1"
+
+
+def test_слово_оператора_сильнее(monkeypatch):
+    """Он мог выставить ноль нарочно — чтобы увидеть этот отказ, а не то
+    неизвестное, во что упрётся кластер дальше."""
+    import os
+    import platform
+
+    from looma_ray.cluster import allow_cluster_here
+
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setenv("RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER", "0")
+
+    allow_cluster_here()
+
+    assert os.environ["RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER"] == "0"
+
+
+def test_на_linux_ничего_не_трогаем(monkeypatch):
+    """Там запрета нет, и переменная только сбивала бы с толку того, кто её
+    однажды увидит в окружении задачи."""
+    import os
+    import platform
+
+    from looma_ray.cluster import allow_cluster_here
+
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.delenv("RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER", raising=False)
+
+    allow_cluster_here()
+
+    assert "RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER" not in os.environ
