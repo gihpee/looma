@@ -485,12 +485,15 @@ def test_запасной_локалхост_когда_слушают_не_та
         сервер.close()
 
 
-def test_отказ_называет_последний_адрес():
-    """Иначе «не отвечает» относится неизвестно к чему из двух."""
+def test_отказ_называет_все_адреса():
+    """Их три — адрес ранга, локалхост и адрес машины. Назвать один значит
+    отправить искать не там: «не отвечает 192.168.1.5» читается как проблема
+    сети, хотя проверялись ещё два локальных."""
     from looma_agent.p2p.tunnel import Endpoint
 
-    endpoint = Endpoint(allow=lambda _p: True, host_for=lambda _p: "127.0.0.1")
+    endpoint = Endpoint(allow=lambda _p: True, host_for=lambda _p: "127.0.0.9")
     ответ = endpoint.connect("c2", 1)
 
     assert not ответ["ok"]
-    assert "127.0.0.1:1" in ответ["error"]
+    assert "порт 1" in ответ["error"]
+    assert "127.0.0.9" in ответ["error"] and "127.0.0.1" in ответ["error"]

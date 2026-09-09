@@ -404,6 +404,10 @@ class Agent:
         # while the stream is still up means the orchestrator hears why.
         self.tasks.stop_all()
         self.commands.shutdown()
+        # До закрытия управляющего канала: p2p держит свой порт, и без явного
+        # закрытия следующий запуск находит его занятым — берёт соседний, а
+        # соседи продолжают искать узел по прежнему номеру.
+        self.peers.close()
         self.client.stop()
 
 

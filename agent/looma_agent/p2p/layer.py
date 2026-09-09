@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from dataclasses import replace
 import time
 from typing import Callable, List, Optional
 
@@ -28,6 +29,11 @@ from looma_agent.p2p.peer import (
 from looma_agent.proto import agent_pb2
 
 logger = logging.getLogger("looma_agent.p2p")
+
+# Сколько ждать, прежде чем судить о достижимости узла. AutoNAT высказывается не
+# мгновенно, а резервация на реле — это обмен с ним по сети. Раньше приговор
+# выносился через доли секунды после старта и не отзывался никогда.
+REACHABILITY_DELAY_S = float(os.environ.get("LOOMA_REACHABILITY_DELAY_S", "10"))
 
 # The numbers this samples change on the scale of a network path settling, not
 # of a token. Slow on purpose.
@@ -135,18 +141,37 @@ class PeerLayer:
             rtt=node.rtt_ms,
             relay_rtt=node.relay_rtt_ms,
         )
-        self._report_reachability(relay_addrs)
+        # Не сразу: адреса узла и резервация на реле приходят не в тот же миг,
+        # что и старт. Со стенда — предупреждение «реле не дало резервации»
+        # печаталось через доли секунды после подъёма узла, когда обмен с реле
+        # ещё физически не мог состояться, и больше никогда не отзывалось. В
+        # логе оно выглядело поломкой при исправном реле.
+        threading.Timer(REACHABILITY_DELAY_S, self._report_reachability,
+                        args=(relay_addrs,)).start()
 
     def _report_reachability(self, relay_addrs: List[str]) -> None:
         """Say plainly which of the several silent failures this node is in.
+
+        Вызывается с задержкой (REACHABILITY_DELAY_S) и берёт адреса ЗАНОВО, а
+        не те, что были при старте: к этому времени AutoNAT успевает высказаться,
+        а реле — выдать резервацию.
 
         They look identical from the outside — node up, peer id reported,
         nobody can reach it — and have nothing in common. Naming which one it
         is saves the whole investigation.
         """
+        if self.node is None:
+            return          # узел успели закрыть, пока мы ждали
         identity = self.identity
         if identity is None:
             return
+        # Свежие, а не запомненные при старте: ради этого всё и откладывалось.
+        try:
+            видно = self.node.visible_addrs()
+        except Exception:
+            видно = list(identity.visible_addrs)
+        if видно:
+            identity = replace(identity, visible_addrs=видно)
         if identity.symmetric_nat:
             logger.warning(
                 "this node is behind a symmetric NAT: peers cannot open a direct "
@@ -186,6 +211,27 @@ class PeerLayer:
                 "port %d (TCP and UDP), or run a relay (docs/P2P_RELAY.md)",
                 port,
             )
+
+    def close(self) -> None:
+        """Закрыть узел p2p и отпустить его порт.
+
+        Со стенда: агента остановили, подняли снова — и он сообщил, что порт
+        47100 занят, взяв 47101. Дальше номер рос с каждым перезапуском, а
+        соседи продолжали искать узел там, где его больше нет.
+
+        Держал порт прежний процесс: узел никогда не закрывался, и его
+        освобождение зависело от того, как быстро система разберёт умерший
+        процесс. Здесь это делается явно и до выхода.
+        """
+        node, self.node = self.node, None
+        if node is None:
+            return
+        try:
+            node.close()
+        except Exception:
+            logger.debug("p2p node did not close cleanly", exc_info=True)
+        else:
+            logger.info("p2p node closed, port %d released", node.port)
 
     def _start_sampler(self) -> None:
         if self._sampler is not None and self._sampler.is_alive():

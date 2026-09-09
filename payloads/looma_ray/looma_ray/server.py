@@ -261,6 +261,14 @@ def main(argv=None) -> int:
         # проверяет живость и раздаёт работу — и если там адрес чужой локальной
         # сети, до узла никто не дотянется.
         logger.info("узлы в кластере: %s", cluster.registered_addresses())
+        if args.rank == 0:
+            # Отдельно от сборки: кластер бывает жив, а вход снаружи — нет, и
+            # тогда `looma-connect` получает «connection refused», что читается
+            # как поломка сети между машинами.
+            беда = cluster.client_entry_ready(STATE["client_port"])
+            if беда:
+                STATE["error"] = беда
+                logger.warning("%s", беда)
 
         if args.rank == 0 and args.script:
             code = run_script(args.script, address)

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import List, Optional
 
 from looma_ray.ports import (RankPorts, group_base, head_address, loopback_for,
@@ -57,6 +58,21 @@ class ClusterRefused(RuntimeError):
 
 class Stopped(ClusterRefused):
     """Сборку прервали снаружи. Не отказ — решение."""
+
+
+def _own_address() -> str:
+    """Адрес этой машины в её сети. Часть служб Ray биндится на него, а не на
+    петлю, и тогда проверка по одному локалхосту говорит «не принимает» о
+    работающем сервере."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 53))
+        found = probe.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        probe.close()
+    return "" if not found or found.startswith("127.") else found
 
 
 def _reachable(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -176,6 +192,8 @@ def start_node(rank: int, size: int, *, gpus: Optional[int] = None,
         # подключиться снаружи будет нечем.
         if client_server_available():
             argv += ["--ray-client-server-port", str(ports.client_server)]
+            logger.info("клиентский вход будет на %s:%d",
+                        loopback_for(0), ports.client_server)
         else:
             logger.info("ray[client] не установлен: внешнего входа у кластера "
                         "не будет (добавьте ray[client] в требования)")
@@ -233,6 +251,65 @@ def ray_version() -> str:
         return str(ray.__version__)
     except Exception:
         return ""
+
+
+def client_entry_ready(port: int, *, wait_s: float = 30.0) -> str:
+    """Принимает ли клиентский вход. Пусто — принимает; иначе почему нет.
+
+    Проверяется отдельно от сборки кластера, потому что ломается отдельно:
+    кластер собирается, узлы в нём, всё живо — а `looma-connect` получает
+    «connection refused» и выглядит это поломкой сети между машинами. Со стенда
+    ровно так и было, дважды.
+
+    С ожиданием: клиентский сервер поднимается не в ту же секунду, что и голова,
+    и проверка сразу после `ray start` застаёт его на полпути.
+    """
+    if not port:
+        return ("клиентский вход не поднимался: в этой установке нет ray[client]. "
+                "Кластер работает, но подключиться снаружи нечем")
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if STOP.is_set():
+            return ""
+        for host in (loopback_for(0), "127.0.0.1", _own_address()):
+            if not host:
+                continue
+            if _reachable(host, port, timeout=1.0):
+                logger.info("клиентский вход принимает на %s:%d", host, port)
+                return ""
+        STOP.wait(1.0)
+    return (f"клиентский вход Ray не принимает на порту {port} ни на "
+            f"{loopback_for(0)}, ни на 127.0.0.1 за {wait_s:.0f}с. Кластер при "
+            "этом собран и работает — не работать будет только подключение "
+            "снаружи (looma-connect)." + client_server_said())
+
+
+def client_server_said(temp_dir: str = "") -> str:
+    """Что Ray написал в лог своего клиентского сервера.
+
+    Он пишет туда, и только туда: `ray start` про его неудачу молчит и код
+    возврата не меняет. Без этих строк «вход не принимает» — тупик, а с ними
+    видно, на чём именно он не поднялся.
+    """
+    base = Path(temp_dir or os.environ.get("RAY_TMPDIR")
+                or os.environ.get("LOOMA_TASK_TMP") or "/tmp")
+    try:
+        logs = sorted(base.glob("session_*/logs/ray_client_server*"))
+    except OSError:
+        return ""
+    if not logs:
+        return (f" Лога клиентского сервера в {base} нет вовсе — похоже, Ray "
+                "его и не запускал")
+    сказано = []
+    for path in logs[-2:]:
+        try:
+            строки = [s.strip() for s in path.read_text(
+                errors="replace").splitlines() if s.strip()]
+        except OSError:
+            continue
+        if строки:
+            сказано.append(f"{path.name}: " + " / ".join(строки[-5:]))
+    return (" Клиентский сервер сказал: " + "; ".join(сказано)) if сказано else ""
 
 
 def client_port(size: int, *, base: int = 0, stride: int = 0) -> int:

@@ -50,6 +50,23 @@ class TunnelRefused(RuntimeError):
     """Туннель не открылся, и вот почему."""
 
 
+def _own_address() -> str:
+    """Адрес этой машины в её сети. Пусто — если его нет.
+
+    Тем же приёмом, что и в tasks/forward.py: спросить у таблицы маршрутизации,
+    с какого адреса она пошла бы наружу. Пакет при этом не уходит.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 53))
+        found = probe.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        probe.close()
+    return "" if not found or found.startswith("127.") else found
+
+
 class Endpoint:
     """Наша сторона: принимает соединения, которые открывают соседи.
 
@@ -87,19 +104,27 @@ class Endpoint:
         # какой где, зависит от версии. Со стенда: кластер собрался и работал,
         # а `looma-connect` получал «127.0.0.2:25607 не отвечает» — там сидел
         # локалхост.
+        # Третьим — адрес самой машины: часть служб Ray биндится на него, а не
+        # на петлю, и тогда оба локальных адреса отвечают отказом о работающем
+        # сервере.
         candidates = [self.host_for(port) or "127.0.0.1"]
-        if "127.0.0.1" not in candidates:
-            candidates.append("127.0.0.1")
-        sock, refusal = None, ""
+        for спутник in ("127.0.0.1", _own_address()):
+            if спутник and спутник not in candidates:
+                candidates.append(спутник)
+        sock, refusals = None, []
         for host in candidates:
             try:
                 sock = socket.create_connection((host, port),
                                                 timeout=CONNECT_TIMEOUT_S)
                 break
             except OSError as exc:
-                refusal = f"{host}:{port} не отвечает: {exc}"
+                refusals.append(f"{host} ({exc.strerror or exc})")
         if sock is None:
-            return {"ok": False, "error": refusal}
+            # Все адреса, а не последний: иначе из отказа не видно, где вообще
+            # искали, и «не отвечает 192.168.1.5» читается как проблема сети,
+            # хотя проверялись ещё два локальных.
+            return {"ok": False,
+                    "error": f"порт {port} не отвечает нигде: " + ", ".join(refusals)}
         sock.settimeout(None)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         with self._lock:

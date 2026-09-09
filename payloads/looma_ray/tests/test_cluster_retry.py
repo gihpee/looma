@@ -238,3 +238,54 @@ def test_на_linux_ничего_не_трогаем(monkeypatch):
     allow_cluster_here()
 
     assert "RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER" not in os.environ
+
+
+def test_вход_снаружи_проверяется_отдельно_от_кластера(monkeypatch, tmp_path):
+    """Со стенда, дважды: кластер собран, оба узла в нём, всё живо — а
+    `looma-connect` получает «connection refused». Читается это как поломка
+    сети между машинами, хотя сеть ни при чём: не поднялся клиентский вход."""
+    from looma_ray import cluster
+
+    monkeypatch.setattr(cluster, "_reachable", lambda *a, **kw: False)
+    monkeypatch.setenv("RAY_TMPDIR", str(tmp_path))
+
+    беда = cluster.client_entry_ready(31807, wait_s=0.2)
+
+    assert "31807" in беда
+    assert "кластер" in беда.lower(), "молчит о том, что сам кластер при этом жив"
+
+
+def test_без_ray_client_говорится_прямо(monkeypatch):
+    """Порт ноль означает, что вход не поднимали вовсе: в установке нет
+    ray[client]. Это не поломка, но подключиться снаружи будет нечем."""
+    from looma_ray import cluster
+
+    беда = cluster.client_entry_ready(0)
+
+    assert "ray[client]" in беда
+
+
+def test_слова_клиентского_сервера_попадают_в_отказ(monkeypatch, tmp_path):
+    """`ray start` про его неудачу молчит и код возврата не меняет — Ray пишет
+    её только в свой лог. Без этих строк «вход не принимает» остаётся тупиком."""
+    from looma_ray import cluster
+
+    logs = tmp_path / "session_2026" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "ray_client_server.err").write_text("Traceback\nAddress already in use\n")
+    monkeypatch.setattr(cluster, "_reachable", lambda *a, **kw: False)
+    monkeypatch.setenv("RAY_TMPDIR", str(tmp_path))
+
+    беда = cluster.client_entry_ready(31807, wait_s=0.2)
+
+    assert "Address already in use" in беда
+
+
+def test_вход_принимает_молча(monkeypatch):
+    """Хорошая новость не должна занимать место в логе задачи наравне с плохой:
+    отсутствие отказа и есть отсутствие проблемы."""
+    from looma_ray import cluster
+
+    monkeypatch.setattr(cluster, "_reachable", lambda *a, **kw: True)
+
+    assert cluster.client_entry_ready(31807, wait_s=5.0) == ""
