@@ -27,3 +27,27 @@ def test_недоступный_путь_даёт_нули_а_не_падени�
     from looma_agent.hwinfo import disk_bytes
 
     assert disk_bytes("/такого-пути-нет-и-не-будет") == (0, 0)
+
+
+def test_на_маке_берутся_обычные_колёса_а_не_cpu():
+    """Со стенда: узел на Apple ставил torch с индекса «cpu», потому что карты
+    NVIDIA у него нет. Но на Apple Silicon именно обычные колёса с PyPI собраны
+    с Metal, а на индексе «cpu» лежит сборка без него — то есть выбор отнимал у
+    Mac единственный ускоритель."""
+    import platform
+
+    from looma_agent.tasks.env.python import _torch_tag
+
+    tag = _torch_tag(["torch", "transformers"])
+    if platform.system() == "Darwin":
+        assert tag == "", "на Mac индекс подменять нельзя"
+    else:
+        assert tag in ("", "cpu") or tag.startswith("cu")
+
+
+def test_без_torch_индекс_не_трогаем():
+    """Требования без torch не должны уводить весь набор на чужой индекс:
+    остальные пакеты живут на PyPI."""
+    from looma_agent.tasks.env.python import _torch_tag
+
+    assert _torch_tag(["transformers", "safetensors"]) == ""

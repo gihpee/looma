@@ -52,6 +52,27 @@ def available() -> bool:
     return platform.system() == "Darwin" and os.path.exists(SANDBOX_EXEC)
 
 
+def interpreter_roots() -> List[str]:
+    """Где лежит питон, которым всё это работает.
+
+    Задача запускается интерпретатором из своего окружения, но стандартная
+    библиотека у него общая с тем, от которого окружение создано, — в venv её
+    копии нет. В пакете этот питон лежит ВНУТРИ каталога агента, а тот закрыт
+    целиком, и получается интерпретатор без собственного `encodings`:
+
+        Fatal Python error: init_fs_encoding: failed to get the Python codec
+        ModuleNotFoundError: No module named 'encodings'
+
+    Открываем только на чтение и только сам питон: ключ узла лежит не тут, а
+    рядом с ним, и остаётся закрытым.
+    """
+    found: List[str] = []
+    for root in (sys.base_prefix, sys.prefix):
+        if root and root not in found:
+            found.append(root)
+    return found
+
+
 def guards_home(agent_root: Path) -> bool:
     """Закрывать ли дом хозяина целиком.
 
@@ -110,9 +131,22 @@ def profile(*, task_dir: Path, scratch: Path, envs_dir: Path,
         "",
         ";; Каталог агента: там ключ узла, его payload и задачи соседей.",
         '(deny file-read* file-write* (subpath (param "LOOMA_ROOT")))',
+        # Но пройти СКВОЗЬ него можно. Иначе непроходим и путь к тому, что
+        # задаче выдано: её окружение лежит внутри этого же каталога, и поиск
+        # интерпретатора по PATH упирается в realpath на промежуточной папке.
+        # Со стенда это выглядело как "execvp() of python failed: No such file
+        # or directory" — то есть не как запрет, а как отсутствие файла.
+        #
+        # Метаданные — это существование, права и размер; содержимое остаётся
+        # закрытым. Проверено: ключ узла из-под такой политики не читается.
+        '(allow file-read-metadata (subpath (param "LOOMA_ROOT")))',
         "",
         ";; Системное — читать можно, менять нельзя.",
         *(f'(deny file-write* (subpath "{path}"))' for path in READ_ONLY),
+        "",
+        ";; Питон, которым запускается сама задача: стандартная библиотека у",
+        ";; него общая с тем, от которого создано окружение.",
+        *(f'(allow file-read* (subpath "{root}"))' for root in interpreter_roots()),
         "",
         ";; И только теперь — то, что выдано этой задаче.",
         '(allow file-read* file-write* (subpath (param "LOOMA_TASK")))',

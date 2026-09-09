@@ -384,7 +384,11 @@ def test_индекс_torch_заменяет_а_не_дополняет():
 
     from looma_agent.tasks.env.python import _torch_index
 
-    with mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=(12, 4)):
+    # Платформа задаётся явно: на macOS выбор колеса по драйверу не делается
+    # вовсе (там обычные колёса с PyPI и есть сборка с Metal), и тест проверял
+    # бы не ту ветку, а её отсутствие.
+    with mock.patch("platform.system", return_value="Linux"), \
+         mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=(12, 4)):
         flags = _torch_index(["torch"])
     assert flags[0] == "--index-url", \
         "--extra-index-url не гарантирует сборку: pip выберет версию повыше"
@@ -398,7 +402,8 @@ def test_способ_сборки_входит_в_имя_окружения():
 
     from looma_agent.tasks.env.python import RECIPE, wheel_variant
 
-    with mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=(12, 4)):
+    with mock.patch("platform.system", return_value="Linux"), \
+         mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=(12, 4)):
         assert wheel_variant(["torch"]) == f"cu124-r{RECIPE}"
 
 
@@ -414,9 +419,14 @@ def test_колесо_torch_выбирается_под_драйвер_узла(
 
     from looma_agent.tasks.env.python import _torch_index
 
-    with mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=(12, 4)):
+    # Платформа задаётся явно: на macOS выбор колеса по драйверу не делается
+    # вовсе (там обычные колёса с PyPI и есть сборка с Metal), и тест проверял
+    # бы не ту ветку, а её отсутствие.
+    with mock.patch("platform.system", return_value="Linux"), \
+         mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=(12, 4)):
         assert _torch_index(["torch"])[-1].endswith("/cu124")
-    with mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=(12, 8)):
+    with mock.patch("platform.system", return_value="Linux"), \
+         mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=(12, 8)):
         assert _torch_index(["torch"])[-1].endswith("/cu128")
 
 
@@ -426,7 +436,8 @@ def test_без_карты_берутся_cpu_колёса():
 
     from looma_agent.tasks.env.python import _torch_index
 
-    with mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=None):
+    with mock.patch("platform.system", return_value="Linux"), \
+         mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=None):
         assert _torch_index(["torch"])[-1].endswith("/cpu")
 
 
@@ -444,9 +455,11 @@ def test_смена_драйвера_даёт_новое_окружение(tmp_
 
     cache = EnvironmentCache(tmp_path / "envs")
     spec = EnvSpec(kind="python", requirements=("torch",))
-    with mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=(12, 4)):
+    with mock.patch("platform.system", return_value="Linux"), \
+         mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=(12, 4)):
         old = cache._key(spec)
-    with mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=(12, 8)):
+    with mock.patch("platform.system", return_value="Linux"), \
+         mock.patch("looma_agent.hwinfo.cuda_driver_version", return_value=(12, 8)):
         new = cache._key(spec)
     assert old != new
     assert "cu124" in old and "cu128" in new

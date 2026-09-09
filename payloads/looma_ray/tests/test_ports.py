@@ -190,3 +190,29 @@ def test_точка_встречи_лежит_в_проброшенном_окн
     зависание на init_process_group без единого слова о причине."""
     порт = int(client_env(2, 1)["MASTER_PORT"])
     assert порт in set(ports_for(0).crossing())
+
+
+def test_отказ_агента_доходит_словами(monkeypatch):
+    """Со стенда: задача упала с «HTTP Error 502: Bad Gateway» и стеком из
+    urllib — из чего не следует ничего. Причина при этом лежала в теле ответа,
+    и агент её честно написал; читать его никто не стал."""
+    import io
+    import urllib.error
+    import urllib.request
+
+    from looma_ray import server
+
+    monkeypatch.setattr(server, "AGENT_URL", "http://127.0.0.1:1")
+
+    def отказ(*_a, **_kw):
+        raise urllib.error.HTTPError(
+            "http://x/forward", 502, "Bad Gateway", {},
+            io.BytesIO("порт 20100 на 127.0.0.3 занят".encode()))
+
+    monkeypatch.setattr(urllib.request, "urlopen", отказ)
+
+    with pytest.raises(SystemExit) as упало:
+        server.ask_forwarding(2, 1)
+
+    assert "127.0.0.3" in str(упало.value)
+    assert "502" in str(упало.value)

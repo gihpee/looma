@@ -214,3 +214,115 @@ def test_дом_не_закрывается_если_агент_живёт_в_н
                            models_dir=tmp_path, agent_root=tmp_path)
     assert '(subpath "/Users")' not in text
     assert '(deny file-read* file-write* (subpath (param "LOOMA_ROOT")))' in text
+
+
+def test_интерпретатор_ищется_по_PATH_как_у_настоящей_задачи(node):
+    """Ровно то, обо что стадия споткнулась на стенде.
+
+    Агент запускает `python -m looma_stage.server`, а не полный путь: команду
+    пишет оркестратор, и где на этом узле лежит окружение, он не знает. Поиск
+    по PATH зовёт realpath на каталоге окружения, тот лежит ВНУТРИ корня
+    агента, а корень закрыт целиком — и запрет доходит до execvp как «No such
+    file or directory», то есть выглядит отсутствием файла, а не отказом.
+
+    Прежняя проверка запускала скрипт по полному пути и этого не ловила.
+    """
+    root, task, scratch = node
+    bindir = root / "envs" / "e1" / "bin"
+    bindir.mkdir(parents=True)
+    fake = bindir / "python"
+    fake.write_text("#!/bin/sh\necho started\n")
+    fake.chmod(0o755)
+
+    profile = sandbox.prepare(task_dir=task, scratch=scratch,
+                              envs_dir=root / "envs", models_dir=root / "models",
+                              agent_root=root)
+    done = subprocess.run(
+        sandbox.wrap(["python"], profile_path=profile, task_dir=task,
+                     scratch=scratch, envs_dir=root / "envs",
+                     models_dir=root / "models", agent_root=root),
+        capture_output=True, text=True, timeout=60,
+        # Как у задачи: окружение впереди системных путей.
+        env={"PATH": f"{bindir}:/usr/bin:/bin"})
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "started"
+
+
+def test_сквозной_проход_не_открывает_содержимое(node):
+    """Проход по каталогу агента разрешён, чтение — нет. Иначе задача добралась
+    бы до ключа узла, ради закрытия которого всё и делается."""
+    root, task, scratch = node
+    profile = sandbox.prepare(task_dir=task, scratch=scratch,
+                              envs_dir=root / "envs", models_dir=root / "models",
+                              agent_root=root)
+    проба = task / "work" / "probe2.py"
+    проба.write_text(
+        "import sys\n"
+        "try:\n"
+        "    open(sys.argv[1]).read(); print('read')\n"
+        "except Exception:\n"
+        "    print('denied')\n"
+        "import os\n"
+        "print('exists' if os.path.exists(sys.argv[1]) else 'missing')\n")
+    done = subprocess.run(
+        sandbox.wrap([SYSTEM_PYTHON, str(проба), str(root / "secret.key")],
+                     profile_path=profile, task_dir=task, scratch=scratch,
+                     envs_dir=root / "envs", models_dir=root / "models",
+                     agent_root=root),
+        capture_output=True, text=True, timeout=60)
+
+    строки = done.stdout.split()
+    assert строки[0] == "denied", "содержимое ключа доступно"
+    # Существование видно — это и есть цена прохода, и она приемлема: имя файла
+    # ключом не является.
+    assert строки[1] == "exists"
+
+
+def test_окружение_задачи_находит_стандартную_библиотеку(node, tmp_path):
+    """Со стенда, дважды подряд.
+
+    Задача запускается интерпретатором из своего окружения, но стандартной
+    библиотеки в venv нет — она общая с тем питоном, от которого окружение
+    создано. В пакете этот питон лежит ВНУТРИ каталога агента, а тот закрыт
+    целиком, и получался интерпретатор без собственного `encodings`:
+
+        Fatal Python error: init_fs_encoding: failed to get the Python codec
+        ModuleNotFoundError: No module named 'encodings'
+
+    Здесь venv создаётся от того питона, которым идут тесты; полное
+    воспроизведение требует питона внутри корня, как в собранном пакете, но
+    проверяемое одно и то же — интерпретатор окружения обязан запуститься.
+    """
+    import venv as venv_mod
+
+    root, task, scratch = node
+    окружение = root / "envs" / "e1"
+    venv_mod.create(окружение, with_pip=False)
+
+    profile = sandbox.prepare(task_dir=task, scratch=scratch,
+                              envs_dir=root / "envs", models_dir=root / "models",
+                              agent_root=root)
+    done = subprocess.run(
+        sandbox.wrap([str(окружение / "bin" / "python"), "-c", "print('ok')"],
+                     profile_path=profile, task_dir=task, scratch=scratch,
+                     envs_dir=root / "envs", models_dir=root / "models",
+                     agent_root=root),
+        capture_output=True, text=True, timeout=120)
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "ok"
+
+
+def test_питон_открыт_а_ключ_рядом_с_ним_нет(node):
+    """Открывается каталог интерпретатора, а не корень агента: ключ узла лежит
+    рядом с ним и обязан остаться закрытым."""
+    root, task, scratch = node
+    текст = sandbox.profile(task_dir=task, scratch=scratch,
+                            envs_dir=root / "envs", models_dir=root / "models",
+                            agent_root=root)
+
+    for корень in sandbox.interpreter_roots():
+        assert f'(allow file-read* (subpath "{корень}"))' in текст
+    # И только на чтение: подменить питон задача не может.
+    assert 'file-write* (subpath (param "LOOMA_ROOT"))' in текст

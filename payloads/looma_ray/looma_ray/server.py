@@ -138,8 +138,22 @@ def ask_forwarding(size: int, rank: int) -> dict:
     request = urllib.request.Request(
         f"{AGENT_URL}/forward", data=json.dumps(body).encode(), method="POST",
         headers={"Content-Type": "application/json", "X-Looma-Task": TASK_ID})
-    with urllib.request.urlopen(request, timeout=60) as answer:
-        return json.loads(answer.read() or b"{}")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as answer:
+            return json.loads(answer.read() or b"{}")
+    except urllib.error.HTTPError as отказ:
+        # Причина лежит в ТЕЛЕ ответа, а сам HTTPError её не показывает: в
+        # traceback видно только «HTTP Error 502: Bad Gateway», из чего не
+        # следует ничего. Со стенда: за этим кодом скрывалось «порт занят» —
+        # на macOS адрес ранга на петле не существовал, пока его не завели.
+        причина = ""
+        try:
+            причина = отказ.read().decode("utf-8", "replace").strip()
+        except Exception:
+            pass
+        raise SystemExit(
+            f"агент отказал в пробросе портов ({отказ.code}): "
+            f"{причина or 'без объяснения'}") from None
 
 
 def serve_health(port: int) -> ThreadingHTTPServer:

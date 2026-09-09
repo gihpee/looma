@@ -108,6 +108,13 @@ def _torch_tag(requirements: Sequence[str]) -> str:
         return ""
     from looma_agent.hwinfo import cuda_driver_version
 
+    import platform
+
+    if platform.system() == "Darwin":
+        # Обычные колёса с PyPI, без своего индекса. На Apple Silicon именно
+        # они собраны с Metal, а на индексе «cpu» лежит сборка без него — то
+        # есть выбор «cpu-колёс» отнял бы у Mac единственный ускоритель.
+        return ""
     driver = cuda_driver_version()
     if driver is None:
         # Карты нет или её не видно — CPU-колёса вместо гигабайтов CUDA,

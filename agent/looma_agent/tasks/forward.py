@@ -37,6 +37,7 @@ import uuid
 from typing import Callable, Dict, List, Optional
 
 from looma_agent.p2p.tunnel import RemoteSide, TunnelRefused, pump
+from looma_agent.tasks import loopback
 
 logger = logging.getLogger("looma_agent.tasks.forward")
 
@@ -191,6 +192,10 @@ class Forwarder:
                 where: List[str]) -> List[socket.socket]:
         made: List[socket.socket] = []
         for host in where:
+            # На macOS из всей петли назначен только 127.0.0.1, и адрес ранга
+            # приходится заводить (tasks/loopback.py). На Linux это ничего не
+            # делает: там вся 127.0.0.0/8 уже поднята.
+            loopback.ensure(host)
             sock = socket.socket()
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:

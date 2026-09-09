@@ -26,6 +26,7 @@ from looma_agent import recent
 from looma_agent.proto import agent_pb2
 from looma_agent.tasks import channel as channel_mod
 from looma_agent.p2p.tunnel import Endpoint
+from looma_agent.tasks import loopback
 from looma_agent.tasks.forward import Forwarder
 from looma_agent.tasks.groups import GroupTable, group_from_proto
 from looma_agent.tasks.registry import TaskRegistry
@@ -344,6 +345,12 @@ class TaskCommands:
         if not ports and not external:
             raise TaskRefused("в раскладке нет ни одного порта")
         own = hosts.get(group.rank, "")
+        # Свой адрес нужен раньше слушателей: на нём поднимется САМ Ray этого
+        # ранга, а не наш проброс. Без него `ray start --node-ip-address` падает
+        # на «Can't assign requested address» — там, где адреса на петле не
+        # заведены заранее (macOS).
+        if own:
+            loopback.ensure(own)
         if external:
             # На том же адресе, что и остальное наше: внешний вход — это порт
             # нашего же Ray, и если тот слушает не локалхост, то и здесь тоже.

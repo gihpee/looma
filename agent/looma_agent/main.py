@@ -42,6 +42,7 @@ from looma_agent.tasks.env import EnvironmentCache
 from looma_agent.tasks.env.cache import BUILDERS as ENVIRONMENT_KINDS
 from looma_agent.tasks.limits import resolve_isolation
 from looma_agent.tasks.models import ModelCache
+from looma_agent.tasks import loopback
 from looma_agent.tasks.registry import TaskRegistry
 from looma_agent.update import Updater, mark_healthy
 from looma_agent.control.tasks import TaskCommands
@@ -357,6 +358,9 @@ class Agent:
 
     def stop(self) -> None:
         self._stop.set()
+        # Адреса, поднятые на петле ради кластера, — единственное, что агент
+        # менял в настройках машины. Уходя, возвращаем как было.
+        loopback.release_all()
         # Tasks first: they are somebody's work, and stopping them politely
         # while the stream is still up means the orchestrator hears why.
         self.tasks.stop_all()
