@@ -99,6 +99,9 @@ class Agent:
         self.node_id = config.node_id or default_node_id()
         self.hardware = hardware_message()
         self._stop = threading.Event()
+        # Взведён, пока идёт сбор доклада. Против накопления потоков там, где
+        # застрял первый.
+        self._collecting = threading.Event()
         self.isolation = resolve_isolation()
         self.tasks = TaskRegistry(
             root=config.tasks_dir,
@@ -294,7 +297,43 @@ class Agent:
             self._refresh_vram()
             self._save_status()
             if self.client.registered:
-                self.client.send(self._telemetry())
+                report = self._telemetry_or_none()
+                if report is not None:
+                    self.client.send(report)
+
+    def _telemetry_or_none(self):
+        """Собрать доклад, но не ждать его дольше удара сердца.
+
+        Собирается он из нескольких источников, и один из них — состояние p2p —
+        уходит в чужую библиотеку, где может задержаться неизвестно насколько.
+        Раньше такая задержка останавливала ВЕСЬ цикл: узел переставал
+        отчитываться, оркестратор считал его молчащим, а процесс при этом жил и
+        выглядел здоровым. Со стенда — ровно так: снимок отстал на десять минут
+        при живом агенте.
+
+        None означает «в этот раз не успели». Пропустить один доклад дешевле,
+        чем встать: следующий удар сердца попробует снова.
+        """
+        if self._collecting.is_set():
+            # Прошлый сбор ещё не вернулся. Заводить второй значит копить
+            # потоки на том же самом месте, где застрял первый.
+            logger.warning("сбор доклада идёт дольше удара сердца; пропускаю")
+            return None
+        готово = []
+        self._collecting.set()
+
+        def собрать() -> None:
+            try:
+                готово.append(self._telemetry())
+            except Exception:
+                logger.debug("доклад не собрался", exc_info=True)
+            finally:
+                self._collecting.clear()
+
+        worker = threading.Thread(target=собрать, name="telemetry", daemon=True)
+        worker.start()
+        worker.join(self.config.heartbeat_interval_s)
+        return готово[0] if готово else None
 
     def _save_status(self) -> None:
         """Снимок для панели провайдера — рядом с ударом сердца, а не отдельным

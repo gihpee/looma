@@ -27,8 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from looma_ray import cluster
-from looma_ray.ports import (client_env, crossing_for_group, hosts_for_group,
-                             ports_for)
+from looma_ray.ports import (client_env, crossing_for_group, essential_for_group,
+                             hosts_for_group, ports_for)
 
 logging.basicConfig(level=os.environ.get("LOOMA_LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -228,6 +228,20 @@ def main(argv=None) -> int:
         if bridged.get("listening"):
             logger.info("агент слушает %d чужих портов для рангов %s",
                         bridged["listening"], bridged.get("ranks"))
+        # Занятый рабочий порт агент теперь пропускает, а не роняет задачу:
+        # Ray их обойдёт. Но если пропущен порт головы или диспетчера узла,
+        # присоединяться некуда — и сказать это надо сейчас, а не после
+        # пятнадцати минут попыток в пустоту.
+        пропущено = set(bridged.get("skipped") or [])
+        важные = пропущено & essential_for_group(args.size)
+        if важные:
+            raise cluster.ClusterRefused(
+                "на этом узле заняты порты, без которых кластер не собрать: "
+                f"{sorted(важные)}. Похоже, там живёт группа прошлой попытки — "
+                "снимите её или поднимите кластер заново, он возьмёт другое окно")
+        if пропущено:
+            logger.warning("занято и пропущено %d рабочих портов — Ray обойдёт: %s",
+                           len(пропущено), sorted(пропущено)[:8])
         # ДО `ray start`, а не после: воркеры Ray наследуют окружение своего
         # raylet, и это единственный момент, когда мы можем в него что-то
         # положить. После запуска актора его окружение уже не наше.

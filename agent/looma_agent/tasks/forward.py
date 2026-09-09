@@ -128,11 +128,23 @@ class Forwarder:
 
         opened: List[socket.socket] = []
         ports_open = 0
+        skipped: List[int] = []
         try:
             for rank, peer_id in sorted(remote.items()):
                 where = [hosts[rank]] if rank in hosts else self._hosts()
                 for port in ports.get(rank, []):
-                    opened.extend(self._listen(port, peer_id, where))
+                    try:
+                        opened.extend(self._listen(port, peer_id, where))
+                    except ForwardRefused as отказ:
+                        # Один занятый порт из девяноста трёх — не повод ронять
+                        # задачу целиком. Рабочих портов у Ray шесть десятков,
+                        # и занятый он просто обойдёт; а вот без порта головы
+                        # кластер не соберётся. Что именно случилось, знает
+                        # только сама задача — она одна знает, какой порт чему
+                        # служит. Поэтому здесь список, а не отказ.
+                        logger.warning("задача %s: %s", task_id, отказ)
+                        skipped.append(port)
+                        continue
                     ports_open += 1
         except Exception:
             for sock in opened:
@@ -148,7 +160,12 @@ class Forwarder:
                     task_id, ports_open, sorted(remote),
                     ", ".join(hosts.get(rank) or "+".join(self._hosts())
                               for rank in sorted(remote)))
-        return {"listening": ports_open, "ranks": sorted(remote)}
+        if skipped:
+            logger.warning("задача %s: %d портов из %d заняты и пропущены: %s",
+                           task_id, len(skipped), ports_open + len(skipped),
+                           ", ".join(str(p) for p in skipped[:12]))
+        return {"listening": ports_open, "ranks": sorted(remote),
+                "skipped": skipped}
 
     def close(self, task_id: str) -> None:
         with self._lock:
@@ -205,8 +222,10 @@ class Forwarder:
                 for done in made:
                     self._drop(done)
                 raise ForwardRefused(
-                    f"порт {port} на {host} занят ({exc}); если ранги делят "
-                    "машину, их диапазоны обязаны различаться") from None
+                    f"порт {port} на {host} занят ({exc}); либо ранги делят "
+                    "машину и их диапазоны совпали, либо порт остался от "
+                    "прошлой группы — посмотрите, кто его держит "
+                    f"(lsof -nP -iTCP:{port} -sTCP:LISTEN)") from None
             sock.listen(BACKLOG)
             sock.setblocking(False)
             with self._lock:

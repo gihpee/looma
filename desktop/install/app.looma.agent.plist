@@ -52,6 +52,10 @@
     <key>PYTHONUNBUFFERED</key><string>1</string>
   </dict>
 
+  <!-- Маска демона: без неё launchd создаёт лог под 0600 у root, и панель,
+       работающая под обычным пользователем, его не прочитает. -->
+  <key>Umask</key><integer>18</integer>
+
   <key>StandardOutPath</key><string>/Library/Logs/Looma/agent.log</string>
   <key>StandardErrorPath</key><string>/Library/Logs/Looma/agent.log</string>
 

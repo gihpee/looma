@@ -34,10 +34,17 @@ fi
 
 # ------------------------------------------------------------- каталоги
 mkdir -p "$ROOT/tasks" "$ROOT/envs" "$ROOT/models" "$LOGS"
+# Файл лога заводим сами и сразу с нужными правами. launchd создаёт его при
+# первом запуске под своей маской, и получается 0600 у root — а читает его
+# панель, работающая под обычным пользователем. Со стенда: «Permission denied
+# (os error 13)» прямо в окне, вместо журнала.
+touch "$LOGS/agent.log"
+chmod 644 "$LOGS/agent.log"
 # Группа admin на корне — чтобы панель, работающая под обычным пользователем,
 # могла положить сюда ключ. Всё, что внутри, остаётся за root.
 chown root:admin "$ROOT" "$LOGS"
 chmod 775 "$ROOT" "$LOGS"
+chown root:admin "$LOGS/agent.log"
 chown -R root:wheel "$ROOT/tasks" "$ROOT/envs" "$ROOT/models" "$ROOT/runtime"
 chmod 755 "$ROOT/tasks" "$ROOT/envs" "$ROOT/models"
 

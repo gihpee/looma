@@ -81,12 +81,25 @@ class Endpoint:
                 return {"ok": False, "error": "слишком много туннелей на этом узле"}
             if conn_id in self._conns:
                 return {"ok": False, "error": f"туннель {conn_id} уже есть"}
-        host = self.host_for(port) or "127.0.0.1"
-        try:
-            sock = socket.create_connection((host, port),
-                                            timeout=CONNECT_TIMEOUT_S)
-        except OSError as exc:
-            return {"ok": False, "error": f"{host}:{port} не отвечает: {exc}"}
+        # Сначала адрес, который назвала задача, потом обычный локалхост.
+        # Гадать, где именно софт задачи поднял слушателя, бесполезно: Ray
+        # держит ранг на адресе своего ранга, а клиентский вход — на другом, и
+        # какой где, зависит от версии. Со стенда: кластер собрался и работал,
+        # а `looma-connect` получал «127.0.0.2:25607 не отвечает» — там сидел
+        # локалхост.
+        candidates = [self.host_for(port) or "127.0.0.1"]
+        if "127.0.0.1" not in candidates:
+            candidates.append("127.0.0.1")
+        sock, refusal = None, ""
+        for host in candidates:
+            try:
+                sock = socket.create_connection((host, port),
+                                                timeout=CONNECT_TIMEOUT_S)
+                break
+            except OSError as exc:
+                refusal = f"{host}:{port} не отвечает: {exc}"
+        if sock is None:
+            return {"ok": False, "error": refusal}
         sock.settimeout(None)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         with self._lock:

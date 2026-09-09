@@ -9,8 +9,9 @@ from __future__ import annotations
 import pytest
 
 from looma_ray.ports import (BASE, CLIENT_PORTS, PortsRefused, client_env,
-                            crossing_for_group, head_address, hosts_for_group,
-                            loopback_for, ports_for)
+                            crossing_for_group, essential_for_group,
+                            head_address, hosts_for_group, loopback_for,
+                            ports_for)
 
 
 def test_диапазоны_рангов_не_пересекаются():
@@ -216,3 +217,27 @@ def test_отказ_агента_доходит_словами(monkeypatch):
 
     assert "127.0.0.3" in str(упало.value)
     assert "502" in str(упало.value)
+
+
+def test_важные_порты_отделены_от_рабочих():
+    """Со стенда: один занятый рабочий порт из девяноста трёх ронял всю
+    задачу. Ray рабочий порт просто обошёл бы — а вот без порта головы
+    присоединяться некуда, и это разные беды."""
+    важные = essential_for_group(2)
+    ranks = [ports_for(0), ports_for(1)]
+
+    for ports in ranks:
+        assert ports.gcs in важные
+        assert ports.node_manager in важные
+        assert ports.object_manager in важные
+        # Шесть десятков рабочих портов сюда не входят: занятый обходится.
+        assert ports.worker_first not in важные
+        assert ports.worker_last not in важные
+
+
+def test_важные_порты_подмножество_проброшенных():
+    """Иначе задача проверяла бы наличие того, что агенту и не поручали."""
+    важные = essential_for_group(3)
+    проброшенные = {порт for порты in crossing_for_group(3).values() for порт in порты}
+
+    assert важные <= проброшенные

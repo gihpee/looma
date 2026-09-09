@@ -143,14 +143,27 @@ fn node_status() -> Result<serde_json::Value, String> {
     // тот агент, который это умеет: приезжающий по сети может и не уметь, и
     // тогда его снимок остаётся вечно старым. Со стенда: панель показывала
     // версию 0.1.0 и «агент замолчал», пока работал 0.1.13.
+    let agent_silent = is_stale(&read_status(&state_path()).unwrap_or_default());
     if let Ok(from_launcher) = read_status(&state_path().with_file_name("launcher.json")) {
         if let (Some(target), Some(source)) =
             (status.as_object_mut(), from_launcher.as_object())
         {
-            for key in ["agent_version", "running", "paused", "why"] {
+            for key in ["agent_version", "paused", "why"] {
                 if let Some(value) = source.get(key) {
                     target.insert(key.into(), value.clone());
                 }
+            }
+            // "running" от пускового слоя значит только «процесс жив». Агент,
+            // переставший отчитываться, — это ещё живой процесс, и панель
+            // показывала бы зелёное, пока оркестратор считает узел молчащим.
+            // Со стенда: снимок агента отстал на десять минут, а в окне было
+            // «Узел работает».
+            if agent_silent {
+                target.insert("running".into(), false.into());
+                target.insert("why".into(),
+                    "агент запущен, но перестал отчитываться — смотрите журнал".into());
+            } else if let Some(value) = source.get("running") {
+                target.insert("running".into(), value.clone());
             }
             if let Some(when) = source.get("updated_at") {
                 target.insert("updated_at".into(), when.clone());

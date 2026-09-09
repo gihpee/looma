@@ -240,6 +240,22 @@ def client_env(size: int, rank: int, *, base: int = 0, stride: int = 0) -> dict:
     }
 
 
+def essential_for_group(size: int, *, base: int = 0, stride: int = 0) -> set:
+    """Порты, без которых кластер не соберётся вовсе.
+
+    Отдельно от `crossing`, потому что цена у них разная. Рабочих портов шесть
+    десятков, и занятый Ray просто обойдёт — ронять из-за одного целую аренду
+    не за что. А без порта головы или диспетчера узла присоединяться некуда, и
+    лучше сказать это сразу, чем пятнадцать минут повторять попытки в пустоту.
+    """
+    base = base or group_base(size, stride=stride)
+    нужные = set()
+    for rank in range(size):
+        ports = ports_for(rank, base=base, stride=stride)
+        нужные |= {ports.gcs, ports.node_manager, ports.object_manager}
+    return нужные
+
+
 def crossing_for_group(size: int, *, base: int = 0, stride: int = 0) -> dict:
     """Что агенту предстоит пробросить: ранг → его внешние порты.
 

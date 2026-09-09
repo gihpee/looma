@@ -456,3 +456,41 @@ def test_называются_оба_направления():
 
     why = pump(один, Немой(), closed=th.Event())
     assert "наружу:" in why and "внутрь:" in why, f"названо одно направление: {why!r}"
+
+
+def test_запасной_локалхост_когда_слушают_не_там():
+    """Со стенда: кластер собрался и работал, а `looma-connect` получал
+    «127.0.0.2:25607 не отвечает». Клиентский вход Ray поднялся не на адресе
+    ранга, а на обычном локалхосте — и гадать, где именно софт задачи поставит
+    слушателя, бесполезно: это зависит от его версии."""
+    import socket
+    import threading
+
+    from looma_agent.p2p.tunnel import Endpoint
+
+    сервер = socket.socket()
+    сервер.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    сервер.bind(("127.0.0.1", 0))
+    сервер.listen(1)
+    порт = сервер.getsockname()[1]
+    threading.Thread(target=lambda: сервер.accept(), daemon=True).start()
+
+    # Задача назвала адрес ранга, а слушают на локалхосте.
+    endpoint = Endpoint(allow=lambda p: p == порт,
+                        host_for=lambda _p: "127.0.0.9")
+    try:
+        assert endpoint.connect("c1", порт)["ok"], "запасной адрес не пробовали"
+    finally:
+        endpoint.close("c1")
+        сервер.close()
+
+
+def test_отказ_называет_последний_адрес():
+    """Иначе «не отвечает» относится неизвестно к чему из двух."""
+    from looma_agent.p2p.tunnel import Endpoint
+
+    endpoint = Endpoint(allow=lambda _p: True, host_for=lambda _p: "127.0.0.1")
+    ответ = endpoint.connect("c2", 1)
+
+    assert not ответ["ok"]
+    assert "127.0.0.1:1" in ответ["error"]

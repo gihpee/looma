@@ -143,3 +143,58 @@ def test_без_файла_паузы_ничего_не_ждём(tmp_path):
     _wait_while_paused(config, poll_s=5.0)
 
     assert time.monotonic() - начали < 1.0
+
+
+# ------------------------------------------- доклад не останавливает узел
+def test_подвисший_доклад_пропускается_а_не_останавливает(monkeypatch):
+    """Со стенда: снимок агента отстал на десять минут при живом процессе.
+    Доклад собирается из нескольких источников, и один — состояние p2p — уходит
+    в чужую библиотеку, где может задержаться неизвестно насколько. Раньше это
+    останавливало весь цикл: узел переставал отчитываться, оркестратор считал
+    его молчащим, а процесс выглядел здоровым."""
+    import threading
+
+    from looma_agent.main import Agent
+
+    агент = Agent.__new__(Agent)
+    агент._collecting = threading.Event()
+    агент.config = type("Config", (), {"heartbeat_interval_s": 0.2})()
+    агент._telemetry = lambda: (_ for _ in ()).throw(AssertionError("не должно ждать"))
+
+    # Долгий сбор: возвращаем None, а не висим вместе с ним.
+    держим = threading.Event()
+    агент._telemetry = lambda: держим.wait(30) or "поздно"
+
+    assert агент._telemetry_or_none() is None
+    держим.set()
+
+
+def test_второй_сбор_не_заводится_поверх_застрявшего():
+    """Иначе на том же самом месте копились бы потоки — по одному на каждый
+    удар сердца, и узел уходил бы в лимит по потокам вместо простого молчания."""
+    import threading
+
+    from looma_agent.main import Agent
+
+    агент = Agent.__new__(Agent)
+    агент._collecting = threading.Event()
+    агент._collecting.set()          # прошлый сбор ещё идёт
+    агент.config = type("Config", (), {"heartbeat_interval_s": 5})()
+    агент._telemetry = lambda: "не должны сюда попасть"
+
+    начали = time.monotonic()
+    assert агент._telemetry_or_none() is None
+    assert time.monotonic() - начали < 1.0, "ждали вместо того, чтобы пропустить"
+
+
+def test_обычный_доклад_возвращается():
+    import threading
+
+    from looma_agent.main import Agent
+
+    агент = Agent.__new__(Agent)
+    агент._collecting = threading.Event()
+    агент.config = type("Config", (), {"heartbeat_interval_s": 5})()
+    агент._telemetry = lambda: "доклад"
+
+    assert агент._telemetry_or_none() == "доклад"
