@@ -138,3 +138,30 @@ def test_по_умолчанию_узел_считается_вне_сети():
     from looma.orchestrator.agents import AgentNode
 
     assert AgentNode(node_id="a").as_dict()["in_network"] is False
+
+
+def test_местные_адреса_не_делают_узел_достижимым():
+    """Регрессия из панели: после того как узлы начали объявлять свои
+    локальные адреса ради соседей за одним роутером, проверка «есть адрес без
+    /p2p-circuit» стала истинной для КАЖДОГО узла. Все разом сделались
+    «принимает входящие», а связность перестала проверяться вовсе."""
+    from looma.orchestrator.connectivity import reachable_from
+
+    assert reachable_from(["/ip4/10.124.10.12/tcp/47100",
+                           "/ip4/10.124.10.12/udp/47100/quic-v1"]) is False
+    assert reachable_from(["/ip4/172.17.0.1/tcp/47100"]) is False
+    assert reachable_from(["/ip4/95.79.46.1/tcp/47100"]) is True
+
+
+def test_несвязная_пара_снова_видна():
+    """То, ради чего эта проверка и существует: две машины, у которых наружу
+    смотрит только реле, встретятся лишь пробиванием — и об этом надо знать
+    до запуска, а не через пятнадцать минут отказов."""
+    from looma.orchestrator.connectivity import pairs_needing_relay, reachable_from
+
+    nv2 = {"node_id": "nv2", "symmetric_nat": True,
+           "reachable": reachable_from(["/ip4/10.124.10.12/tcp/47100"])}
+    nv3 = {"node_id": "nv3", "symmetric_nat": True,
+           "reachable": reachable_from(["/ip4/10.124.10.11/tcp/47100"])}
+
+    assert pairs_needing_relay([nv2, nv3]) == [("nv2", "nv3")]

@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-ROOT="/Library/Application Support/Looma"
+ROOT="/usr/local/looma"
 LOGS="/Library/Logs/Looma"
 PLIST="/Library/LaunchDaemons/app.looma.agent.plist"
 TASK_USER="_looma"
@@ -49,7 +49,8 @@ for app in /Applications/Looma*.app; do
 done
 
 say "убираю данные и логи"
-rm -rf "$ROOT" "$LOGS"
+# И прежний каталог: до переезда узел жил в пути с пробелом, который ломал Ray.
+rm -rf "$ROOT" "$LOGS" "/Library/Application Support/Looma"
 
 say "убираю служебного пользователя"
 dscl . -delete "/Users/$TASK_USER" 2>/dev/null || true

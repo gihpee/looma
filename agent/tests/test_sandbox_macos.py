@@ -194,7 +194,7 @@ def test_дом_хозяина_закрыт_у_настоящей_установ
     monkeypatch.setattr(sandbox.sys, "prefix", "/Library/Looma/python")
     monkeypatch.setattr(sandbox.sys, "base_prefix", "/Library/Looma/python")
 
-    assert sandbox.guards_home(Path("/Library/Application Support/Looma"))
+    assert sandbox.guards_home(Path("/usr/local/looma"))
     text = sandbox.profile(task_dir=tmp_path, scratch=tmp_path, envs_dir=tmp_path,
                            models_dir=tmp_path, agent_root=tmp_path)
     assert '(deny file-read* file-write* (subpath "/Users"))' in text
@@ -209,7 +209,7 @@ def test_дом_не_закрывается_если_агент_живёт_в_н
     запись в кэш окружений."""
     monkeypatch.setattr(sandbox.sys, "executable", "/Users/dev/.venv/bin/python")
 
-    assert not sandbox.guards_home(Path("/Library/Application Support/Looma"))
+    assert not sandbox.guards_home(Path("/usr/local/looma"))
     text = sandbox.profile(task_dir=tmp_path, scratch=tmp_path, envs_dir=tmp_path,
                            models_dir=tmp_path, agent_root=tmp_path)
     assert '(subpath "/Users")' not in text

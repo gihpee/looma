@@ -6,7 +6,7 @@
 # пользователь. Ходить по ним руками каждый раз — потерянное время, а половину
 # ещё и надо знать наизусть.
 
-ROOT="/Library/Application Support/Looma"
+ROOT="/usr/local/looma"
 LOG="/Library/Logs/Looma/agent.log"
 LABEL="app.looma.agent"
 

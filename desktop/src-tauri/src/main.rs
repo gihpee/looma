@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, Submenu},
     tray::TrayIconBuilder,
     Manager,
 };
@@ -28,7 +28,7 @@ fn state_path() -> PathBuf {
     if let Ok(root) = std::env::var("LOOMA_ROOT") {
         return PathBuf::from(root).join("status.json");
     }
-    PathBuf::from("/Library/Application Support/Looma/status.json")
+    PathBuf::from("/usr/local/looma/status.json")
 }
 
 /// Ключ узла лежит рядом с его данными, а не в настройках панели: агент
@@ -292,12 +292,38 @@ mod tests {
     }
 }
 
+/// Работает ли узел прямо сейчас — то, что показывает значок в панели.
+///
+/// По тем же файлам, что и окно: снимок агента и снимок пускового слоя. Живой
+/// процесс сам по себе ничего не значит — агент, переставший отчитываться, это
+/// ещё живой процесс.
+fn node_is_working() -> bool {
+    match node_status() {
+        Ok(status) => status.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Значок для этого состояния. Приглушённый — узел стоит.
+fn tray_icon(жив: bool) -> tauri::image::Image<'static> {
+    let bytes: &[u8] = if жив {
+        include_bytes!("../icons/tray.png")
+    } else {
+        include_bytes!("../icons/tray-off.png")
+    };
+    tauri::image::Image::from_bytes(bytes).expect("значок не читается")
+}
+
 /// Показать панель и вывести её вперёд.
 ///
 /// Одним местом на оба входа — меню-бар и щелчок по значку в Доке. Порознь
 /// они разъезжаются: окно, которое `show()` вернул из скрытых, остаётся позади
 /// активного приложения, и выглядит это как «щёлкнул, и ничего не произошло».
 fn show_panel(app: &tauri::AppHandle) {
+    // Приложение фоновое: показать окно мало, надо ещё вывести само приложение
+    // вперёд. Иначе окно открывается позади всего и выглядит не открывшимся.
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -315,12 +341,49 @@ static QUITTING: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let app = tauri::Builder::default()
+        // Своё меню приложения вместо стандартного — ради одного отсутствующего
+        // пункта. В стандартном есть «Завершить» с cmd+Q, и он завершает
+        // процесс напрямую, мимо всех обработчиков: значок в панели пропадал
+        // вместе с панелью, хотя узел продолжал работать. Фонового режима для
+        // этого мало — меню остаётся и в нём.
+        .menu(|handle| {
+            // cmd+Q висит на «Скрыть панель», и в этом весь смысл. Системный
+            // пункт «Завершить» с той же комбинацией завершает процесс
+            // напрямую, мимо всех обработчиков, — и значок в панели пропадает
+            // вместе с окном, хотя узел продолжает работать. Занятая
+            // комбинация до него не доходит.
+            let hide = MenuItem::with_id(handle, "hide", "Скрыть панель",
+                                         true, Some("cmd+q"))?;
+            let show = MenuItem::with_id(handle, "show", "Показать панель",
+                                         true, Some("cmd+o"))?;
+            // Выход есть, но без привычной комбинации: уходить целиком —
+            // редкое и осознанное действие, а не то, что делают наощупь.
+            let quit = MenuItem::with_id(handle, "quit", "Выйти из Looma",
+                                         true, Some("cmd+shift+q"))?;
+            let app_menu = Submenu::with_items(handle, "Looma", true,
+                                               &[&hide, &show, &quit])?;
+            Menu::with_items(handle, &[&app_menu])
+        })
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_panel(app),
+            "hide" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+            "quit" => {
+                QUITTING.store(true, Ordering::SeqCst);
+                app.exit(0);
+            }
+            _ => {}
+        })
         .invoke_handler(tauri::generate_handler![node_status, save_key, set_paused, agent_log])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "Показать панель", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Выйти", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
-            TrayIconBuilder::new()
+            let pause = MenuItem::with_id(app, "pause", "Остановить узел", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Выйти из Looma", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &pause, &quit])?;
+            TrayIconBuilder::with_id("looma")
                 .menu(&menu)
                 // Тот же знак, что на сайте, но без подложки и одним цветом.
                 // `as_template` означает «красьте сами»: macOS сделает его
@@ -328,8 +391,24 @@ fn main() {
                 // читаемым при смене темы, чего фиксированный белый не умеет.
                 .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?)
                 .icon_as_template(true)
+                .tooltip("Looma")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_panel(app),
+                    "pause" => {
+                        // Один пункт на оба действия: он и показывает состояние
+                        // узла, и переключает его. Два пункта, из которых один
+                        // всегда серый, занимали бы место и заставляли читать.
+                        let стоит = pause_path().exists();
+                        if let Err(беда) = write_pause(&pause_path(), !стоит) {
+                            eprintln!("не вышло: {беда}");
+                            return;
+                        }
+                        // И только. Панель остаётся, значок гаснет: узел
+                        // остановлен, а не удалён, и включить его обратно надо
+                        // тем же одним движением, а не поиском приложения в
+                        // Программах.
+                        let _ = app;
+                    }
                     "quit" => {
                         QUITTING.store(true, Ordering::SeqCst);
                         app.exit(0);
@@ -337,6 +416,40 @@ fn main() {
                     _ => {}
                 })
                 .build(app)?;
+
+            // Значок показывает УЗЕЛ, а не панель: узел работает сам по себе, и
+            // закрытая панель на него не влияет. Приглушённый значок означает,
+            // что узел стоит или молчит.
+            // Показать окно при запуске. Значка в Доке нет, и запуск из
+            // Программ иначе не делает ничего видимого: приложение молча
+            // добавляет значок в панель, а человек ждёт окна.
+            show_panel(app.handle());
+
+            let handle = app.handle().clone();
+            let pause_item = pause.clone();
+            std::thread::spawn(move || {
+                let mut прежнее: Option<bool> = None;
+                loop {
+                    let жив = node_is_working();
+                    if прежнее != Some(жив) {
+                        прежнее = Some(жив);
+                        if let Some(tray) = handle.tray_by_id("looma") {
+                            let _ = tray.set_icon(Some(tray_icon(жив)));
+                            let _ = tray.set_tooltip(Some(if жив {
+                                "Looma — узел работает"
+                            } else {
+                                "Looma — узел не работает"
+                            }));
+                        }
+                        let _ = pause_item.set_text(if жив {
+                            "Остановить узел"
+                        } else {
+                            "Запустить узел"
+                        });
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+            });
             Ok(())
         })
         .on_window_event(|window, event| {

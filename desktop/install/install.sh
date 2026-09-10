@@ -8,7 +8,7 @@
 #
 # Ставит три вещи и ничего больше:
 #   * служебного пользователя _looma, под которым идут чужие задачи;
-#   * агента и его окружение в /Library/Application Support/Looma;
+#   * агента и его окружение в /usr/local/looma;
 #   * демон launchd, который держит агента запущенным.
 #
 # Ключ узла здесь не спрашивается: его вводят потом, в панели. Агент дождётся.
@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-ROOT="/Library/Application Support/Looma"
+ROOT="/usr/local/looma"
 LOGS="/Library/Logs/Looma"
 PLIST="/Library/LaunchDaemons/app.looma.agent.plist"
 LABEL="app.looma.agent"

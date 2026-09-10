@@ -98,6 +98,82 @@ def _listen_addrs(port: int) -> List[str]:
     return addrs
 
 
+def _mdns_enabled() -> bool:
+    """Искать ли соседей в своей подсети широковещательно. По умолчанию нет.
+
+    Включается LOOMA_P2P_MDNS=1. Задачу «найти соседа за тем же роутером»
+    штатно решает объявление локальных адресов (_lan_addrs); mDNS — запасной
+    путь, и он шумит в лог на каждом интерфейсе без маршрута.
+    """
+    return os.environ.get("LOOMA_P2P_MDNS", "0").strip() in ("1", "true", "yes")
+
+
+def _lan_addrs(port: int) -> List[str]:
+    """Свои адреса в локальной сети, как мультиадреса. Пусто — если их нет.
+
+    Только частные диапазоны: публичный адрес узел объявит сам, если он у
+    него есть, а объявлять чужой NAT-адрес незачем.
+    """
+    private = [ip for ip in _local_ips() if _is_private(ip)]
+    addrs: List[str] = []
+    for ip in private:
+        addrs += [f"/ip4/{ip}/tcp/{port}", f"/ip4/{ip}/udp/{port}/quic-v1"]
+    return addrs
+
+
+def _is_private(ip: str) -> bool:
+    try:
+        import ipaddress
+
+        parsed = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return bool(parsed.is_private and not parsed.is_loopback
+                and not parsed.is_link_local)
+
+
+def dialable_from_outside(addr: str) -> bool:
+    """Можно ли по этому адресу дозвониться до узла из ЛЮБОЙ точки сети.
+
+    Раньше признаком было «нет /p2p-circuit», и этого хватало: всё, что узел
+    показывал миру, было либо циркуитным, либо настоящим публичным адресом.
+
+    С тех пор узел объявляет и свои локальные адреса (_lan_addrs) — ради
+    соседей за тем же роутером. Они не циркуитные, и старая проверка стала
+    считать достижимым КАЖДЫЙ узел, включая те, до которых снаружи не
+    дозвониться никак. В панели это выглядело как «принимает входящие» у всех
+    подряд, а в оркестраторе — как связная группа там, где связности нет.
+
+    Поэтому частные диапазоны исключаются явно: 10/8, 172.16/12, 192.168/16,
+    петля, link-local. Имя вместо адреса считаем публичным — резолвить его
+    здесь нечем, а имена узлы дают только для настоящих точек входа.
+    """
+    if "/p2p-circuit" in addr:
+        return False
+    parts = addr.split("/")
+    for index, piece in enumerate(parts):
+        if piece in ("ip4", "ip6") and index + 1 < len(parts):
+            return _is_public(parts[index + 1])
+    return True
+
+
+def _is_public(ip: str) -> bool:
+    """Адрес, по которому можно прийти извне. НЕ отрицание _is_private.
+
+    Два разных вопроса, и слить их в один нельзя: _is_private отбирает адреса
+    локальной сети, которые узел ОБЪЯВЛЯЕТ соседям по роутеру, и петля туда не
+    входит — объявлять её бессмысленно. Здесь же петля должна отвергаться так
+    же твёрдо, как 10/8. Собственный тест на объявление петли это и поймал.
+    """
+    try:
+        import ipaddress
+
+        parsed = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not (parsed.is_private or parsed.is_loopback or parsed.is_link_local)
+
+
 def _address_in_use(exc: BaseException) -> bool:
     """Is this the Rust core telling us the port is taken?
 
@@ -455,9 +531,38 @@ class PeerNode:
             # it is even worth attempting.
             .with_dcutr(True)
             .with_autonat(True)
-            # Off: peers are named by the orchestrator, never found by shouting
-            # on the local network. On a rented host mDNS is noise at best.
-            .with_mdns(False)
+            # Включён — и это исправление, а не удобство.
+            #
+            # Со стенда, nv2+nv3: две машины ОДНОГО владельца за одним
+            # роутером, 10.124.10.11 и 10.124.10.12, наружу обе через
+            # 95.79.46.1. Пробивание дырок целится в этот общий публичный
+            # адрес, а роутер не разворачивает пакет обратно внутрь себя
+            # (hairpin умеют немногие). Прямого соединения не возникает
+            # никогда, и байтовый туннель Ray, который поверх реле не
+            # открывается, не открывается тоже — кластер не собирается вовсе.
+            # С машинами в РАЗНЫХ сетях этого не было, поэтому выглядело как
+            # случайная поломка одного узла.
+            #
+            # mDNS для этого и придуман: соседи по локальной сети находят друг
+            # друга и свои локальные адреса напрямую, без DHT, реле и
+            # пробивания. Слушаем мы уже на 0.0.0.0, то есть порт на локальном
+            # адресе открыт — не хватало только узнать этот адрес.
+            #
+            # По умолчанию ВЫКЛЮЧЕН, и это измерено, а не осторожность. На
+            # нашем же прогоне тестов libp2p начал сыпать в лог по строке
+            # ERROR на каждый интерфейс без маршрута:
+            #
+            #   libp2p_mdns::behaviour::iface: error sending packet on iface
+            #   address No route to host (os error 65) address=10.124.11.4
+            #
+            # У nv2 и nv3 по десятку докеровских мостов, то есть это десяток
+            # строк на каждый цикл опроса, навсегда. Лог агента — то, по чему
+            # разбирают поломки, и хоронить его нельзя.
+            #
+            # Ту же задачу решает объявление локальных адресов ниже, и решает
+            # тише. mDNS остаётся включаемым (LOOMA_P2P_MDNS=1) на случай, если
+            # объявления окажется мало.
+            .with_mdns(_mdns_enabled())
             # Ask the router to forward our port. Free when it works (a lot of
             # home routers support it), silent when it does not, and every node
             # it makes reachable is one more pair that can connect directly.
@@ -472,6 +577,15 @@ class PeerNode:
             # столько же, сколько он сам.
             .with_idle_timeout(IDLE_TIMEOUT_S)
         )
+        local = _lan_addrs(port)
+        if local:
+            # Второй способ добраться до соседа по своей же сети, не зависящий
+            # от mDNS: назвать свои локальные адреса явно, чтобы они попали в
+            # запись DHT рядом с циркуитными. Узел из другой сети попробует их
+            # и мгновенно получит отказ — обычное поведение libp2p, цена этому
+            # одна неудачная попытка. Узел из этой же сети попадёт сразу.
+            logger.info("объявляю локальные адреса: %s", ", ".join(local))
+            builder = builder.with_external_addrs(local)
         if self.bootstraps:
             builder = builder.with_bootstraps(self.bootstraps)
         if self.relay_servers:

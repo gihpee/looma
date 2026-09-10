@@ -102,6 +102,19 @@ class Agent:
         # Взведён, пока идёт сбор доклада. Против накопления потоков там, где
         # застрял первый.
         self._collecting = threading.Event()
+        # Замер VRAM идёт СВОИМ потоком, а не ударом сердца. Причина ровно та
+        # же, по которой так уже устроен опрос p2p (p2p/layer.py): обращение к
+        # драйверу NVIDIA — вызов в чужую библиотеку, у которого нет тайм-аута,
+        # и зависший драйвер останавливал весь цикл. Со стенда: узел жив,
+        # процесс на месте, последний удар сердца 700 секунд назад, логи
+        # наверх не идут — оркестратор считает машину пропавшей.
+        self._sampling = threading.Event()
+        self._vram_at = 0.0
+        # Последний собранный доклад и с каких пор сбор не возвращается.
+        # Нужны, чтобы узел не пропадал: см. _stale_report().
+        self._last_report = None
+        self._stuck_since = 0.0
+        self._said_stuck_at = 0.0
         self.isolation = resolve_isolation()
         self.tasks = TaskRegistry(
             root=config.tasks_dir,
@@ -294,7 +307,6 @@ class Agent:
                 # четвёртым способом ничего не делать.
                 self.updater.step_aside("остановлен владельцем машины")
                 return
-            self._refresh_vram()
             self._save_status()
             if self.client.registered:
                 report = self._telemetry_or_none()
@@ -317,8 +329,7 @@ class Agent:
         if self._collecting.is_set():
             # Прошлый сбор ещё не вернулся. Заводить второй значит копить
             # потоки на том же самом месте, где застрял первый.
-            logger.warning("сбор доклада идёт дольше удара сердца; пропускаю")
-            return None
+            return self._stale_report()
         готово = []
         self._collecting.set()
 
@@ -333,7 +344,43 @@ class Agent:
         worker = threading.Thread(target=собрать, name="telemetry", daemon=True)
         worker.start()
         worker.join(self.config.heartbeat_interval_s)
-        return готово[0] if готово else None
+        if not готово:
+            return self._stale_report()
+        self._last_report = готово[0]
+        self._stuck_since = self._said_stuck_at = 0.0
+        return готово[0]
+
+    def _stale_report(self):
+        """Прошлый доклад вместо молчания.
+
+        Здесь была ошибка, стоившая живого узла. Раньше на незавершившийся сбор
+        возвращался None, и удар сердца не отправлял НИЧЕГО. Пока сбор шёл
+        секунду-другую, это было незаметно. Но сбор может не вернуться совсем —
+        он уходит в чужой рантайм, — и тогда `_collecting` больше никогда не
+        снимается, каждый следующий удар сердца молча уходит в None, а выхода
+        из этого состояния не предусмотрено вовсе. Со стенда, узел nv3:
+        контейнер up, процесс жив, ядро и драйвер ни при чём, наверх не идёт
+        ничего и не пойдёт уже никогда.
+
+        Живой узел, о котором нечего сказать нового, — это всё ещё живой узел.
+        Оркестратор считает машину на связи по ПРИХОДУ телеметрии, а не по
+        времени внутри неё, поэтому `reported_at_unix_ms` не трогаем: по нему и
+        видно, насколько содержимое отстало.
+        """
+        if self._last_report is None:
+            return None        # ещё ни одного удачного сбора — сказать нечего
+        сейчас = time.monotonic()
+        if not self._stuck_since:
+            self._stuck_since = сейчас
+        застряли = сейчас - self._stuck_since
+        # Раз в минуту, а не каждые пять секунд: это состояние может длиться
+        # часами, и лог не должен быть его единственным следствием.
+        if сейчас - self._said_stuck_at >= 60:
+            self._said_stuck_at = сейчас
+            logger.warning(
+                "сбор доклада не возвращается уже %.0f с; шлю прошлый, "
+                "чтобы узел не считался пропавшим", застряли)
+        return self._last_report
 
     def _save_status(self) -> None:
         """Снимок для панели провайдера — рядом с ударом сердца, а не отдельным
@@ -349,21 +396,56 @@ class Agent:
             "tasks_running": snapshot["running"],
             "accepts_tasks": not self.tasks.unusable,
             "refusal": self.tasks.unusable or "",
+            # Сколько секунд драйвер не отвечает на запрос о памяти. Ноль —
+            # отвечает. Большое число значит, что карта у планировщика ещё
+            # числится, а на машине её уже нет: драйвер отвалился или его
+            # переустанавливают. Раньше это было видно только по тому, что
+            # задача на карте падала.
+            "vram_stale_s": round(self._vram_stale_s(), 1),
             # По нему панель понимает, что агент замолчал. Без него последний
             # снимок жил бы вечно и показывал работающий узел, которого нет.
             "updated_at": time.time(),
         })
 
-    def _refresh_vram(self) -> None:
-        """Пересчитать свободную VRAM: снимок при старте устареет за минуту.
+    def _vram_loop(self) -> None:
+        """Пересчитывать свободную VRAM своим потоком: снимок при старте
+        устареет за минуту, а спрашивать драйвер из удара сердца нельзя.
 
-        Ноль от измерителя означает «не смогли», а не «памяти нет», поэтому
-        прежнее значение остаётся: подставить ноль — значит вывести рабочий
-        узел из планирования из-за одного неудачного опроса.
+        Один замер за раз. Драйвер, который не отвечает, задержит ЭТОТ поток —
+        и только его: удар сердца продолжит уходить с прошлым значением, узел
+        останется видимым, а `vram_stale_s` покажет, насколько число отстало.
+        Складывать поверх зависшего замера второй значит копить потоки там же,
+        где встал первый.
         """
-        free = free_vram_bytes()
-        if free:
-            self.hardware.vram_free_bytes = free
+        while not self._stop.wait(self.config.heartbeat_interval_s):
+            if self._sampling.is_set():
+                continue
+            self._sampling.set()
+            threading.Thread(target=self._sample_vram, name="vram",
+                             daemon=True).start()
+
+    def _sample_vram(self) -> None:
+        try:
+            free = free_vram_bytes()
+            # Ноль от измерителя означает «не смогли», а не «памяти нет»:
+            # подставить ноль — значит вывести рабочий узел из планирования
+            # из-за одного неудачного опроса.
+            if free:
+                self.hardware.vram_free_bytes = free
+                self._vram_at = time.monotonic()
+        except Exception:
+            logger.debug("VRAM не измерилась", exc_info=True)
+        finally:
+            self._sampling.clear()
+
+    def _vram_stale_s(self) -> float:
+        """Сколько секунд назад драйвер в последний раз ответил.
+
+        Ноль до первого удачного замера. Большое число здесь означает
+        отвалившийся или переустанавливаемый драйвер: карта у Ray и у
+        планировщика ещё числится, а на деле её уже нет.
+        """
+        return 0.0 if not self._vram_at else time.monotonic() - self._vram_at
 
     def _report_readiness(self) -> None:
         """Say once, at startup, whether this node can actually take work.
@@ -390,6 +472,7 @@ class Agent:
         self._report_readiness()
         self.commands.start()
         threading.Thread(target=self._heartbeat_loop, name="heartbeat", daemon=True).start()
+        threading.Thread(target=self._vram_loop, name="vram-sampler", daemon=True).start()
         self.client.run_forever()
         # Ненулевой код здесь означает «остановился ради обновления», а не
         # поломку: пусковой слой не должен считать это падением.

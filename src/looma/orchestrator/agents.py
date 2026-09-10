@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from looma.logging_config import get_logger
+from looma.orchestrator.connectivity import reachable_from
 from looma.orchestrator.resources import Resources, choose_node
 from looma.orchestrator.state import StateStore
 from looma.proto_gen import agent_pb2, agent_pb2_grpc
@@ -1131,9 +1132,12 @@ class AgentHub:
         peer = report.peer
         node.peer_id = peer.peer_id or node.peer_id
         node.symmetric_nat = peer.symmetric_nat
-        # Адрес без /p2p-circuit значит, что до узла можно дозвониться прямо;
-        # circuit — это тот же путь через реле под другим именем.
-        node.reachable = any("/p2p-circuit" not in a for a in peer.visible_addrs)
+        # Не «есть адрес без /p2p-circuit». Узел объявляет ещё и свои локальные
+        # адреса — ради соседей за тем же роутером, — и под ту проверку стал
+        # подходить каждый узел без исключения: в панели все разом сделались
+        # «принимает входящие», а группа из двух заведомо несвязных узлов
+        # проходила проверку связности.
+        node.reachable = reachable_from(peer.visible_addrs)
         # Разные вопросы: reachable — «дозвонятся ли до него», in_network —
         # «дозвонится ли он». Узел без DHT принимает входящие как ни в чём не
         # бывало и при этом не находит никого.

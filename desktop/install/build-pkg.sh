@@ -5,7 +5,7 @@
 # Looma-<версия>-<архитектура>.pkg, который кладёт на чужую машину три вещи:
 #
 #   /Applications/Looma.app                     панель
-#   /Library/Application Support/Looma/runtime  свой питон с агентом внутри
+#   /usr/local/looma/runtime  свой питон с агентом внутри
 #   /Library/LaunchDaemons/app.looma.agent.plist демон
 #
 # Питон свой, а не машинный: системный на macOS — 3.9 и таким останется, а
@@ -43,7 +43,7 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 PKGROOT="$STAGE/root"
 mkdir -p "$PKGROOT/Applications" \
-         "$PKGROOT/Library/Application Support/Looma" \
+         "$PKGROOT/usr/local/looma" \
          "$PKGROOT/Library/LaunchDaemons"
 
 # ------------------------------------------------------------- панель
@@ -78,7 +78,7 @@ ACTUAL="$(shasum -a 256 "$CACHE/$PY_FILE" | cut -d' ' -f1)"
   получили $ACTUAL
 Файл подменён или ссылка стала указывать на другое. Не собираю."
 
-RUNTIME="$PKGROOT/Library/Application Support/Looma/runtime"
+RUNTIME="$PKGROOT/usr/local/looma/runtime"
 mkdir -p "$RUNTIME"
 # --strip-components=1: в архиве всё лежит под python/, а нам нужен runtime/bin
 tar xzf "$CACHE/$PY_FILE" -C "$RUNTIME" --strip-components=1
@@ -96,7 +96,7 @@ say "ставлю агента внутрь питона"
 # попробует разобраться, когда что-то не так, и они обязаны работать.
 for script in "$RUNTIME"/bin/looma-*; do
     [ -f "$script" ] || continue
-    sed -i '' "1s|^#!.*|#!/Library/Application Support/Looma/runtime/bin/python3|" "$script"
+    sed -i '' "1s|^#!.*|#!/usr/local/looma/runtime/bin/python3|" "$script"
 done
 
 # Кэш pip внутри пакета никому не нужен и весит больше самого агента.

@@ -26,7 +26,7 @@
        никогда не видел. `-P` не пускает в sys.path текущий каталог. -->
   <key>ProgramArguments</key>
   <array>
-    <string>/Library/Application Support/Looma/runtime/bin/python3</string>
+    <string>/usr/local/looma/runtime/bin/python3</string>
     <string>-P</string>
     <string>-m</string>
     <string>looma_launcher.main</string>
@@ -46,7 +46,7 @@
 
   <key>EnvironmentVariables</key>
   <dict>
-    <key>LOOMA_ROOT</key><string>/Library/Application Support/Looma</string>
+    <key>LOOMA_ROOT</key><string>/usr/local/looma</string>
     <!-- Строки лога уходят в файл без буфера: иначе последнее, что сказал
          упавший агент, теряется вместе с ним. -->
     <key>PYTHONUNBUFFERED</key><string>1</string>

@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-ROOT="/Library/Application Support/Looma"
+ROOT="/usr/local/looma"
 LOGS="/Library/Logs/Looma"
 PLIST="/Library/LaunchDaemons/app.looma.agent.plist"
 TASK_USER="_looma"
@@ -34,6 +34,17 @@ fi
 
 # ------------------------------------------------------------- каталоги
 mkdir -p "$ROOT/tasks" "$ROOT/envs" "$ROOT/models" "$LOGS"
+
+# Ключ с прежнего места, если узел ставили до переезда. Пробел в
+# «/Library/Application Support» ломал Ray (см. config.default_root), и корень
+# переехал — но заставлять владельца заново искать ключ из-за нашей ошибки не
+# за что. Кэши не переносим: они большие и наберутся заново.
+LEGACY="/Library/Application Support/Looma"
+if [ -f "$LEGACY/join.key" ] && [ ! -f "$ROOT/join.key" ]; then
+    cp "$LEGACY/join.key" "$ROOT/join.key"
+    chmod 600 "$ROOT/join.key"
+    echo "ключ узла перенесён из $LEGACY"
+fi
 # Файл лога заводим сами и сразу с нужными правами. launchd создаёт его при
 # первом запуске под своей маской, и получается 0600 у root — а читает его
 # панель, работающая под обычным пользователем. Со стенда: «Permission denied

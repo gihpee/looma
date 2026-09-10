@@ -280,11 +280,11 @@ def test_кластер_ставит_ray_с_клиентским_входом(tw
     monkeypatch.setattr(hub, "submit_group", watch)
     answer = client(hub).post("/admin/ray", json={"node_ids": ["node-0"]})
     assert answer.status_code == 200, answer.text
-    assert asked["environment"]["requirements"] == ["ray[client]"]
+    assert asked["environment"]["requirements"] == ["ray[client]", "virtualenv"]
 
     client(hub).post("/admin/ray", json={"node_ids": ["node-1"],
                                          "ray_version": "2.58.0"})
-    assert asked["environment"]["requirements"] == ["ray[client]==2.58.0"]
+    assert asked["environment"]["requirements"] == ["ray[client]==2.58.0", "virtualenv"]
 
 
 def test_просимые_библиотеки_доезжают_до_узлов(two_nodes, monkeypatch):
@@ -304,7 +304,8 @@ def test_просимые_библиотеки_доезжают_до_узлов(
         "node_ids": ["node-0"], "requirements": "torch\nnumpy"})
 
     assert answer.status_code == 200, answer.text
-    assert asked["environment"]["requirements"] == ["ray[client]", "torch", "numpy"]
+    assert asked["environment"]["requirements"] == ["ray[client]", "virtualenv",
+                                                     "torch", "numpy"]
 
 
 def test_негодные_требования_отвергаются_до_запуска(two_nodes):
@@ -351,3 +352,25 @@ def test_список_принимается_наравне_с_текстом():
     from looma.api.app import _requirements_of
 
     assert _requirements_of(["torch"]) == _requirements_of("torch") == ["torch"]
+
+
+def test_virtualenv_едет_на_узлы_ради_runtime_env(two_nodes, monkeypatch):
+    """Без него `ray.init(runtime_env={"pip": [...]})` падает ещё на подключении.
+
+    Плагин pip у Ray заводит окружение задания через virtualenv и, не найдя
+    его, отвечает клиенту ConnectionAbortedError. Проверялось на живом
+    кластере: «RuntimeError: Please install virtualenv». Ставим всегда — иначе
+    второй способ задавать библиотеки выглядит рабочим ровно до первой попытки
+    им воспользоваться."""
+    hub = two_nodes.hub
+    asked = {}
+    original = hub.submit_group
+
+    def watch(**kwargs):
+        asked.update(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(hub, "submit_group", watch)
+    answer = client(hub).post("/admin/ray", json={"node_ids": ["node-0"]})
+    assert answer.status_code == 200, answer.text
+    assert "virtualenv" in asked["environment"]["requirements"]

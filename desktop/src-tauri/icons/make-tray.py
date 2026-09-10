@@ -75,7 +75,44 @@ def draw() -> bytes:
             + chunk(b"IEND", b""))
 
 
+def dim(png: bytes, доля: float) -> bytes:
+    """Тот же знак, но приглушённый: так выглядит остановленный узел.
+
+    Приглушаем альфу, а не цвет: значок в панели template — цвет ему задаёт
+    система, и любое наше значение она перекрасит. Видимой остаётся только
+    прозрачность.
+    """
+    import zlib as _zlib
+
+    raw = b""
+    pos = 8
+    while pos < len(png):
+        ln = struct.unpack(">I", png[pos:pos + 4])[0]
+        tag = png[pos + 4:pos + 8]
+        if tag == b"IDAT":
+            raw += png[pos + 8:pos + 8 + ln]
+        pos += 12 + ln
+    px = bytearray(_zlib.decompress(raw))
+    stride = SIZE * 4
+    for row in range(SIZE):
+        start = row * (stride + 1) + 1
+        for i in range(start + 3, start + stride, 4):
+            px[i] = int(px[i] * доля)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", SIZE, SIZE, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(px), 9))
+            + chunk(b"IEND", b""))
+
+
 if __name__ == "__main__":
-    out = pathlib.Path(__file__).with_name("tray.png")
-    out.write_bytes(draw())
-    print(f"{out} — {out.stat().st_size} байт")
+    здесь = pathlib.Path(__file__).parent
+    живой = draw()
+    (здесь / "tray.png").write_bytes(живой)
+    (здесь / "tray-off.png").write_bytes(dim(живой, 0.35))
+    for имя in ("tray.png", "tray-off.png"):
+        print(f"{здесь / имя} — {(здесь / имя).stat().st_size} байт")

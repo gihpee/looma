@@ -20,6 +20,7 @@ import base64
 import logging
 import queue
 import threading
+import time
 from typing import Callable, Dict, List, Optional
 
 from looma_agent import recent
@@ -33,6 +34,12 @@ from looma_agent.tasks.registry import TaskRegistry
 from looma_agent.tasks.runner import Task
 from looma_agent.tasks.spec import EnvSpec, Resources, TaskRefused, TaskSpec
 from looma_agent.transport.files import Inbox, IncomingFile, TransferRefused, safe_target
+
+# Сколько раз и с каким шагом наводить маршрут к соседу по группе. Соседний
+# ранг может ещё ставить окружение — сборка torch на домашнем канале занимает
+# минуты, — поэтому счёт идёт на минуты, а не на секунды.
+WARM_ATTEMPTS = 30
+WARM_RETRY_S = 10.0
 
 logger = logging.getLogger("looma_agent.control.tasks")
 
@@ -113,6 +120,7 @@ class TaskCommands:
         group = group_from_proto(command.group)
         if group is not None:
             self.groups.join(spec.task_id, group)
+            self._warm_group(group)
         expected = list(command.inputs)
         if expected:
             with self._lock:
@@ -123,6 +131,47 @@ class TaskCommands:
             target=self._carry_out, args=(spec, expected, group),
             name=f"submit-{spec.task_id}", daemon=True,
         ).start()
+
+    def _warm_group(self, group) -> None:
+        """Навести маршруты ко всем соседям по группе, не дожидаясь первого байта.
+
+        Ровно то, что конвейер делает в `LinkTable.set_neighbours`, и чего у
+        Ray не было. Соединение к узлу за NAT поднимается сначала через реле, и
+        DCUtR пробивает его в прямое за секунды. Байтовый туннель поверх реле
+        не открывается вовсе — lattica отвечает «Only relayed connection
+        available for peer», — а Ray на соединение даёт пять секунд. То есть
+        непрогретый сосед за NAT давал не медленный кластер, а не собравшийся:
+        со стенда, nv2+nv3, пятнадцать минут одинаковых отказов.
+
+        Своим потоком и с повторами: соседний ранг может ещё ставить себе
+        окружение, а сборка torch занимает минуты. Ничего не ждём и ничем не
+        рискуем — не вышло, значит первый запрос попробует сам.
+        """
+        if self.peers is None:
+            return
+        соседи = [m.peer_id for rank, m in group.members.items()
+                  if rank != group.rank and m.peer_id]
+        if not соседи:
+            return
+
+        def наводить() -> None:
+            остались = list(соседи)
+            for попытка in range(WARM_ATTEMPTS):
+                остались = [p for p in остались if not self.peers.warm(p)]
+                if not остались:
+                    logger.info("маршруты к соседям по группе %s наведены",
+                                group.group_id)
+                    return
+                time.sleep(WARM_RETRY_S)
+            logger.warning(
+                "к соседям %s маршрут навести не удалось за %.0f с; если они за "
+                "NAT, кластер Ray может не собраться: байтовый туннель через "
+                "реле не открывается",
+                ", ".join(p[:12] for p in остались),
+                WARM_ATTEMPTS * WARM_RETRY_S)
+
+        threading.Thread(target=наводить, name=f"warm-{group.group_id}",
+                         daemon=True).start()
 
     def input_chunk(self, chunk: agent_pb2.InputChunk) -> None:
         """Hand a piece of input to the thread waiting for it.

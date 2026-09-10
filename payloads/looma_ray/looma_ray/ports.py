@@ -65,6 +65,24 @@ WINDOW_END = int(os.environ.get("LOOMA_RAY_PORT_WINDOW_END", "32000"))
 LOOPBACK_FIRST = int(os.environ.get("LOOMA_RAY_LOOPBACK_FIRST", "2"))
 LOOPBACK_LAST = 254
 
+# Кусок, который занимать нельзя, потому что его занимает сам Ray.
+#
+# Клиентский вход, который мы просим через `--ray-client-server-port`, — это
+# только ПРОКСИ. На каждое подключение прокси поднимает отдельный процесс
+# (SpecificServer) и порт ему выбирает сам, из диапазона, зашитого в исходник
+# константами:
+#
+#     ray/util/client/server/proxier.py
+#     MIN_SPECIFIC_SERVER_PORT = 23000
+#     MAX_SPECIFIC_SERVER_PORT = 24000
+#
+# Ни флага, ни переменной окружения для него нет — проверено по коду Ray
+# 2.58. Наше окно шло с 20000 по 32000 и этот кусок накрывало: группа, чей
+# хеш попадал внутрь, дралась с клиентским сервером за одни и те же номера.
+# Со стенда так и выглядело — «порт 23807 занят» на ровном месте.
+RAY_SPECIFIC_FIRST = 23000
+RAY_SPECIFIC_LAST = 24000
+
 
 class PortsRefused(ValueError):
     """Так разложить порты нельзя, и вот почему."""
@@ -132,8 +150,20 @@ def group_base(size: int, *, base: int = 0, stride: int = 0) -> int:
         return base
     import hashlib
 
-    slot = int(hashlib.sha256(group_id.encode()).hexdigest()[:8], 16) % slots
-    return base + slot * width
+    # Слоты, накрывающие диапазон Ray, из выбора исключаются целиком. Не
+    # сдвигаются: сдвиг разъехался бы у разных рангов, а считать окно они
+    # обязаны одинаково и молча.
+    годные = [n for n in range(slots)
+              if not _touches_ray(base + n * width, width)]
+    if not годные:
+        return base
+    slot = int(hashlib.sha256(group_id.encode()).hexdigest()[:8], 16) % len(годные)
+    return base + годные[slot] * width
+
+
+def _touches_ray(start: int, width: int) -> bool:
+    """Пересекается ли окно с тем, что Ray держит под клиентские серверы."""
+    return start < RAY_SPECIFIC_LAST and start + width > RAY_SPECIFIC_FIRST
 
 
 def ports_for(rank: int, *, base: int = 0, stride: int = 0) -> RankPorts:

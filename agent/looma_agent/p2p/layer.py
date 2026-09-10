@@ -24,6 +24,7 @@ from looma_agent.p2p.peer import (
     DEFAULT_P2P_PORT,
     PeerNode,
     behind_container_nat,
+    dialable_from_outside,
     lattica_available,
 )
 from looma_agent.proto import agent_pb2
@@ -72,6 +73,13 @@ class PeerLayer:
         # read off the link table, because neighbours need it BEFORE any link
         # exists — a zero there means they cannot judge their side of the path.
         self._relay_rtt_ms: float = 0.0
+        # Тоже сюда, и по той же причине, что и всё выше. Здесь это стоило
+        # дорого: in_network() спрашивался ПРЯМО в ударе сердца, и когда
+        # рантайм p2p был занят (кластер Ray, десятки туннелей на 93
+        # проброшенных порта), вызов не возвращался. Со стенда, узел nv3:
+        # контейнер up, процесс жив, ядро ни при чём, драйвер отвечает — а
+        # наверх не уходит ничего.
+        self._in_network: bool = False
         # Explicit so several agents can run in one process during tests: two
         # nodes sharing a key directory interfere, and a closed node does not
         # give its port back instantly.
@@ -178,13 +186,27 @@ class PeerLayer:
                 "link to it and will relay"
             )
             return
-        if any("/p2p-circuit" in a for a in identity.visible_addrs):
+        # Публичные, а не «все нециркуитные»: узел объявляет ещё и свои
+        # локальные адреса ради соседей за тем же роутером, и по ним снаружи
+        # не дозвониться. Считать их достижимостью — значит сказать «принимаю
+        # входящие» про каждый узел без исключения.
+        public = [a for a in identity.visible_addrs if dialable_from_outside(a)]
+        if public:
+            return                      # дозваниваются напрямую, говорить не о чем
+        relayed = [a for a in identity.visible_addrs if "/p2p-circuit" in a]
+        if relayed:
             # A reservation is held: nothing can dial this node directly, but
             # peers reach it through the relay and can try to punch through
             # from there. This is the state the relay exists to produce.
-            logger.info("this node is reachable through the relay: %s", identity.visible_addrs[0])
+            logger.info("this node is reachable through the relay: %s", relayed[0])
             return
         if identity.visible_addrs:
+            # Адреса есть, но все — местные. Снаружи узел не виден, и реле
+            # резервации ему не дало: он не найдёт соседей и его не найдут.
+            logger.warning(
+                "this node shows only local addresses (%s): peers outside its "
+                "own network cannot reach it, and the relay gave it no "
+                "reservation", ", ".join(identity.visible_addrs[:3]))
             return
         port = self.node.port if self.node else DEFAULT_P2P_PORT
         if behind_container_nat():
@@ -240,14 +262,7 @@ class PeerLayer:
         def sample() -> None:
             while self.node is not None:
                 try:
-                    self._visible = self.node.visible_addrs()
-                    self._relay_rtt_ms = self.node.relay_rtt_ms() or 0.0
-                    # A circuit address is not reachability: it means "through
-                    # the relay", which is the relay path under another name.
-                    self.links.set_self_reachable(
-                        any("/p2p-circuit" not in a for a in self._visible)
-                    )
-                    self.links.refresh()
+                    self._sample_once()
                 except Exception:
                     logger.debug("sampling the p2p state failed", exc_info=True)
                 time.sleep(SAMPLE_INTERVAL_S)
@@ -256,7 +271,52 @@ class PeerLayer:
                                          daemon=True)
         self._sampler.start()
 
+    def _sample_once(self) -> None:
+        """Один проход опроса: всё, что телеметрия потом только читает.
+
+        Отдельным методом, а не телом цикла, по двум причинам. Его можно
+        позвать в тесте, не заводя поток. И он один: список того, что
+        спрашивается у рантайма, не должен расходиться по коду — именно так
+        `in_network()` и оказался когда-то прямо в status(), то есть в ударе
+        сердца.
+        """
+        self._visible = self.node.visible_addrs()
+        self._relay_rtt_ms = self.node.relay_rtt_ms() or 0.0
+        self._in_network = bool(self.node.in_network())
+        # A circuit address is not reachability: it means "through the relay",
+        # which is the relay path under another name.
+        # Не «есть нециркуитный адрес»: с тех пор как узел объявляет свои
+        # локальные адреса ради соседей за тем же роутером, под это подходит
+        # каждый узел. Достижим тот, до кого можно дозвониться СНАРУЖИ.
+        self.links.set_self_reachable(
+            any(dialable_from_outside(a) for a in self._visible)
+        )
+        self.links.refresh()
+
     # ----------------------------------------------------------------- report
+    def warm(self, peer_id: str) -> bool:
+        """Заранее навести маршрут к соседу. Ложь — не получилось, и это не беда.
+
+        Зачем это здесь. Соединение к узлу за NAT сначала поднимается ЧЕРЕЗ
+        реле, и только потом DCUtR пробивает его в прямое. Пробивание занимает
+        секунды, а байтовый туннель поверх реле lattica открывать отказывается
+        вовсе: «Only relayed connection available for peer». То есть первый же
+        запрос к непрогретому соседу получает отказ, а не задержку.
+
+        Конвейеру это давно известно — там маршруты наводятся в
+        `LinkTable.set_neighbours`, до первого токена. Ray жил без этого, и
+        отсюда кластеры, которые не собирались с узлом за NAT: Ray даёт на
+        соединение пять секунд, а пробивание в них не укладывается.
+        """
+        node = self.node
+        if node is None:
+            return False
+        try:
+            return bool(node.warm(peer_id))
+        except Exception:
+            logger.debug("не удалось навести маршрут к %s", peer_id[:12], exc_info=True)
+            return False
+
     def status(self) -> agent_pb2.PeerStatus:
         """What this node reports about its p2p state on every heartbeat.
 
@@ -282,10 +342,12 @@ class PeerLayer:
             visible_addrs=self._visible or (identity.visible_addrs if identity else []),
             link_rtt_ms=stats["link_rtt_ms"],
             relay_rtt_ms=self._relay_rtt_ms or stats["relay_rtt_ms"],
-            # Спрашивается каждый раз, а не берётся со старта: связь с точкой
-            # встречи теряется при её перезапуске, и снимок годовой давности
-            # здесь ровно так же бесполезен, как и по достижимости.
-            in_network=bool(self.node and self.node.in_network()),
+            # Снимок с потока опроса, а не вопрос рантайму отсюда. Связь с
+            # точкой встречи действительно теряется при её перезапуске, и
+            # значение со старта было бы бесполезно — но обновляет его тот же
+            # поток, что и остальное: этот метод зовёт удар сердца, и всё, что
+            # в нём уходит в чужой рантайм, рано или поздно его останавливает.
+            in_network=bool(self.node) and self._in_network,
         )
 
     def identity_message(self):

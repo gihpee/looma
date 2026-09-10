@@ -241,3 +241,38 @@ def test_важные_порты_подмножество_проброшенны
     проброшенные = {порт for порты in crossing_for_group(3).values() for порт in порты}
 
     assert важные <= проброшенные
+
+
+def test_окно_не_задевает_диапазон_клиентских_серверов_ray(monkeypatch):
+    """Ray поднимает на каждое подключение отдельный SpecificServer и порт ему
+    выбирает сам, из зашитого в исходник 23000-24000. Ни флага, ни переменной
+    окружения для этого нет. Наше окно шло с 20000 по 32000 и этот кусок
+    накрывало — группа, чей хеш попадал внутрь, дралась с клиентским сервером
+    за одни и те же номера, и выглядело это как «порт занят» на ровном месте.
+    """
+    from looma_ray import ports
+
+    for i in range(300):
+        monkeypatch.setenv("LOOMA_GROUP_ID", f"group-{i:08x}")
+        for size in (1, 2, 4):
+            base = ports.group_base(size)
+            последний = ports.ports_for(size - 1, base=base).client_last
+            assert not (base < ports.RAY_SPECIFIC_LAST
+                        and последний >= ports.RAY_SPECIFIC_FIRST), (
+                f"окно {base}-{последний} налезает на диапазон Ray")
+
+
+def test_окно_по_прежнему_одинаково_у_всех_рангов(monkeypatch):
+    """Ранги считают его молча и обязаны сойтись — иначе они разъедутся по
+    портам и не найдут друг друга."""
+    from looma_ray import ports
+
+    monkeypatch.setenv("LOOMA_GROUP_ID", "group-408fb77630")
+    assert ports.group_base(2) == ports.group_base(2)
+
+
+def test_без_идентификатора_группы_берётся_начало(monkeypatch):
+    from looma_ray import ports
+
+    monkeypatch.delenv("LOOMA_GROUP_ID", raising=False)
+    assert ports.group_base(2) == ports.BASE

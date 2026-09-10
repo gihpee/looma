@@ -1239,8 +1239,16 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
                 # ray[client], а не просто ray: серверная часть клиентского
                 # входа лежит в этом extra, и без него `--ray-client-server-port`
                 # не игнорируется, а роняет `ray start` целиком.
+                #
+                # virtualenv — ради `runtime_env={"pip": [...]}`. Плагин pip у
+                # Ray заводит окружение задания через virtualenv и без него
+                # отказывается ещё на подключении клиента, роняя ray.init с
+                # «Please install virtualenv». Пакет чисто питонный и мелкий,
+                # ставится всегда: иначе способ задавать библиотеки на лету
+                # выглядит рабочим ровно до первой попытки им воспользоваться.
                 environment={"kind": "python", "requirements": [
                     f"ray[client]=={version}" if version else "ray[client]",
+                    "virtualenv",
                     *extra,
                 ]},
                 resources=raw.get("resources") or None,
