@@ -630,3 +630,25 @@ def test_старая_версия_закрывать_нечего():
     vllm_engine._finish_step(types.SimpleNamespace())          # нет sample_tokens
     vllm_engine._finish_step(types.SimpleNamespace(sample_tokens=None,
                                                    execute_model_state=None))
+
+
+def test_воркеры_наследуют_запрет_компиляции(monkeypatch):
+    """Переменную torch читает при импорте, воркеры — отдельные процессы:
+    ставить её надо до их подъёма, у себя."""
+    monkeypatch.delenv("TORCH_COMPILE_DISABLE", raising=False)
+    order = []
+    monkeypatch.setattr(vllm_engine, "forbid_compile",
+                        lambda: order.append("запрет"))
+    _loading(monkeypatch, built=18, order=order)
+    vllm_engine.load_shard("модель", start_layer=0, end_layer=18,
+                           num_model_layers=36)
+    assert order.index("запрет") < order.index("воркеры")
+
+
+def test_запрет_не_перекрывает_выставленное_оператором(monkeypatch):
+    monkeypatch.setenv("TORCH_COMPILE_DISABLE", "0")
+    vllm_engine.forbid_compile()
+    assert __import__("os").environ["TORCH_COMPILE_DISABLE"] == "0"
+    monkeypatch.delenv("TORCH_COMPILE_DISABLE")
+    vllm_engine.forbid_compile()
+    assert __import__("os").environ["TORCH_COMPILE_DISABLE"] == "1"

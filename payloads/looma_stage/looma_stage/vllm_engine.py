@@ -417,6 +417,31 @@ def _build_config(model_path: str, *, dtype: str, max_model_len: int,
     )
 
 
+def forbid_compile() -> None:
+    """Не давать torch.compile'у собирать ядра: на узле нет компилятора.
+
+    Со стенда (nv3, 2 карты): модель поднялась, а первый шаг упал с
+        Failed to find C compiler. Please specify via CC environment variable
+    из недр Triton. Виновник — `VocabParallelEmbedding.forward` в vLLM: при
+    `tp_size > 1` он зовёт `get_masked_input_and_mask`, обёрнутую в
+    `@torch.compile(backend="inductor")`. Inductor генерирует Triton-ядро,
+    Triton при первом запуске компилирует свой C-модуль — и ему нужен `cc`.
+    На одной карте ветка не выполняется, поэтому раньше это не всплывало.
+
+    Функция чисто поэлементная и в eager считается так же, только без
+    слияния в одно ядро: одна операция на шаг над индексами токенов. Ставить
+    ради неё gcc в образ агента — плюс полторы сотни мегабайт на каждый узел.
+
+    Переменную читает `torch._dynamo.config` при импорте, поэтому ставится
+    ДО подъёма воркеров — они наследуют окружение. В самом воркере флаг
+    дублируется прямо в конфиге (см. vllm_worker): на случай, если torch там
+    уже импортирован к моменту, когда до этого дошло.
+    """
+    import os
+
+    os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+
+
 def start_executor(config):
     """Поднять воркеры — по одному на карту — через исполнитель vLLM.
 
@@ -595,6 +620,7 @@ def load_shard(model_path: str, *, start_layer: int, end_layer: int,
                                   "num_model_layers": num_model_layers})
     _hold_config(config)
     warn_if_shm_tight(cards)
+    forbid_compile()
 
     driver = StageDriver(start_executor(config), cards=cards,
                          is_first=is_first, is_last=is_last)

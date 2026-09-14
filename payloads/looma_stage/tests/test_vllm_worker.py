@@ -178,6 +178,8 @@ def fake_vllm(monkeypatch):
     torch.cuda = types.SimpleNamespace(
         mem_get_info=lambda index: (10 * 2 ** 30, 24 * 2 ** 30))
     torch.inference_mode = contextlib.nullcontext
+    dynamo = module("torch._dynamo", config=types.SimpleNamespace(disable=False))
+    torch._dynamo = dynamo
     for name, made in modules.items():
         monkeypatch.setitem(sys.modules, name, made)
 
@@ -333,3 +335,11 @@ def test_ненулевой_ранг_последней_стадии_тоже_з
         worker.model_runner, "execute_model_state", None)
     assert worker.stage_step("батч", {"hidden_states": _Tensor("h")}, expected=1) is None
     assert worker.model_runner.execute_model_state is None
+
+
+def test_воркер_запрещает_torch_compile(fake_vllm):
+    """Со стенда: при TP>1 vLLM зовёт функцию под @torch.compile, inductor
+    строит Triton-ядро, Triton ищет C-компилятор — на узле его нет. В eager
+    та же функция считается без компилятора."""
+    _worker(fake_vllm)
+    assert fake_vllm["torch._dynamo"].config.disable is True

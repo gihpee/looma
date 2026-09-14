@@ -124,6 +124,7 @@ SIGBUS без единой строки в логе. Стадия предупр
 | Симптом | Причина |
 |---|---|
 | `not exists in the runnable of cudagraph wrapper` | спецификацию кэша спрашивали у модели, а она под обёрткой; теперь её спрашивает сам воркер vLLM (`get_kv_cache_spec`), как в штатном движке |
+| `Failed to find C compiler` из Triton на первом шаге при TP>1 | `VocabParallelEmbedding` при `tp_size > 1` зовёт функцию под `@torch.compile(backend="inductor")`; на узле нет `cc`. Стадия ставит `TORCH_COMPILE_DISABLE=1` воркерам и `torch._dynamo.config.disable` в них — функция считается в eager |
 | `WorkerProc initialization failed… see stack trace` | воркер упал на подъёме; причина — в его логе выше по выводу (строки `WorkerProc failed`), сюда доходит только общая фраза |
 | воркер исчез молча, стадия ждёт | SIGBUS на записи в переполненный `/dev/shm` (см. выше) или зависшая NCCL-коллектива; шаг ограничен `STEP_TIMEOUT_S`, чтобы второе не длилось вечно |
 | `IndexError` в `attn_groups[0]` | сделана только планировщиковая половина кэша |
