@@ -9,11 +9,19 @@ read makes this node look dead.
 from __future__ import annotations
 
 import logging
+import threading
 
 from looma_agent.control.tasks import TaskCommands
 from looma_agent.proto import agent_pb2
 
 logger = logging.getLogger("looma_agent.handlers")
+
+# Команды, которые нельзя выполнять в приёмном потоке. Мерки простые: снятие
+# ждёт процесс до GRACE_S, освобождение — до 30 секунд плюс удаление каталога
+# задачи и обход кэша весов. Всё остальное здесь либо кладёт в очередь, либо
+# отвечает сразу; порядок для них важен (куски входных файлов, куски туннеля),
+# и уводить их в потоки нельзя — приедут вперемешку.
+SLOW = frozenset({"stop_task", "release_task"})
 
 
 class CommandHandlers:
@@ -31,6 +39,28 @@ class CommandHandlers:
 
     def handle(self, message: agent_pb2.ServerMessage) -> None:
         kind = message.WhichOneof("msg")
+        if kind in SLOW:
+            # Своим потоком, а не здесь. Этот метод зовётся ПРЯМО из цикла
+            # приёма управляющего потока, и пока он не вернётся, агент не
+            # разбирает ни одной другой команды.
+            #
+            # Снятие ждёт процесс до GRACE_S, освобождение — до 30 секунд, плюс
+            # удаление каталога задачи и обход кэша весов. С дампа живого агента
+            # (py-spy) главный поток стоял в снятии, а весь приём стоял вместе с
+            # ним. Узел в это время глухой: ни второй команды, ни ответа на
+            # запрос логов — то есть неотличим от мёртвого.
+            threading.Thread(target=self._carry, args=(kind, message),
+                             name=f"cmd-{kind}", daemon=True).start()
+            return
+        self._dispatch(kind, message)
+
+    def _carry(self, kind: str, message: agent_pb2.ServerMessage) -> None:
+        try:
+            self._dispatch(kind, message)
+        except Exception:
+            logger.exception("команда %s не отработала", kind)
+
+    def _dispatch(self, kind: str, message: agent_pb2.ServerMessage) -> None:
         if kind == "input_chunk":
             self.tasks.input_chunk(message.input_chunk)
         elif kind == "run_task":

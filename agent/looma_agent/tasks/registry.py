@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import signal
 import threading
 import time
 from dataclasses import replace
@@ -23,7 +25,7 @@ from typing import Dict, List, Optional, Tuple
 from looma_agent.tasks.directory import TaskDirectory
 from looma_agent.tasks.env import EnvironmentCache
 from looma_agent.tasks.limits import Isolation, ensure_can_run
-from looma_agent.tasks.runner import Task
+from looma_agent.tasks.runner import CANCELLED, Task
 from looma_agent.tasks.spec import TaskRefused, TaskSpec
 
 
@@ -154,6 +156,56 @@ class TaskRegistry:
         with self._lock:
             self._held.pop(task_id, None)
 
+    # ------------------------------------------------------------ leftovers
+    def sweep_leftovers(self) -> dict:
+        """Убрать всё, что осталось от задач прошлой жизни агента.
+
+        Задачи агент не переживают: их процессы — его потомки, каталоги —
+        его учёт, а учёт живёт в памяти. После перезапуска ни одна запись о
+        них не восстанавливается — значит всё, что несёт метку задачи, уже
+        ничьё. Но само оно не исчезает: со стенда, на двух узлах по три
+        каталога /tmp/looma-* за два дня и воркер мёртвого кластера на порту,
+        который следующему кластеру оказался нужен.
+
+        Окружения не трогаем: они в своём кэше и переживают задачи намеренно.
+        """
+        from looma_agent.tasks import runner as runner_mod
+        from looma_agent.tasks.directory import _scratch_name
+
+        убито = 0
+        for pid in runner_mod._processes_of_any():
+            runner_mod._signal(pid, signal.SIGKILL)
+            убито += 1
+
+        каталогов = 0
+        try:
+            for entry in self.root.iterdir():
+                if not entry.is_dir():
+                    continue
+                short = Path("/tmp") / _scratch_name(entry.name)
+                shutil.rmtree(short, ignore_errors=True)
+                try:
+                    shutil.rmtree(entry)
+                    каталогов += 1
+                except OSError:
+                    logger.warning("не убрал остаток задачи %s", entry, exc_info=True)
+        except FileNotFoundError:
+            pass
+
+        # Короткие каталоги, чьих задач в каталоге задач уже нет.
+        try:
+            for short in Path("/tmp").glob("looma-????????"):
+                if short.is_dir():
+                    shutil.rmtree(short, ignore_errors=True)
+                    каталогов += 1
+        except OSError:
+            pass
+
+        if убито or каталогов:
+            logger.info("уборка после прошлой жизни: снял %d процесс(ов), "
+                        "убрал %d каталог(ов)", убито, каталогов)
+        return {"processes": убито, "directories": каталогов}
+
     # ----------------------------------------------------------------- submit
     def submit(self, spec: TaskSpec, deliver_input=None, group=None) -> Task:
         """Take a task on, or say plainly why not.
@@ -236,12 +288,20 @@ class TaskRegistry:
         """
         task.wait()
         self._release_devices(task.spec.task_id)
-        # The environment can be evicted again once nothing holds it.
+        # The environment can be evicted again once nothing holds it. Лизинг,
+        # а не удаление: само окружение остаётся в кэше — ради него он и есть.
         self.environments.release(task.environment.fingerprint)
-        if self.retention_s <= 0:
+        if self.retention_s <= 0 or task.state == CANCELLED:
+            # Снятой задаче удержание не положено: результата, за которым
+            # придут, у неё нет — её остановили. А лежало всё это час, и то
+            # если агент за час не перезапускался: со стенда, на двух узлах по
+            # три каталога /tmp/looma-* от кластеров за два дня.
             self.release(task.spec.task_id)
             return
-        time.sleep(self.retention_s)
+        # Ждём событие, а не спим: явное освобождение будит сразу, и поток не
+        # висит час после того, как убирать уже нечего.
+        if task.released.wait(self.retention_s):
+            return
         if self.get(task.spec.task_id) is task:
             logger.info("task %s was never collected; reclaiming its disk",
                         task.spec.task_id)
@@ -310,6 +370,7 @@ class TaskRegistry:
             task.wait(timeout=30)
         self._release_devices(task_id)
         task.directory.remove()
+        task.released.set()
         # Место освободилось — самое время посмотреть, не пора ли убрать
         # давние веса. Здесь, а не при запуске: на запуске задача уже ждёт, и
         # обход кэша добавил бы ей задержку ни за что.

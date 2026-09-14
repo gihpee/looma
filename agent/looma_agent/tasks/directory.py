@@ -143,6 +143,11 @@ class TaskDirectory:
         # rmtree по root его не заденет и убрать его надо отдельно. Первым:
         # иначе ранний выход по FileNotFoundError оставил бы его навсегда.
         shutil.rmtree(self.scratch, ignore_errors=True)
+        if self.scratch.exists():
+            # Молчать нельзя: именно эти каталоги копились по три штуки на узел,
+            # и без строки в логе о них узнавали только по df.
+            logger.warning("короткий каталог %s не убрался; он останется занимать "
+                           "диск", self.scratch)
         try:
             shutil.rmtree(self.root, ignore_errors=False)
         except FileNotFoundError:

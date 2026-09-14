@@ -187,6 +187,19 @@ def start_node(rank: int, size: int, *, gpus: Optional[int] = None,
     # и новый его больше не встречает.
     base = base or group_base(size, stride=stride)
     ports = ports_for(rank, base=base, stride=stride)
+    busy = occupied(loopback_for(rank), ports.essential())
+    if busy:
+        # Сейчас, а не через таймаут клиента. `ray start` о занятом порте
+        # молчит: клиентский сервер просто не поднимается, код возврата не
+        # меняется, а проверка «принимает ли вход» видит ЧУЖОГО слушателя и
+        # верит ему. Со стенда, nv3: порты 20006–20007 на хосте держал
+        # docker-proxy постороннего контейнера, кластер «собрался», вход
+        # «принимал», а клиент получал таймаут.
+        raise RuntimeError(
+            f"ранг {rank}: порты {', '.join(str(p) for p in busy)} на "
+            f"{loopback_for(rank)} уже заняты кем-то ещё на этой машине — Ray "
+            "поднимется без них и промолчит. " + holders_of(busy) +
+            " Освободите порты или сдвиньте окно через LOOMA_RAY_PORT_BASE.")
     argv = [sys.executable, "-m", "ray.scripts.scripts", "start"]
     if rank == 0:
         # --include-dashboard только здесь: Ray отвергает его у неголовных
@@ -283,13 +296,98 @@ def client_entry_ready(port: int, *, wait_s: float = 30.0) -> str:
             if not host:
                 continue
             if _reachable(host, port, timeout=1.0):
-                logger.info("клиентский вход принимает на %s:%d", host, port)
-                return ""
+                # TCP-connect — не доказательство: на порту может сидеть кто
+                # угодно, и он примет. Со стенда: docker-proxy на 0.0.0.0:20007
+                # принимал за прокси Ray, которого не было. Верим только логу
+                # самого прокси — он пишет первой строкой, что стартовал.
+                said = client_server_said()
+                if "Starting Ray Client server" in said:
+                    logger.info("клиентский вход принимает на %s:%d", host, port)
+                    return ""
+                if said.strip() and "Starting Ray Client server" not in said:
+                    return (f"на порту {port} кто-то принимает соединения, но "
+                            "это не клиентский сервер Ray: он не стартовал." + said)
         STOP.wait(1.0)
     return (f"клиентский вход Ray не принимает на порту {port} ни на "
             f"{loopback_for(0)}, ни на 127.0.0.1 за {wait_s:.0f}с. Кластер при "
             "этом собран и работает — не работать будет только подключение "
             "снаружи (looma-connect)." + client_server_said())
+
+
+def occupied(host: str, ports) -> list:
+    """Какие из портов уже нельзя занять на этом адресе.
+
+    Пробуем bind на ТОМ адресе, куда пойдёт Ray, а не на 0.0.0.0: слушатель
+    на 127.0.0.1 нашему 127.0.0.2 не мешает, а слушатель на 0.0.0.0 мешает
+    всем — и ровно это bind на конкретном адресе и покажет.
+    """
+    busy = []
+    for port in ports:
+        with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind((host, port))
+            except OSError:
+                busy.append(port)
+    return busy
+
+
+def holders_of(ports) -> str:
+    """Кто держит порты — по /proc/net/tcp, без ss и lsof: в образе их нет.
+
+    Только слушатели (состояние 0A), любой адрес. Имя процесса — по inode
+    сокета через /proc/*/fd, и только если хватает прав; иначе честное
+    «не удалось узнать».
+    """
+    wanted = set(ports)
+    inodes = {}
+    seen_table = False
+    try:
+        for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                lines = open(table).read().splitlines()[1:]
+            except OSError:
+                continue
+            seen_table = True
+            for line in lines:
+                cols = line.split()
+                if len(cols) < 10 or cols[3] != "0A":
+                    continue
+                port = int(cols[1].rsplit(":", 1)[1], 16)
+                if port in wanted:
+                    inodes[cols[9]] = port
+    except Exception:
+        return "Кто их держит, узнать не удалось."
+    if not seen_table:
+        return "Кто их держит, здесь не узнать: нет /proc (macOS?) — посмотрите lsof -nP -iTCP -sTCP:LISTEN."
+    if not inodes:
+        return "Слушателя в /proc/net/tcp не видно: возможно, он в другом сетевом пространстве."
+    found = {}
+    try:
+        import os as _os
+        for pid in _os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                fds = _os.listdir(f"/proc/{pid}/fd")
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    link = _os.readlink(f"/proc/{pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if link.startswith("socket:[") and link[8:-1] in inodes:
+                    try:
+                        name = open(f"/proc/{pid}/comm").read().strip()
+                    except OSError:
+                        name = "?"
+                    found[inodes[link[8:-1]]] = f"{name} (pid {pid})"
+    except Exception:
+        pass
+    if not found:
+        return "Кто их держит, узнать не удалось (нет прав на /proc чужих процессов)."
+    return "Держат: " + ", ".join(f"{p} — {who}" for p, who in sorted(found.items())) + "."
 
 
 def client_server_said(temp_dir: str = "") -> str:

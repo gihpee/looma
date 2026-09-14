@@ -95,6 +95,44 @@ def describe(repo: str, *, token: str = "") -> ModelInfo:
     )
 
 
+def expand_ranks(nodes: list, engine: str) -> list:
+    """Из выбранных узлов — ранги: кто где живёт и сколько у него VRAM.
+
+    Ранг — это узел, для обоих движков. Разница в том, сколько памяти узла
+    ранг может занять:
+
+    torch — всю: его загрузчик кладёт срез на все карты машины пропорционально
+    их памяти, стык между картами идёт по PCIe внутри процесса
+    (looma_stage/loader.py, plan_layer_devices).
+
+    vLLM — `N × min(карта)`: стадия поднимается на всех картах узла с tensor
+    parallelism (looma_stage/vllm_worker.py), а TP режет каждый слой поровну,
+    так что меньшая карта задаёт предел всем. Сумма карт была бы обещанием
+    памяти, которую большие карты не могут отдать за маленькую: на 24+12 ГБ
+    стадия возьмёт 2×12, а не 36.
+
+    Разворачивать многокарточную машину в несколько рангов через локальную
+    доставку НЕ делается намеренно: карты одной машины должны говорить по
+    NCCL, а не через сокет агента.
+
+    Агент постарше не шлёт память по картам — тогда сумма делится поровну и
+    берётся вся: поровну поделённые карты и есть `N × min`.
+    """
+    ranks = []
+    for node in nodes:
+        total = int(node.get("vram_free_bytes") or 0)
+        if engine != "vllm":
+            ranks.append({"node_id": node["node_id"], "vram": total})
+            continue
+        per_gpu = [int(v) for v in (node.get("vram_free_per_gpu") or []) if int(v) > 0]
+        if not per_gpu:
+            count = max(1, int(node.get("gpus_total") or 1))
+            per_gpu = [total // count] * count
+        ranks.append({"node_id": node["node_id"],
+                      "vram": len(per_gpu) * min(per_gpu)})
+    return ranks
+
+
 def split_layers(num_layers: int, stages: int,
                  weights: Optional[List[float]] = None) -> List[Tuple[int, int]]:
     """Кому какой диапазон слоёв.

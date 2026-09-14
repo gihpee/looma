@@ -5,16 +5,28 @@
 # Изменения: без LoRA, MoE-роутинга и спекулятивного декодирования — их тут
 # нечем проверить и незачем нести; поднятие разбито на именованные шаги, чтобы
 # отказ называл, на каком именно; проверка карты до всего остального.
-"""Движок vLLM, собирающий только слои этой стадии.
+"""Движок vLLM, собирающий только слои этой стадии — на всех картах узла.
 
-Веха 1: он **грузит** свой срез и рассказывает, что загрузил. Шага модели и
-батча тут ещё нет — они следующие, и до них надо убедиться, что приём вообще
-работает на настоящей карте.
+Как это устроено. Между машинами — pipeline parallelism: стадия держит свой
+диапазон слоёв, активации ходят через агента. Внутри машины — tensor
+parallelism: стадия поднимается через штатный исполнитель vLLM с
+`tensor_parallel_size = число видимых карт`, по воркеру на карту, NCCL между
+ними по PCIe/NVLink, каждый слой порезан на все карты поровну. Одна карта —
+тот же путь с одним воркером.
 
-Почему так, а не всё сразу: приём держится на трёх вмешательствах во
-внутренности vLLM (см. vllm_runner.py и vllm_patch.py), и любое из них может
-разойтись с версией движка. Узнать это на загрузке — минуты; узнать на батче,
-проделав всю работу, — недели.
+Этот процесс — ДРАЙВЕР: карту он не держит. Он собирает батч (менеджер
+блоков KV-кэша живёт здесь, один на все карты), рассылает его воркерам и
+забирает результат с нулевого. Всё, что считает, — в `vllm_worker.py`.
+
+Почему не по агенту на карту с обменом активациями через сеть: карты одной
+машины связаны шиной в сотни гигабит, а сосед по конвейеру — тоннелем в
+десятки мегабит. Гонять через тоннель то, что можно сложить по шине, —
+терять на каждом токене.
+
+Приём держится на трёх вмешательствах во внутренности vLLM (см.
+vllm_runner.py и vllm_patch.py), и любое из них может разойтись с версией
+движка. Узнать это на загрузке — минуты; узнать на батче, проделав всю
+работу, — недели.
 
 Проверить на узле, ничего не разворачивая:
 
@@ -28,8 +40,9 @@ import logging
 from dataclasses import dataclass
 from typing import List, Optional
 
-from looma_stage.vllm_runner import (RunnerRefused, layer_range, replace_pipeline_group,
-                                    stage_role, stage_runner_class)
+import threading
+
+from looma_stage.vllm_runner import RunnerRefused, lay_out_cache, stage_role
 
 logger = logging.getLogger("looma_stage.vllm_engine")
 
@@ -56,6 +69,11 @@ MAX_UTILISATION = 0.9
 # узнаем только в работе. Занизить его хуже, чем завысить: нехватка вылезет
 # посреди запроса, а не при загрузке.
 OVERHEAD_BYTES = 2 * 1024 ** 3
+
+# Сколько ждать один шаг от воркеров. Без предела зависшая NCCL-коллектива
+# (одна карта отвалилась, остальные ждут её вечно) вешала бы стадию молча;
+# с пределом шаг падает с причиной, голова узнаёт и снимает батч.
+STEP_TIMEOUT_S = 600
 
 
 def dtype_bytes(dtype: str) -> int:
@@ -148,35 +166,73 @@ def plan_memory(*, per_token: int, weights_bytes: int, total_bytes: int,
                 bytes_needed=int(needed), why=why)
 
 
+def kv_heads(config) -> int:
+    """Сколько KV-голов у модели — по стольким карта делит кэш при TP."""
+    return int(getattr(config, "num_key_value_heads", None)
+               or getattr(config, "num_attention_heads", None) or 1)
+
+
+def per_card(total: int, cards: int, *, heads: int = 0) -> int:
+    """Сколько из общего достаётся одной карте при tensor parallelism.
+
+    Веса делятся на все карты. KV-кэш — по головам: когда карт больше, чем
+    KV-голов (GQA-модель на восьми картах), vLLM головы дублирует, и на карту
+    приходится 1/heads, а не 1/cards. Считать иначе значило бы обещать кэш,
+    которого на карте нет.
+    """
+    cards = max(1, int(cards))
+    share = min(cards, heads) if heads > 0 else cards
+    return -(-int(total) // share)
+
+
 def plan_for_shard(model_path: str, *, layers: int, dtype: str,
                    vram_quota_bytes: int, max_sequences: int,
-                   max_model_len: int) -> "Plan":
-    """Сколько карты попросит эта стадия.
+                   max_model_len: int, cards: int = 1) -> "Plan":
+    """Сколько попросит эта стадия — от КАЖДОЙ карты.
 
     Считается от того, что она обещает обслужить, а не берётся долей наугад.
     vLLM выделяет KV-кэш заранее и на всю отведённую долю, так что
     фиксированные «70% карты» означали бы, что стадия крошечной модели
     занимает столько же, сколько огромной, и соседу на этом узле места не
     остаётся.
+
+    При нескольких картах и веса, и кэш режутся между ними, а квота узла
+    (оркестратор считает её как `карт × меньшая карта`) — поровну на карту.
+    Доля одна на все карты: vLLM применяет её к каждой, поэтому считается
+    она от самой маленькой из них.
     """
     from transformers import AutoConfig
 
-    total = card_bytes()
+    config = AutoConfig.from_pretrained(model_path)
+    total = card_bytes(cards)
+    quota = vram_quota_bytes // cards if vram_quota_bytes > 0 else total
     return plan_memory(
-        per_token=kv_bytes_per_token(AutoConfig.from_pretrained(model_path),
-                                     layers=layers, dtype=dtype),
-        weights_bytes=weights_size(model_path),
-        total_bytes=total,
-        budget_bytes=vram_quota_bytes if vram_quota_bytes > 0 else total,
+        per_token=per_card(kv_bytes_per_token(config, layers=layers, dtype=dtype),
+                           cards, heads=kv_heads(config)),
+        weights_bytes=per_card(weights_size(model_path), cards),
+        total_bytes=total, budget_bytes=quota,
         max_sequences=max_sequences, max_model_len=max_model_len)
 
 
-def card_bytes() -> int:
-    """Сколько всего памяти на карте. Отдельной функцией — чтобы расчёт можно
+def card_count() -> int:
+    """Сколько карт видит этот процесс — столько и воркеров.
+
+    Агент отдаёт задаче её карты через CUDA_VISIBLE_DEVICES, так что «все
+    видимые» — это ровно те, что выданы, а не все, что есть на машине.
+    """
+    import torch
+
+    return max(1, int(torch.cuda.device_count()))
+
+
+def card_bytes(cards: int = 1) -> int:
+    """Память самой маленькой из карт: доля vLLM одна на все, и считать её
+    надо от той, где меньше всего. Отдельной функцией — чтобы расчёт можно
     было проверить там, где карты нет."""
     import torch
 
-    return int(torch.cuda.get_device_properties(0).total_memory)
+    return min(int(torch.cuda.get_device_properties(index).total_memory)
+               for index in range(max(1, int(cards))))
 
 
 def weights_size(model_path: str) -> int:
@@ -205,10 +261,14 @@ class LoadedShard:
     is_first: bool
     is_last: bool
     dtype: str
+    #: Драйвер (`StageDriver`): менеджер блоков и связь с воркерами. Карты у
+    #: него нет — считают воркеры.
     runner: object
     #: Сколько последовательностей стадия реально может держать — после того,
     #: как под них нашлось место. Может быть меньше запрошенного.
     max_sequences: int = 0
+    #: На скольких картах, то есть сколько воркеров режут каждый слой.
+    cards: int = 1
 
     def as_dict(self) -> dict:
         return {
@@ -218,7 +278,13 @@ class LoadedShard:
             "last": self.is_last,
             "dtype": self.dtype,
             "мест": self.max_sequences,
+            "карт": self.cards,
         }
+
+    def close(self) -> None:
+        close = getattr(self.runner, "close", None)
+        if close is not None:
+            close()
 
 
 def require_cuda() -> None:
@@ -293,12 +359,18 @@ def prepare_weights(weights: str, *, start_layer: int, end_layer: int,
 
 def _build_config(model_path: str, *, dtype: str, max_model_len: int,
                   utilisation: float, block_size: int, max_sequences: int,
-                  max_batched_tokens: int):
+                  max_batched_tokens: int, cards: int, stage: dict):
     """Конфиги vLLM. Всё, чего мы не используем, названо явно нулём или None —
-    молчаливое умолчание тут означало бы «как получится»."""
-    import torch
+    молчаливое умолчание тут означало бы «как получится».
+
+    `stage` — срез этой стадии; уезжает воркерам в `additional_config`, потому
+    что конфиг — единственное, что vLLM передаёт в процесс воркера при его
+    создании.
+    """
     from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, ModelConfig,
                              ParallelConfig, SchedulerConfig, VllmConfig)
+
+    from looma_stage import vllm_worker
 
     # Без torch.compile и без захвата CUDA-графов.
     #
@@ -319,46 +391,160 @@ def _build_config(model_path: str, *, dtype: str, max_model_len: int,
         trust_remote_code=True, dtype=dtype, seed=0,
         max_model_len=max_model_len, max_logprobs=1, enforce_eager=True,
     )
+    # Исполнитель "mp" и при одной карте: путь один на все узлы, и узел с
+    # одной картой проверяет тот же код, что и узел с четырьмя. Конвейер
+    # для vLLM всегда из одной стадии — между машинами он наш, не его.
+    parallel = _config_with(ParallelConfig,
+        pipeline_parallel_size=1, tensor_parallel_size=int(cards),
+        distributed_executor_backend="mp", worker_cls=vllm_worker.QUALNAME,
+    )
     return VllmConfig(
         model_config=model,
         cache_config=CacheConfig(block_size=block_size,
                                  gpu_memory_utilization=utilisation,
                                  swap_space=0, cache_dtype="auto"),
-        parallel_config=ParallelConfig(pipeline_parallel_size=1,
-                                       tensor_parallel_size=1,
-                                       distributed_executor_backend=None),
+        parallel_config=parallel,
         scheduler_config=SchedulerConfig(
             max_num_batched_tokens=max(max_batched_tokens, model.max_model_len),
             max_num_seqs=max_sequences, max_model_len=model.max_model_len,
             is_encoder_decoder=False, enable_chunked_prefill=False),
-        device_config=DeviceConfig(device=torch.device("cuda:0")),
+        # Без номера: каждый воркер берёт карту по своему рангу.
+        device_config=DeviceConfig(device="cuda"),
         load_config=LoadConfig(load_format="auto"),
         lora_config=None, speculative_config=None, quant_config=None,
-        kv_transfer_config=None, kv_events_config=None, additional_config={},
+        kv_transfer_config=None, kv_events_config=None,
+        additional_config={vllm_worker.SETTINGS_KEY: dict(stage)},
     )
 
 
-def _start_distributed() -> None:
-    """Поднять распределённое окружение vLLM из одного процесса.
+def start_executor(config):
+    """Поднять воркеры — по одному на карту — через исполнитель vLLM.
 
-    Настоящей группы у нас нет и не нужно: обмен между стадиями идёт через
-    агента, а не через torch.distributed. Но vLLM без неё не собирается, так
-    что она заводится вырожденной — один ранг, сам себе мир.
+    Отказ воркера приходит сюда одной общей фразой («initialization failed…
+    see stack trace»), а причина — в логе самого воркера выше по выводу: он
+    пишет в тот же stderr. Поэтому отказ здесь называет, куда смотреть.
+    """
+    from vllm.v1.executor.abstract import Executor
+
+    try:
+        return Executor.get_class(config)(config)
+    except Exception as exc:
+        raise RunnerRefused(
+            f"воркеры vLLM не поднялись ({exc}); причина — в их логе выше, "
+            "строки с «WorkerProc failed»") from exc
+
+
+def shm_room() -> int:
+    """Сколько свободно в /dev/shm — или -1, если его тут нет."""
+    import os
+
+    try:
+        stat = os.statvfs("/dev/shm")
+    except OSError:
+        return -1
+    return int(stat.f_bavail * stat.f_frsize)
+
+
+def shm_needed(cards: int) -> int:
+    """Сколько разделяемой памяти могут занять очереди исполнителя.
+
+    Очередь драйвер→воркеры — кольцо из 10 кусков по VLLM_MQ_MAX_CHUNK_BYTES_MB
+    (16 МБ), ответная очередь каждого воркера — 10 по 24 МБ. Кольца
+    заполняются по мере работы, а не при создании, так что это верхняя
+    граница, а не то, что займётся сразу.
     """
     import os
 
-    from vllm.distributed import parallel_state
+    chunk = int(os.environ.get("VLLM_MQ_MAX_CHUNK_BYTES_MB", "16")) * 1024 ** 2
+    return 10 * chunk + max(1, int(cards)) * 10 * 24 * 1024 ** 2
 
-    if parallel_state.model_parallel_is_initialized():
+
+def warn_if_shm_tight(cards: int) -> None:
+    """Сказать заранее, если /dev/shm мал.
+
+    Очереди исполнителя живут в /dev/shm, а в контейнере он по умолчанию
+    64 МБ. Кончится он не при создании, а при первой записи за край —
+    воркер умрёт по SIGBUS без единой строки в логе. Здесь это не отказ:
+    мелкие батчи в такой объём укладываются, а насколько крупные пойдут —
+    заранее не известно. Но пусть в логе будет, на что смотреть, когда
+    воркер исчезнет молча.
+    """
+    room, needed = shm_room(), shm_needed(cards)
+    if room < 0 or room >= needed:
         return
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    os.environ.setdefault("LOCAL_RANK", "0")
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "0")
-    parallel_state.init_distributed_environment()
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size=1,
-                                             pipeline_model_parallel_size=1)
+    logger.warning(
+        "в /dev/shm свободно %d МБ, а очереди исполнителя vLLM на %d карт(ы) "
+        "могут занять до %d МБ; если воркер пропадёт молча (SIGBUS) — это "
+        "оно. Контейнеру нужен --shm-size побольше",
+        room // 1024 ** 2, cards, needed // 1024 ** 2)
+
+
+class StageDriver:
+    """Сторона драйвера: менеджер блоков плюс связь с воркерами.
+
+    Это то, что `vllm_batch` знает как «исполнитель»: у него есть
+    `kv_cache_manager` и `kv_cache_config`, чтобы собирать батч и отдавать
+    блоки. Карты у него нет — `device` не задан нарочно: тензоры с провода
+    остаются на процессоре, а на карту их кладёт каждый воркер сам.
+    """
+
+    def __init__(self, executor, *, cards: int, is_first: bool, is_last: bool) -> None:
+        self.executor = executor
+        self.cards = cards
+        self.is_first = is_first
+        self.is_last = is_last
+        self.kv_cache_config = None
+        self.kv_cache_manager = None
+        #: Запросы, под которые выданы блоки, — чтобы было чем их отпустить.
+        self.requests: dict = {}
+        # Один шаг за раз: очередь исполнителя не рассчитана на два
+        # запроса вперемешку, а батч и так в полёте один.
+        self._lock = threading.Lock()
+
+    def layers_built(self) -> int:
+        """Сколько слоёв собрал каждый воркер. Разошлись — отказ: карты
+        считали бы разные модели."""
+        counts = [int(count) for count in
+                  self.executor.collective_rpc("stage_layers_built")]
+        if len(set(counts)) > 1:
+            raise RunnerRefused(
+                f"воркеры собрали разное число слоёв: {counts}")
+        return counts[0] if counts else 0
+
+    def lay_out_cache(self, config, *, block_size: int, max_model_len: int) -> None:
+        self.kv_cache_config, self.kv_cache_manager = lay_out_cache(
+            self.executor, config, block_size=block_size,
+            max_model_len=max_model_len)
+
+    def run(self, scheduler_output, incoming, *, expected: int):
+        """Шаг на всех воркерах; ответ — с нулевого.
+
+        Входящие тензоры уезжают каждому целиком: при tensor parallelism
+        вход слоя один на всех картах.
+        """
+        tensors = None
+        if incoming is not None:
+            items = incoming.items() if hasattr(incoming, "items") else incoming
+            tensors = {name: value.cpu() for name, value in items}
+        with self._lock:
+            answer = self.executor.collective_rpc(
+                "stage_step", args=(scheduler_output, tensors),
+                kwargs={"expected": expected}, unique_reply_rank=0,
+                timeout=STEP_TIMEOUT_S)
+        if answer is None:
+            raise RunnerRefused("нулевой воркер не отдал результата шага")
+        hidden, logits = answer
+        if hidden is None:
+            return None, logits
+        from vllm.sequence import IntermediateTensors
+
+        return IntermediateTensors(hidden), None
+
+    def close(self) -> None:
+        try:
+            self.executor.shutdown()
+        except Exception:
+            logger.debug("исполнитель не разобрался", exc_info=True)
 
 
 def load_shard(model_path: str, *, start_layer: int, end_layer: int,
@@ -366,65 +552,71 @@ def load_shard(model_path: str, *, start_layer: int, end_layer: int,
                vram_quota_bytes: int = 0, max_model_len: int = 4096,
                block_size: int = 16, max_sequences: int = 64,
                max_batched_tokens: int = 16384) -> LoadedShard:
-    """Собрать модель из одних только наших слоёв.
+    """Собрать модель из одних только наших слоёв — на всех картах узла.
 
     Порядок шагов не переставляется, и каждый стоит там, где стоит:
 
-    1. заплаты — до всякой загрузки;
-    2. конфиг ставится текущим ДО распределённой группы. Свежий vLLM спрашивает
-       конфиг уже внутри `initialize_model_parallel`, и без него падает на
-       assert'е, в котором про конвейер нет ни слова: «Current vLLM config is
-       not set... or a CustomOp was instantiated at module import time». Более
+    1. срез проверяется и веса урезаются до подъёма чего бы то ни было;
+    2. конфиг ставится текущим ДО исполнителя. Свежий vLLM спрашивает конфиг
+       уже внутри `initialize_model_parallel`, и без него падает на assert'е,
+       в котором про конвейер нет ни слова: «Current vLLM config is not
+       set... or a CustomOp was instantiated at module import time». Более
        ранние версии конфиг там не трогают, так что поставить его раньше —
        строго безопаснее, чем позже;
-    3. группа конвейера подменяется после того, как vLLM собрал свою;
-    4. срез слоёв навязывается только на время самой загрузки.
+    3. исполнитель поднимает воркеры: карта, NCCL-группа, наши подмены и
+       загрузка среза — всё это внутри каждого (vllm_worker.py);
+    4. кэш раскладывается на все воркеры сразу, когда веса уже на местах и
+       видно, сколько осталось.
     """
-    from looma_stage import vllm_patch
-
     require_cuda()
     is_first, is_last = stage_role(start_layer, end_layer, num_model_layers)
-    logger.info("собираю слои [%d, %d) из %d: первая=%s, последняя=%s",
-                start_layer, end_layer, num_model_layers, is_first, is_last)
+    cards = card_count()
+    logger.info("собираю слои [%d, %d) из %d: первая=%s, последняя=%s, карт %d",
+                start_layer, end_layer, num_model_layers, is_first, is_last,
+                cards)
 
     model_path = prepare_weights(model_path, start_layer=start_layer,
                                  end_layer=end_layer, is_first=is_first,
                                  is_last=is_last, dtype=dtype)
-    vllm_patch.allow_missing_ends(is_first=is_first, is_last=is_last)
 
     plan = plan_for_shard(model_path, layers=end_layer - start_layer,
                           dtype=dtype, vram_quota_bytes=vram_quota_bytes,
                           max_sequences=max_sequences,
-                          max_model_len=max_model_len)
-    logger.info("память: %s; беру %.2f карты", plan.why, plan.utilisation)
+                          max_model_len=max_model_len, cards=cards)
+    logger.info("память: %s; беру %.2f каждой карты", plan.why, plan.utilisation)
     max_sequences = plan.max_sequences
 
     config = _build_config(model_path, dtype=dtype, max_model_len=max_model_len,
                            utilisation=plan.utilisation, block_size=block_size,
                            max_sequences=max_sequences,
-                           max_batched_tokens=max_batched_tokens)
+                           max_batched_tokens=max_batched_tokens, cards=cards,
+                           stage={"start_layer": start_layer,
+                                  "end_layer": end_layer,
+                                  "num_model_layers": num_model_layers})
     _hold_config(config)
+    warn_if_shm_tight(cards)
 
-    _start_distributed()
-    replace_pipeline_group(start_layer, end_layer, num_model_layers)
-
-    runner = stage_runner_class(start_layer, end_layer, num_model_layers)(
-        vllm_config=config, device=config.device_config.device)
-    with layer_range(start_layer, end_layer):
-        runner.load_model()
-    runner.prepare_cache(block_size=block_size, max_model_len=max_model_len)
-
-    built = _count_layers(runner)
-    wanted = end_layer - start_layer
-    if built and built != wanted:
-        raise RunnerRefused(
-            f"просили {wanted} слоёв, а собралось {built}: приём разошёлся с "
-            "этой версией vLLM, и считать она будет не то")
-    logger.info("загружено слоёв: %s", built or "не удалось сосчитать")
+    driver = StageDriver(start_executor(config), cards=cards,
+                         is_first=is_first, is_last=is_last)
+    try:
+        built = driver.layers_built()
+        wanted = end_layer - start_layer
+        if built and built != wanted:
+            raise RunnerRefused(
+                f"просили {wanted} слоёв, а собралось {built}: приём разошёлся "
+                "с этой версией vLLM, и считать она будет не то")
+        logger.info("загружено слоёв: %s", built or "не удалось сосчитать")
+        driver.lay_out_cache(config, block_size=block_size,
+                             max_model_len=max_model_len)
+    except BaseException:
+        # Воркеры — процессы; брошенные при отказе, они держат карты до
+        # тех пор, пока их не убьёт агент.
+        driver.close()
+        raise
     return LoadedShard(start_layer=start_layer, end_layer=end_layer,
                        num_layers=num_model_layers, is_first=is_first,
-                       is_last=is_last, dtype=dtype, runner=runner,
-                       max_sequences=max_sequences)
+                       is_last=is_last, dtype=dtype, runner=driver,
+                       max_sequences=max_sequences, cards=cards)
 
 
 def step(shard: LoadedShard, sequences, *, incoming=None, first_step: bool):
@@ -433,6 +625,10 @@ def step(shard: LoadedShard, sequences, *, incoming=None, first_step: bool):
     Возвращает то же, что и собственный исполнитель стадии: скрытые состояния
     на всех стадиях кроме последней, логиты — на последней. Различать их
     вызывающему не нужно.
+
+    Батч собирается здесь, в драйвере, и уезжает воркерам готовым: блоки
+    KV-кэша под него выданы один раз, и все карты получают один и тот же
+    состав в одном и том же порядке.
     """
     from looma_stage import vllm_batch
 
@@ -449,14 +645,19 @@ def step(shard: LoadedShard, sequences, *, incoming=None, first_step: bool):
     runner = shard.runner
     form = vllm_batch.prefill if first_step else vllm_batch.decode
     scheduled = form(batch, runner)
-    answer = runner.execute_model(scheduled, incoming if not shard.is_first else None)
+    return runner.run(scheduled, incoming if not shard.is_first else None,
+                      expected=len(batch))
 
-    if shard.is_last:
+
+def collect(runner, answer, *, is_last: bool, expected: int):
+    """Забрать результат шага у исполнителя vLLM — в воркере, сразу после
+    `execute_model`. Возвращает `(тензоры, логиты)`, ровно одно из двух."""
+    if is_last:
         # Копией и ДО закрытия шага: сэмплер vLLM правит логиты на месте
         # (делит на температуру, режет по top-p), а выбирать токен мы будем
         # сами и по своим правилам — иначе один и тот же промпт даёт разные
         # ответы в зависимости от того, каким движком считали.
-        logits = _logits_from(runner, answer, expected=len(batch)).clone()
+        logits = _logits_from(runner, answer, expected=expected).clone()
         _finish_step(runner)
         return None, logits
     return _hidden_from(runner, answer), None
@@ -519,6 +720,7 @@ class VllmEngine:
                                 max_sequences=max_requests)
         self.is_first = self.shard.is_first
         self.is_last = self.shard.is_last
+        self.cards = self.shard.cards
         # Сколько мест нашлось под кэш. Голова раздаёт по этому числу, а не по
         # тому, что просили: обещать больше, чем помещается, — это принимать
         # запросы, которые упрутся в нехватку блоков посреди ответа.
@@ -552,10 +754,9 @@ class VllmEngine:
 
         if tensors is None or isinstance(tensors, IntermediateTensors):
             return tensors
-        device = getattr(self.shard.runner, "device", None)
-        if device is not None:
-            tensors = {name: value.to(device) for name, value in tensors.items()}
-        return IntermediateTensors(tensors)
+        # На карту не кладём: карты у драйвера нет, тензоры уедут воркерам с
+        # процессора, и каждый положит их на свою.
+        return IntermediateTensors(dict(tensors))
 
     def sample_batch(self, logits, sequences) -> list:
         """По токену на последовательность, в порядке батча."""
@@ -592,6 +793,7 @@ class VllmEngine:
         return len(self._live)
 
     def shutdown(self) -> None:
+        self.shard.close()
         shutdown()
 
 
@@ -656,12 +858,13 @@ def _hold_config(config) -> None:
 
 
 def shutdown() -> None:
-    """Разобрать распределённое окружение.
+    """Разобрать то, что поднято в ЭТОМ процессе.
 
-    Без этого torch на выходе жалуется на утечку — и жалуется по делу: группа
-    держит дескрипторы и разделяемую память. Для одиночной проверки это
-    безобидно, а для стадии, которая перезапускается по кругу при неудачном
-    старте, нет.
+    Воркеры разбирает исполнитель (`LoadedShard.close`); здесь — конфиг и
+    распределённая группа, если кто-то поднял её в драйвере (одиночная
+    проверка старого образца). Без этого torch на выходе жалуется на
+    утечку — и жалуется по делу: группа держит дескрипторы и разделяемую
+    память.
 
     Ни один шаг не обязателен: разбираем то, что поднялось, и молчим про
     остальное. Падать на уборке — худшее, что можно сделать с процессом,
@@ -766,8 +969,9 @@ def _save_hidden(tensors, path: str) -> dict:
     return saved
 
 
-def _load_hidden(path: str, device):
-    """Обратно, в тензоры на карте."""
+def _load_hidden(path: str, device=None):
+    """Обратно, в тензоры — на процессоре, если карта не названа: драйвер
+    её не держит, воркеры положат сами."""
     import json
 
     import torch
@@ -782,7 +986,9 @@ def _load_hidden(path: str, device):
     for name, where in layout.items():
         piece = blob[where["at"]:where["at"] + where["size"]]
         restored[name] = wire.from_wire(torch, piece, where["shape"],
-                                        where["dtype"]).to(device)
+                                        where["dtype"])
+        if device is not None:
+            restored[name] = restored[name].to(device)
     return IntermediateTensors(restored)
 
 
@@ -826,6 +1032,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     answer: dict = {}
+    shard = None
     try:
         shard = load_shard(args.weights, start_layer=args.start_layer,
                            end_layer=args.end_layer,
@@ -836,7 +1043,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if args.prompt_ids:
             prompts = _parse_prompts(args.prompt_ids)
-            incoming = (_load_hidden(args.load_hidden, shard.runner.device)
+            incoming = (_load_hidden(args.load_hidden, None)
                         if args.load_hidden else None)
             answer["последовательностей в батче"] = len(prompts)
             answer["токенов в батче"] = sum(len(ids) for ids in prompts)
@@ -858,6 +1065,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"не вышло: {exc}")
         return 2
     finally:
+        if shard is not None:
+            shard.close()
         shutdown()
     print(json.dumps(answer, ensure_ascii=False, indent=2, default=str))
     return 0

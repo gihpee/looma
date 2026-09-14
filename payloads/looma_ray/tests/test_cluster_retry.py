@@ -283,10 +283,17 @@ def test_слова_клиентского_сервера_попадают_в_о
 
 def test_вход_принимает_молча(monkeypatch):
     """Хорошая новость не должна занимать место в логе задачи наравне с плохой:
-    отсутствие отказа и есть отсутствие проблемы."""
+    отсутствие отказа и есть отсутствие проблемы.
+
+    «Принимает» — это два условия, а не одно: соединение проходит И сам прокси
+    записал в лог, что стартовал. Одного TCP-connect'а мало — со стенда на
+    этом порту сидел docker-proxy постороннего контейнера."""
     from looma_ray import cluster
 
     monkeypatch.setattr(cluster, "_reachable", lambda *a, **kw: True)
+    monkeypatch.setattr(cluster, "client_server_said",
+                        lambda temp_dir="": " Клиентский сервер сказал: "
+                        "ray_client_server.err: Starting Ray Client server on 127.0.0.2:31807")
 
     assert cluster.client_entry_ready(31807, wait_s=5.0) == ""
 
@@ -354,3 +361,59 @@ def test_уборка_снимает_демоны_ray(monkeypatch):
     cluster.stop_node("/tmp/session-9")
 
     assert sorted(снятые) == ["gcs_server", "plasma_store", "raylet"]
+
+
+def test_занятый_порт_ловится_до_старта_ray():
+    """Со стенда, nv3: порты 20006–20007 держал docker-proxy постороннего
+    контейнера. `ray start` промолчал, проверка входа увидела чужого
+    слушателя и поверила ему, клиент получил таймаут. Теперь — отказ до
+    старта, с номерами портов."""
+    import socket
+
+    from looma_ray import cluster
+
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        port = holder.getsockname()[1]
+
+        busy = cluster.occupied("127.0.0.1", [port, port + 1 if port < 65535 else port - 1])
+
+    assert port in busy
+
+
+def test_свободный_порт_не_считается_занятым():
+    import socket
+
+    from looma_ray import cluster
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        free = probe.getsockname()[1]
+    assert cluster.occupied("127.0.0.1", [free]) == []
+
+
+def test_tcp_connect_не_доказательство_что_вход_принимает(monkeypatch):
+    """Кто угодно на порту примет соединение. Верим только логу прокси."""
+    from looma_ray import cluster
+
+    monkeypatch.setattr(cluster, "_reachable", lambda host, port, timeout: True)
+    monkeypatch.setattr(cluster, "client_server_said",
+                        lambda temp_dir="": " Клиентский сервер сказал: "
+                        "ray_client_server.err: bind failed: Address already in use")
+
+    why = cluster.client_entry_ready(20007, wait_s=0.5)
+
+    assert why, "чужой слушатель принят за прокси Ray"
+    assert "не клиентский сервер Ray" in why
+
+
+def test_вход_принимает_когда_прокси_сам_сказал_что_стартовал(monkeypatch):
+    from looma_ray import cluster
+
+    monkeypatch.setattr(cluster, "_reachable", lambda host, port, timeout: True)
+    monkeypatch.setattr(cluster, "client_server_said",
+                        lambda temp_dir="": " Клиентский сервер сказал: "
+                        "ray_client_server.err: Starting Ray Client server on 127.0.0.2:20007")
+
+    assert cluster.client_entry_ready(20007, wait_s=0.5) == ""

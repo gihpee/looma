@@ -27,7 +27,7 @@ import platform
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple
 
 logger = logging.getLogger("looma_agent.hwinfo")
 
@@ -377,6 +377,41 @@ def detect_hardware() -> DetectedHardware:
     if "LOOMA_GPU_NAME" in os.environ:
         hw.gpu_name = os.environ["LOOMA_GPU_NAME"]
     return hw
+
+
+def free_vram_per_gpu() -> List[int]:
+    """Свободная VRAM по КАЖДОЙ карте, в порядке индексов. Пусто — не смогли.
+
+    Отдельно от суммы, и ради конкретного решения: оркестратор режет модель
+    между узлами пропорционально памяти, а стадия vLLM режет каждый слой
+    поровну на все карты узла (tensor parallelism). Её доля — `карт × меньшая
+    карта`: большая карта не отдаст за маленькую. Сумма для этого непригодна:
+    она одинакова у машины с одной картой на 96 ГБ и с четырьмя по 24, а
+    стадия на них поднимется по-разному.
+    """
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        count = pynvml.nvmlDeviceGetCount()
+        out = []
+        for index in range(count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+            out.append(int(pynvml.nvmlDeviceGetMemoryInfo(handle).free))
+        if out:
+            return out
+    except Exception:
+        pass
+    if shutil.which("nvidia-smi") is None:
+        return []
+    try:
+        text = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            text=True, timeout=15).strip()
+        return [int(float(line.strip())) * 1024 * 1024
+                for line in text.splitlines() if line.strip()]
+    except Exception:
+        return []
 
 
 def free_vram_bytes() -> int:

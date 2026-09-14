@@ -36,6 +36,7 @@ from looma.orchestrator.agents import AgentError
 from looma.orchestrator.models import (
     ModelError,
     describe,
+    expand_ranks,
     split_layers,
     stage_payload,
     stage_requirements,
@@ -1057,9 +1058,15 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
             if refusals:
                 return _error(409, "; ".join(refusals))
 
-        weights = [n["vram_free_bytes"] for n in chosen] if raw.get("by_vram", True) else None
+        # Ранг = узел, но доля памяти у ранга зависит от движка: torch берёт
+        # все карты машины, vLLM — пока одну (см. expand_ranks). Раньше vLLM
+        # получал долю по СУММЕ карт и клал её на одну: OOM при загрузке на
+        # любой машине с двумя и более картами.
+        ranks = expand_ranks(chosen, engine)
+        by_vram = raw.get("by_vram", True)
+        weights = [r["vram"] for r in ranks] if by_vram else None
         try:
-            ranges = split_layers(model.num_layers, len(chosen), weights)
+            ranges = split_layers(model.num_layers, len(ranks), weights)
             payload = stage_payload()
         except ModelError as exc:
             return _error(400, str(exc))
@@ -1083,16 +1090,20 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
 
         try:
             record = agents.submit_group(
-                size=len(chosen),
+                size=len(ranks),
                 command=per_rank[0]["command"],
                 per_rank=per_rank,
-                node_ids=[n["node_id"] for n in chosen],
+                node_ids=[r["node_id"] for r in ranks],
                 label=label,
                 serve_port=1,
                 # Веса модели качает сама стадия — сюда едет только её код.
                 inputs=payload,
                 environment={"kind": "python",
                              "requirements": stage_requirements(engine)},
+                # Ноль карт значит «не ограничивать»: стадия видит всё, что
+                # есть на машине. Карты при этом не резервируются — старая
+                # дыра в учёте, она остаётся.
+                resources=None,
                 # Без потолка: стадия живёт, пока модель развёрнута.
                 timeout_s=raw.get("timeout_s") or 30 * 24 * 3600,
                 env={"HF_TOKEN": os.environ.get("HF_TOKEN", "")} if os.environ.get("HF_TOKEN") else None,
@@ -1111,7 +1122,7 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         return {
             **record.as_dict(),
             "model": model.as_dict(),
-            "split": [{"rank": i, "node_id": chosen[i]["node_id"],
+            "split": [{"rank": i, "node_id": ranks[i]["node_id"],
                        "start_layer": s, "end_layer": e}
                       for i, (s, e) in enumerate(ranges)],
         }

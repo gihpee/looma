@@ -86,6 +86,12 @@ class PeerLayer:
         self._port = port
         self._key_dir = key_dir
         self._sampler: Optional[threading.Thread] = None
+        # Сказали ли уже, что опрос приостановлен: строка нужна один
+        # раз на паузу, а не каждые пятнадцать секунд.
+        self._said_busy = False
+        # Чем спросить «занят ли узел». Ставится позже: задачи
+        # собираются после слоя p2p.
+        self._busy_probe = None
 
     # ------------------------------------------------------------------ setup
     def on_rendezvous(self, addrs: List[str], relays: Optional[List[str]] = None) -> None:
@@ -262,7 +268,21 @@ class PeerLayer:
         def sample() -> None:
             while self.node is not None:
                 try:
-                    self._sample_once()
+                    if self._busy():
+                        # Пока через узел идут туннели — НЕ трогаем рантайм.
+                        # Причина в комментарии к _busy(); коротко: такой вызов
+                        # способен заморозить весь процесс целиком.
+                        if not self._said_busy:
+                            self._said_busy = True
+                            logger.info(
+                                "через узел идут туннели: опрос состояния p2p "
+                                "приостановлен, числа в панели замрут")
+                    else:
+                        if self._said_busy:
+                            self._said_busy = False
+                            logger.info("туннелей больше нет: опрос состояния "
+                                        "p2p возобновлён")
+                        self._sample_once()
                 except Exception:
                     logger.debug("sampling the p2p state failed", exc_info=True)
                 time.sleep(SAMPLE_INTERVAL_S)
@@ -270,6 +290,60 @@ class PeerLayer:
         self._sampler = threading.Thread(target=sample, name="looma-p2p-sampler",
                                          daemon=True)
         self._sampler.start()
+
+    def _busy(self) -> bool:
+        """Идут ли сейчас через узел байтовые туннели.
+
+        Ради этого и заведено. Со стенда, дважды, на РАЗНЫХ машинах и разных
+        ОС (nv3 на Linux и MacBook), py-spy показал одно и то же:
+
+            Thread ... (active+gil): "looma-p2p-sampler"
+                get_visible_maddrs (lattica/client.py:162)
+                visible_addrs -> _sample_once -> sample
+
+        Пометка `+gil` означает, что поток держит GIL. Держит он его внутри
+        вызова в lattica — а значит, пока тот не вернётся, В ПРОЦЕССЕ НЕ
+        ВЫПОЛНЯЕТСЯ НИ ОДНА строчка Python. Ни удар сердца, ни разбор команд,
+        ничего. Снаружи это выглядит как «узел жив, но молчит», и именно это мы
+        ловили четыре раза подряд, каждый раз находя другую невиновную причину.
+
+        Почему вызов не возвращается. Кластер Ray открывает десятки туннелей, и
+        каждый живёт как генератор `tunnel_open`, сидящий в `sock.recv()` на
+        потоке рантайма lattica (в том же дампе их семь штук, безымянных —
+        созданы из Rust). Рантайм занят ими, а `get_visible_maddrs` ждёт от
+        него ответа. На простаивающем узле тот же вызов возвращается за
+        миллисекунды — проверено отдельно, потому и не воспроизводилось.
+
+        Чинить чужую привязку мы не можем. Можем не ходить туда, когда это
+        опасно: пока туннели идут, числа в панели замирают — и это несравнимо
+        дешевле замолчавшего узла.
+        """
+        probe = self._busy_probe
+        if probe is not None:
+            try:
+                if probe():
+                    return True
+            except Exception:
+                return True        # не знаем — значит считаем занятым
+        node = self.node
+        endpoint = getattr(node, "tunnels", None) if node is not None else None
+        return bool(getattr(endpoint, "open_count", 0))
+
+    def set_busy_probe(self, probe) -> None:
+        """Чем спросить, занят ли узел. Ставится, когда задачи уже собраны.
+
+        Первая версия смотрела только на `Endpoint.open_count` — входящие
+        туннели. Этого не хватило, и стенд показал почему: в логе стояло
+        «убрал 93 разрешённых портов и 0 ВХОДЯЩИХ туннелей», при том что
+        строкой выше форвардер закрыл 12 живых ИСХОДЯЩИХ. Опрос решил, что
+        узел свободен, пошёл в рантайм и заморозил процесс — третий дамп подряд
+        с `+gil` на том же вызове.
+
+        Поэтому спрашиваем не про туннели, а про задачи: пока на узле есть хоть
+        одна, рантайм трогать нельзя. Задача — единственное, из-за чего туннели
+        вообще появляются, и считать её надёжнее, чем перечислять их виды.
+        """
+        self._busy_probe = probe
 
     def _sample_once(self) -> None:
         """Один проход опроса: всё, что телеметрия потом только читает.
@@ -316,6 +390,16 @@ class PeerLayer:
         except Exception:
             logger.debug("не удалось навести маршрут к %s", peer_id[:12], exc_info=True)
             return False
+
+    def describe(self, peer_id: str) -> dict:
+        """См. PeerNode.describe. Пусто, если узла нет."""
+        node = self.node
+        if node is None:
+            return {}
+        try:
+            return node.describe(peer_id)
+        except Exception:
+            return {}
 
     def status(self) -> agent_pb2.PeerStatus:
         """What this node reports about its p2p state on every heartbeat.

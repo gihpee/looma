@@ -136,6 +136,14 @@ def prefill(sequences: List[Sequence], runner):
             _free_quietly(manager, request)
         raise
 
+    # Запомнить, кому выданы блоки: отпускать их (`release`) менеджер умеет
+    # только по тому же объекту запроса. Исполнитель vLLM вёл бы этот список
+    # сам, но батч собирает драйвер, у которого исполнителя нет.
+    known = getattr(runner, "requests", None)
+    if isinstance(known, dict):
+        for request in allocated:
+            known[request.request_id] = request
+
     return SchedulerOutput(
         scheduled_new_reqs=made,
         scheduled_cached_reqs=CachedRequestData.make_empty(),

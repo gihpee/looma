@@ -100,8 +100,8 @@ class ControlClient:
                 self._serve()
             except grpc.RpcError as exc:
                 logger.warning("control stream broken: %s; reconnecting", exc)
-            except Exception:
-                logger.exception("unexpected control-channel error; reconnecting")
+            except Exception as exc2:
+                logger.exception("unexpected control-channel error: %s; reconnecting", exc2)
             self._registered.clear()
             if not self._stop.is_set():
                 time.sleep(self.reconnect_delay_s)

@@ -94,3 +94,28 @@ def test_недостижимый_сосед_не_роняет_запуск(monk
 
 def test_без_p2p_прогревать_нечего():
     хранитель(None)._warm_group(группа(rank=0))     # не должно бросить
+
+
+def test_прогрев_называет_путь_и_rtt_к_каждому_соседу(caplog):
+    """На одной паре узлов полоса скакала от 2.7 до 106 Мбит/с «без единого
+    изменения» — менялся путь, реле или напрямую, и видно этого не было
+    нигде. Теперь путь и RTT называются при прогреве, пока рантайм свободен."""
+    import logging
+
+    caplog.set_level(logging.INFO)
+
+    class СоседиСОписанием(Соседи):
+        def describe(self, peer_id):
+            return {"direct_addr": peer_id.endswith("nv3"), "known": 3, "rtt_ms": 75.0}
+
+    peers = СоседиСОписанием(отвечают={"12D3KooWDee4-nv3", "12D3KooWM7Bs-nv2"})
+    группа_ = Group(group_id="g1", rank=0, members={
+        0: Member(rank=0, node_id="me", peer_id="12D3KooWXXXX-me"),
+        1: Member(rank=1, node_id="nv3", peer_id="12D3KooWDee4-nv3"),
+        2: Member(rank=2, node_id="nv2", peer_id="12D3KooWM7Bs-nv2"),
+    })
+    хранитель(peers)._warm_group(группа_)
+
+    assert дождаться(lambda: "наведены" in caplog.text)
+    assert "12D3KooWDee4 — прямой адрес есть, RTT 75 мс" in caplog.text
+    assert "12D3KooWM7Bs — только через реле, RTT 75 мс" in caplog.text

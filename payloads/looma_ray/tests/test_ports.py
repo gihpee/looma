@@ -276,3 +276,17 @@ def test_без_идентификатора_группы_берётся_нач�
 
     monkeypatch.delenv("LOOMA_GROUP_ID", raising=False)
     assert ports.group_base(2) == ports.BASE
+
+
+def test_существенные_порты_включают_клиентский_вход():
+    """Ray о занятом порте клиентского сервера молчит: сервер просто не
+    поднимается, код возврата не меняется. Поэтому его надо проверять ДО
+    старта, а не верить потом TCP-connect'у — со стенда на 0.0.0.0:20007 сидел
+    docker-proxy постороннего контейнера и принимал за прокси Ray."""
+    from looma_ray import ports
+
+    head = ports.ports_for(0, base=20000, stride=100)
+    assert head.client_server in head.essential()
+    assert head.gcs in head.essential()
+    # рабочих портов там нет: их десятки, Ray сам возьмёт свободные
+    assert head.worker_first not in head.essential()

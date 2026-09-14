@@ -244,6 +244,8 @@ class AgentNode:
             "gpus_total": self.gpus_total,
             "gpus_free": self.gpus_free,
             "vram_free_bytes": hardware.vram_free_bytes if hardware else 0,
+            # По картам. Пусто у агента постарше — тогда делят сумму поровну.
+            "vram_free_per_gpu": list(hardware.vram_free_per_gpu) if hardware else [],
             "host_ram_gb": hardware.host_ram_gb if hardware else 0.0,
             "accepts_tasks": self.accepts_tasks,
             "refusal": self.refusal,

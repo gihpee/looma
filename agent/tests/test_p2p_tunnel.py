@@ -531,3 +531,117 @@ def test_отказ_на_закрытом_порту_мгновенный():
 
     assert not ответ["ok"]
     assert ушло < 2.0, f"отказ занял {ушло:.1f}с — Ray столько не ждёт"
+
+
+def test_порция_мегабайт_а_мелкое_не_ждёт_полной(pair):
+    """Полоса записи = порция ÷ RTT: с 64 КБ на WAN выходило 2.7 Мбит/с.
+    Мегабайт даёт до 16 раз больше на крупных передачах. А мелкое сообщение
+    не должно ждать, пока наберётся мегабайт: recv() отдаёт сколько есть."""
+    import time
+
+    from looma_agent.p2p import tunnel
+
+    assert tunnel.CHUNK >= 1024 * 1024
+
+    a, peer_id, echo = pair
+    started = time.time()
+    assert through(a, peer_id, echo.port, b"ping") == b"ping"
+    assert time.time() - started < 5.0, "мелкое сообщение ждало полной порции"
+
+
+def test_крупная_передача_идёт_порциями_по_мегабайту(pair):
+    """4 МБ через туннель — и обратно те же байты, в том же порядке."""
+    a, peer_id, echo = pair
+    payload = bytes(range(256)) * (4 * 1024 * 1024 // 256)
+    assert through(a, peer_id, echo.port, payload, timeout=120) == payload
+
+
+def test_pump_считает_записи_и_говорит_средний_размер(pair):
+    """Единственный способ узнать, во что упирается полоса: в нашу порцию или
+    в окно потока Ray. CHUNK — верхняя граница; сколько байт реально уходит
+    за одну запись, решает тот, кто пишет в сокет. Поэтому pump обязан это
+    считать и называть при закрытии — для передач, где есть что мерить."""
+    import socket
+
+    from looma_agent.p2p import tunnel
+
+    a, peer_id, echo = pair
+    remote = side(a, peer_id, echo.port)
+    remote.open()
+
+    # Местная сторона — пара сокетов: в один пишем как «Ray», второй отдаём
+    # pump'у как локальный конец туннеля.
+    ours, theirs = socket.socketpair()
+    # Чуть больше порога в мегабайт — ровно столько, чтобы строка появилась.
+    # Больше не надо: в полном прогоне оба узла делят один процесс и GIL, и
+    # три мегабайта туда-обратно не укладывались в срок.
+    payload = b"z" * (1024 * 1024 + 4096)
+    closed = threading.Event()
+    итог = {}
+
+    def гнать() -> None:
+        итог["why"] = tunnel.pump(theirs, remote, closed=closed)
+
+    worker = threading.Thread(target=гнать, daemon=True)
+    worker.start()
+    # Эхо вернёт те же байты; их надо вычитывать, иначе буфер сокета
+    # заполнится и pump встанет на sendall — как встал бы Ray, который не
+    # читает ответ. А когда всё вернулось — закрыть туннель явно: у него нет
+    # полузакрытия, и эхо-сервер сам свою сторону не закроет, а pump ждёт
+    # конца ОБОИХ направлений.
+    def сливать_и_закрыть() -> None:
+        получено = 0
+        while получено < len(payload):
+            piece = ours.recv(65536)
+            if not piece:
+                return
+            получено += len(piece)
+        remote.close()
+
+    сливать = threading.Thread(target=сливать_и_закрыть, daemon=True)
+    сливать.start()
+    ours.sendall(payload)
+    ours.shutdown(socket.SHUT_WR)
+    worker.join(120)
+    ours.close()
+
+    assert "why" in итог, "pump не вернулся"
+    assert "наружу 1.0 МБ за" in итог["why"], итог["why"]
+    assert "в среднем" in итог["why"] and "КБ" in итог["why"]
+
+
+def test_мелкий_обмен_не_засоряет_лог_статистикой(pair):
+    """У управляющего обмена Ray записи мелкие по природе — про них строка в
+    логе только шум."""
+    import socket
+
+    from looma_agent.p2p import tunnel
+
+    a, peer_id, echo = pair
+    remote = side(a, peer_id, echo.port)
+    remote.open()
+    ours, theirs = socket.socketpair()
+    closed = threading.Event()
+    итог = {}
+    worker = threading.Thread(
+        target=lambda: итог.setdefault("why", tunnel.pump(theirs, remote, closed=closed)),
+        daemon=True)
+    worker.start()
+
+    def дождаться_эха_и_закрыть() -> None:
+        получено = b""
+        while len(получено) < 4:
+            piece = ours.recv(64)
+            if not piece:
+                return
+            получено += piece
+        remote.close()          # полузакрытия у туннеля нет — закрываем явно
+
+    threading.Thread(target=дождаться_эха_и_закрыть, daemon=True).start()
+    ours.sendall(b"ping")
+    ours.shutdown(socket.SHUT_WR)
+    worker.join(30)
+    ours.close()
+
+    assert "why" in итог
+    assert "в среднем" not in итог["why"]

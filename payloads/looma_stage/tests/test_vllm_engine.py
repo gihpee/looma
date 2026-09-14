@@ -59,69 +59,90 @@ def test_модель_без_слоёв_не_ломает_счёт():
     assert vllm_engine._count_layers(types.SimpleNamespace(model=None)) == 0
 
 
+def _loading(monkeypatch, *, built, cards=2, order=None):
+    """Всё, что подъём стадии зовёт снаружи, — без карты и без vLLM."""
+    order = order if order is not None else []
+    monkeypatch.setattr(vllm_engine, "require_cuda", lambda: None)
+    monkeypatch.setattr(vllm_engine, "card_count", lambda: cards)
+    monkeypatch.setattr(vllm_engine, "plan_for_shard",
+                        lambda *a, **k: vllm_engine.Plan(
+                            utilisation=0.5, max_sequences=8,
+                            bytes_needed=0, why="в тесте"))
+    monkeypatch.setattr(vllm_engine, "_build_config",
+                        lambda *a, **k: _FakeConfig(k))
+    # Конфиг vLLM держится открытым на всю жизнь процесса — тут его нет.
+    monkeypatch.setattr(vllm_engine, "_hold_config",
+                        lambda _c: order.append("конфиг"))
+    monkeypatch.setattr(vllm_engine, "warn_if_shm_tight", lambda _c: None)
+    executor = _FakeExecutor(built=built, cards=cards)
+    monkeypatch.setattr(vllm_engine, "start_executor",
+                        lambda _c: (order.append("воркеры"), executor)[1])
+    monkeypatch.setattr(vllm_engine, "lay_out_cache",
+                        lambda *a, **k: (order.append("кэш"), (None, None))[1])
+    # Иначе тест пойдёт качать модель с HuggingFace.
+    monkeypatch.setattr(vllm_engine, "prepare_weights",
+                        lambda weights, **_k: weights)
+    return executor, order
+
+
 def test_несовпадение_числа_слоёв_отвергается(monkeypatch):
     """Подмена get_pp_indices — единственное, что удерживает vLLM от сборки
     всей модели. Её молчаливый провал даёт стадию, которая считает всё и ест
     всю карту, не сказав ни слова."""
-    monkeypatch.setattr(vllm_engine, "require_cuda", lambda: None)
-    monkeypatch.setattr(vllm_engine, "plan_for_shard",
-                        lambda *a, **k: vllm_engine.Plan(
-                            utilisation=0.5, max_sequences=8,
-                            bytes_needed=0, why="в тесте"))
-    monkeypatch.setattr(vllm_engine, "_start_distributed", lambda: None)
-    monkeypatch.setattr(vllm_engine, "replace_pipeline_group",
-                        lambda *a, **k: None)
-    monkeypatch.setattr(vllm_engine, "_build_config", lambda *a, **k: _FakeConfig())
-    monkeypatch.setattr(vllm_engine, "layer_range", _nothing)
-    monkeypatch.setattr(vllm_engine, "_count_layers", lambda _r: 36)
-    monkeypatch.setattr(vllm_engine, "stage_runner_class",
-                        lambda *_a: _FakeRunner)
-    # Конфиг vLLM держится открытым на всю жизнь процесса — тут его нет.
-    monkeypatch.setattr(vllm_engine, "_hold_config", lambda _c: None)
-    # Иначе тест пойдёт качать модель с HuggingFace.
-    monkeypatch.setattr(vllm_engine, "prepare_weights",
-                        lambda weights, **_k: weights)
-
-    # Именно атрибут модуля, а не запись в sys.modules: `from looma_stage
-    # import vllm_patch` берёт атрибут пакета, и подмена через sys.modules
-    # работала, только пока модуль не был импортирован кем-то ещё.
-    monkeypatch.setattr("looma_stage.vllm_patch.allow_missing_ends",
-                        lambda **_k: None)
-
+    executor, _order = _loading(monkeypatch, built=36)
     with pytest.raises(RunnerRefused, match="просили 18 слоёв"):
         vllm_engine.load_shard("модель", start_layer=0, end_layer=18,
                                num_model_layers=36)
+    # Воркеры — процессы с картами; после отказа их некому остановить,
+    # кроме нас.
+    assert executor.stopped
 
 
-def test_конфиг_ставится_раньше_распределённой_группы(monkeypatch):
+def test_воркеры_разошлись_в_числе_слоёв_отказ(monkeypatch):
+    executor, _order = _loading(monkeypatch, built=[18, 36])
+    with pytest.raises(RunnerRefused, match="разное число слоёв"):
+        vllm_engine.load_shard("модель", start_layer=0, end_layer=18,
+                               num_model_layers=36)
+    assert executor.stopped
+
+
+def test_конфиг_ставится_раньше_воркеров(monkeypatch):
     """Свежий vLLM спрашивает конфиг уже внутри `initialize_model_parallel`.
 
     Поставь его позже — падает на assert'е, в котором про конвейер нет ни
     слова: «Current vLLM config is not set... or a CustomOp was instantiated at
-    module import time». Порядок этих двух шагов и есть весь смысл теста.
+    module import time». Порядок этих шагов и есть весь смысл теста: конфиг,
+    потом воркеры (в них и группа, и загрузка), потом кэш — когда веса уже
+    на местах и видно, сколько осталось.
     """
-    порядок = []
-    monkeypatch.setattr(vllm_engine, "require_cuda", lambda: None)
-    monkeypatch.setattr(vllm_engine, "plan_for_shard",
-                        lambda *a, **k: vllm_engine.Plan(
-                            utilisation=0.5, max_sequences=8,
-                            bytes_needed=0, why="в тесте"))
-    monkeypatch.setattr(vllm_engine, "_build_config", lambda *a, **k: _FakeConfig())
-    monkeypatch.setattr(vllm_engine, "_hold_config",
-                        lambda _c: порядок.append("конфиг"))
-    monkeypatch.setattr(vllm_engine, "_start_distributed",
-                        lambda: порядок.append("группа"))
-    monkeypatch.setattr(vllm_engine, "replace_pipeline_group",
-                        lambda *a, **k: порядок.append("подмена"))
-    monkeypatch.setattr(vllm_engine, "layer_range", _nothing)
-    monkeypatch.setattr(vllm_engine, "_count_layers", lambda _r: 18)
-    monkeypatch.setattr(vllm_engine, "stage_runner_class", lambda *_a: _FakeRunner)
-    monkeypatch.setattr(vllm_engine, "prepare_weights", lambda weights, **_k: weights)
-    monkeypatch.setattr("looma_stage.vllm_patch.allow_missing_ends", lambda **_k: None)
+    executor, order = _loading(monkeypatch, built=18)
+    shard = vllm_engine.load_shard("модель", start_layer=0, end_layer=18,
+                                   num_model_layers=36)
+    assert order == ["конфиг", "воркеры", "кэш"]
+    assert shard.cards == 2 and shard.as_dict()["карт"] == 2
+    assert not executor.stopped
 
-    vllm_engine.load_shard("модель", start_layer=0, end_layer=18,
+
+def test_срез_уезжает_воркерам_в_конфиге(monkeypatch):
+    """Конфиг — единственное, что vLLM передаёт в процесс воркера при его
+    создании; без среза в нём воркер соберёт всю модель."""
+    seen = {}
+    _loading(monkeypatch, built=18, cards=4)
+    monkeypatch.setattr(vllm_engine, "_build_config",
+                        lambda *a, **k: (seen.update(k), _FakeConfig(k))[1])
+    vllm_engine.load_shard("модель", start_layer=18, end_layer=36,
                            num_model_layers=36)
-    assert порядок == ["конфиг", "группа", "подмена"]
+    assert seen["cards"] == 4
+    assert seen["stage"] == {"start_layer": 18, "end_layer": 36,
+                             "num_model_layers": 36}
+
+
+def test_закрытие_среза_останавливает_воркеры(monkeypatch):
+    executor, _order = _loading(monkeypatch, built=18)
+    shard = vllm_engine.load_shard("модель", start_layer=0, end_layer=18,
+                                   num_model_layers=36)
+    shard.close()
+    assert executor.stopped
 
 
 def test_негодный_срез_отвергается_до_загрузки(monkeypatch):
@@ -132,26 +153,28 @@ def test_негодный_срез_отвергается_до_загрузки(
 
 
 class _FakeConfig:
-    device_config = types.SimpleNamespace(device="cuda:0")
+    def __init__(self, options=None):
+        self.options = options or {}
 
 
-def _nothing(*_a, **_k):
-    import contextlib
+class _FakeExecutor:
+    """Исполнитель vLLM: воркеры отвечают на RPC, остановка запоминается."""
 
-    return contextlib.nullcontext()
+    def __init__(self, *, built, cards):
+        self.built = built if isinstance(built, list) else [built] * cards
+        self.stopped = False
+        self.calls = []
 
+    def collective_rpc(self, method, args=(), kwargs=None, **options):
+        self.calls.append((method, args, kwargs or {}, options))
+        if method == "stage_layers_built":
+            return list(self.built)
+        if method == "stage_step":
+            return options.get("reply")
+        return [None] * len(self.built)
 
-class _FakeRunner:
-    """Исполнитель, который «загрузился», но собрал не тот срез."""
-
-    def __init__(self, **_kwargs):
-        self.model = None
-
-    def load_model(self):
-        pass
-
-    def prepare_cache(self, **_kwargs):
-        return None
+    def shutdown(self):
+        self.stopped = True
 
 
 # ---------------------------------------------------------------- уборка
@@ -196,6 +219,9 @@ def test_уборка_не_падает_когда_разбирать_нечег
 # ------------------------------------------------------------------- шаг
 class Intermediate:
     """Стенд-ин для vllm.sequence.IntermediateTensors."""
+
+    def __init__(self, tensors=None):
+        self.tensors = dict(tensors or {})
 
 
 @pytest.fixture
@@ -509,38 +535,94 @@ class _TwoPhaseRunner:
         self.sampled += 1
 
 
-def _shard(runner, *, is_last=True):
-    return vllm_engine.LoadedShard(
-        start_layer=18, end_layer=36, num_layers=36, is_first=False,
-        is_last=is_last, dtype="bfloat16", runner=runner)
-
-
-def test_шаг_закрывается_и_следующий_проходит(monkeypatch, sequence_module):
+def test_шаг_закрывается_и_следующий_проходит(sequence_module):
     """Не закрыть шаг — значит уронить СЛЕДУЮЩИЙ на «State error», уже после
     того, как первый токен уехал клиенту. Одиночной проверкой не ловится."""
     runner = _TwoPhaseRunner()
-    monkeypatch.setattr("looma_stage.vllm_batch.prefill", lambda *a, **k: "батч")
-    monkeypatch.setattr("looma_stage.vllm_batch.decode", lambda *a, **k: "батч")
-    monkeypatch.setattr(runner, "execute_model", lambda *a, **k: None, raising=False)
-
-    from looma_stage.scheduler import Sequence
-
-    vllm_engine.step(_shard(runner), [Sequence("a", [1, 2, 3])],
-                     incoming="тензоры", first_step=True)
+    vllm_engine.collect(runner, None, is_last=True, expected=1)
     assert runner.execute_model_state is None and runner.sampled == 1
 
 
-def test_логиты_забираются_копией(monkeypatch, sequence_module):
+def test_логиты_забираются_копией(sequence_module):
     """Сэмплер vLLM правит их на месте, а выбирать токен мы будем сами."""
-    runner = _TwoPhaseRunner()
-    monkeypatch.setattr("looma_stage.vllm_batch.prefill", lambda *a, **k: "батч")
-    monkeypatch.setattr(runner, "execute_model", lambda *a, **k: None, raising=False)
+    _hidden, logits = vllm_engine.collect(_TwoPhaseRunner(), None, is_last=True,
+                                          expected=1)
+    assert logits.copied
 
+
+def test_средняя_стадия_отдаёт_тензоры_а_не_логиты(sequence_module):
+    runner = _TwoPhaseRunner()
+    answer = Intermediate()
+    hidden, logits = vllm_engine.collect(runner, answer, is_last=False, expected=1)
+    assert hidden is answer and logits is None
+    assert runner.sampled == 0, "у средней стадии закрывать нечего"
+
+
+# ------------------------------------------------------------ драйвер
+class _Tensor:
+    def __init__(self, name, where="cuda:0"):
+        self.name, self.where = name, where
+
+    def cpu(self):
+        return _Tensor(self.name, "cpu")
+
+
+def _driver(reply, cards=2):
+    executor = _FakeExecutor(built=18, cards=cards)
+    executor.collective_rpc = lambda method, args=(), kwargs=None, **o: (
+        executor.calls.append((method, args, kwargs or {}, o)) or reply)
+    return vllm_engine.StageDriver(executor, cards=cards, is_first=False,
+                                   is_last=False), executor
+
+
+def test_драйвер_шлёт_батч_всем_и_читает_нулевой(sequence_module):
+    """Входящие тензоры — каждому воркеру целиком: при tensor parallelism
+    вход слоя один на всех картах. Ответ — только с нулевого: у остальных
+    он тот же."""
+    driver, executor = _driver(reply=({"hidden_states": _Tensor("h", "cpu")}, None))
+    incoming = {"hidden_states": _Tensor("h"), "residual": _Tensor("r")}
+    hidden, logits = driver.run("батч", incoming, expected=3)
+
+    method, args, kwargs, options = executor.calls[-1]
+    assert method == "stage_step" and args[0] == "батч"
+    assert {name: t.where for name, t in args[1].items()} == {
+        "hidden_states": "cpu", "residual": "cpu"}, "на воркеры едет с процессора"
+    assert kwargs == {"expected": 3}
+    assert options["unique_reply_rank"] == 0
+    assert options["timeout"] == vllm_engine.STEP_TIMEOUT_S, "шаг не ждёт вечно"
+    assert isinstance(hidden, Intermediate) and logits is None
+
+
+def test_драйвер_отдаёт_логиты_последней_стадии(sequence_module):
+    driver, _executor = _driver(reply=(None, "логиты"))
+    assert driver.run("батч", None, expected=1) == (None, "логиты")
+
+
+def test_молчание_нулевого_воркера_отказ(sequence_module):
+    driver, _executor = _driver(reply=None)
+    with pytest.raises(RunnerRefused, match="нулевой воркер"):
+        driver.run("батч", None, expected=1)
+
+
+def test_шаг_собирает_батч_в_драйвере_и_шлёт_воркерам(monkeypatch, sequence_module):
+    """Блоки под батч выдаются один раз, здесь; воркеры получают готовый
+    состав в одном и том же порядке."""
     from looma_stage.scheduler import Sequence
 
-    _hidden, logits = vllm_engine.step(_shard(runner), [Sequence("a", [1])],
-                                       incoming="тензоры", first_step=True)
-    assert logits.copied
+    driver, executor = _driver(reply=(None, "логиты"))
+    formed = []
+    monkeypatch.setattr("looma_stage.vllm_batch.prefill",
+                        lambda batch, runner: formed.append(("prefill", runner)) or "батч")
+    monkeypatch.setattr("looma_stage.vllm_batch.decode",
+                        lambda batch, runner: formed.append(("decode", runner)) or "батч")
+    shard = vllm_engine.LoadedShard(
+        start_layer=18, end_layer=36, num_layers=36, is_first=False,
+        is_last=True, dtype="bfloat16", runner=driver)
+
+    assert vllm_engine.step(shard, [Sequence("a", [1, 2])], incoming={},
+                            first_step=True) == (None, "логиты")
+    assert formed == [("prefill", driver)]
+    assert executor.calls[-1][1][0] == "батч"
 
 
 def test_старая_версия_закрывать_нечего():

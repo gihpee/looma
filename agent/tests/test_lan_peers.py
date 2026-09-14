@@ -55,15 +55,36 @@ def test_несколько_интерфейсов_объявляются_все
     assert "/ip4/172.17.0.1/tcp/47100" in addrs
 
 
-def test_широковещательный_поиск_выключен_по_умолчанию(monkeypatch):
-    """Он сыплет в лог по строке ERROR на каждый интерфейс без маршрута, а у
-    машин с докером их десяток. Штатный путь — объявление локальных адресов."""
+def test_широковещательный_поиск_включён_по_умолчанию(monkeypatch):
+    """Объявления локальных адресов оказалось мало: у той же пары узлов через
+    несколько часов их в записи DHT уже не было, и кластер снова перестал
+    собираться. mDNS находит соседа по подсети заново, а не однажды."""
     monkeypatch.delenv("LOOMA_P2P_MDNS", raising=False)
-    assert peer._mdns_enabled() is False
+    assert peer._mdns_enabled() is True
 
 
-def test_широковещательный_поиск_можно_включить(monkeypatch):
-    """Запасной путь на случай, если объявления адресов окажется мало."""
-    for значение in ("1", "true", "yes"):
+def test_широковещательный_поиск_можно_выключить(monkeypatch):
+    """На арендованной машине в общей сети это может быть нежелательно."""
+    for значение in ("0", "false", "no"):
         monkeypatch.setenv("LOOMA_P2P_MDNS", значение)
-        assert peer._mdns_enabled() is True
+        assert peer._mdns_enabled() is False
+
+
+def test_шум_mdns_глушится_а_остальной_лог_остаётся(monkeypatch):
+    """Ради этого mDNS и был выключен: строка ERROR на каждый интерфейс без
+    маршрута, а у машин с докером их десяток. Остальные сообщения lattica
+    нужны — по ним разбирали не одну поломку."""
+    monkeypatch.delenv("RUST_LOG", raising=False)
+    peer._quiet_mdns_noise()
+
+    import os
+    assert "libp2p_mdns=off" in os.environ["RUST_LOG"]
+    assert os.environ["RUST_LOG"].startswith("error")
+
+
+def test_выбор_оператора_не_перебивается(monkeypatch):
+    monkeypatch.setenv("RUST_LOG", "debug")
+    peer._quiet_mdns_noise()
+
+    import os
+    assert os.environ["RUST_LOG"] == "debug"

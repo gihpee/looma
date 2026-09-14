@@ -130,3 +130,90 @@ def test_объяснение_называет_из_чего_сложилось(
     why = plan().why
     for кусок in ("кэша", "веса", "запас", "итого"):
         assert кусок in why
+
+
+# ------------------------------------------------------------ по картам
+def test_веса_делятся_на_все_карты():
+    assert vllm_engine.per_card(8 * ГБ, 4) == 2 * ГБ
+
+
+def test_одна_карта_берёт_всё():
+    assert vllm_engine.per_card(8 * ГБ, 1) == 8 * ГБ
+    assert vllm_engine.per_card(8 * ГБ, 0) == 8 * ГБ
+
+
+def test_кэш_делится_по_головам_а_не_по_картам():
+    """GQA-модель с 8 KV-головами на 16 картах: vLLM головы дублирует, и на
+    карте лежит 1/8 кэша, а не 1/16. Считать 1/16 значило бы обещать кэш,
+    которого на карте нет."""
+    assert vllm_engine.per_card(16 * ГБ, 16, heads=8) == 2 * ГБ
+    assert vllm_engine.per_card(16 * ГБ, 4, heads=8) == 4 * ГБ
+
+
+def test_деление_округляется_вверх():
+    """Недобрать байт на карту — это на большом батче не досчитать блок."""
+    assert vllm_engine.per_card(10, 3) == 4
+
+
+def test_план_на_узле_считается_от_карты(monkeypatch):
+    """Квота узла — на все карты (`карт × меньшая карта`, как считает
+    оркестратор); на карту приходится её доля, а веса и кэш — свои доли."""
+    seen = {}
+    monkeypatch.setattr(vllm_engine, "card_bytes", lambda cards: 24 * ГБ)
+    monkeypatch.setattr(vllm_engine, "weights_size", lambda path: 8 * ГБ)
+    monkeypatch.setattr(vllm_engine, "kv_bytes_per_token",
+                        lambda config, *, layers, dtype: 64 * 1024)
+    monkeypatch.setattr(vllm_engine, "plan_memory",
+                        lambda **kwargs: seen.update(kwargs) or "план")
+    config = types.SimpleNamespace(num_key_value_heads=8)
+    monkeypatch.setitem(__import__("sys").modules, "transformers",
+                        types.SimpleNamespace(AutoConfig=types.SimpleNamespace(
+                            from_pretrained=lambda path: config)))
+
+    assert vllm_engine.plan_for_shard("модель", layers=18, dtype="bfloat16",
+                                      vram_quota_bytes=80 * ГБ, max_sequences=8,
+                                      max_model_len=4096, cards=4) == "план"
+    assert seen["weights_bytes"] == 2 * ГБ
+    assert seen["per_token"] == 16 * 1024
+    assert seen["budget_bytes"] == 20 * ГБ
+    assert seen["total_bytes"] == 24 * ГБ
+
+
+def test_память_карты_это_самая_маленькая(monkeypatch):
+    """Доля vLLM одна на все карты — считать её надо от той, где меньше."""
+    sizes = [48 * ГБ, 24 * ГБ, 48 * ГБ]
+    torch = types.SimpleNamespace(cuda=types.SimpleNamespace(
+        get_device_properties=lambda index: types.SimpleNamespace(
+            total_memory=sizes[index])))
+    monkeypatch.setitem(__import__("sys").modules, "torch", torch)
+    assert vllm_engine.card_bytes(3) == 24 * ГБ
+    assert vllm_engine.card_bytes(1) == 48 * ГБ
+
+
+# -------------------------------------------------------------- /dev/shm
+def test_очередям_нужно_место_на_каждый_воркер(monkeypatch):
+    monkeypatch.delenv("VLLM_MQ_MAX_CHUNK_BYTES_MB", raising=False)
+    one, four = vllm_engine.shm_needed(1), vllm_engine.shm_needed(4)
+    assert four - one == 3 * 10 * 24 * 1024 ** 2
+
+
+def test_тесный_shm_называется_вслух(monkeypatch, caplog):
+    """Кончится он не при создании, а при первой записи за край — воркер
+    умрёт по SIGBUS без единой строки. Пусть строка будет хотя бы здесь."""
+    import logging
+
+    monkeypatch.setattr(vllm_engine, "shm_room", lambda: 64 * 1024 ** 2)
+    with caplog.at_level(logging.WARNING, logger="looma_stage.vllm_engine"):
+        vllm_engine.warn_if_shm_tight(4)
+    assert "--shm-size" in caplog.text and "SIGBUS" in caplog.text
+
+
+def test_просторный_или_отсутствующий_shm_молчит(monkeypatch, caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="looma_stage.vllm_engine"):
+        monkeypatch.setattr(vllm_engine, "shm_room", lambda: 64 * 1024 ** 3)
+        vllm_engine.warn_if_shm_tight(4)
+        monkeypatch.setattr(vllm_engine, "shm_room", lambda: -1)
+        vllm_engine.warn_if_shm_tight(4)
+    assert caplog.text == ""

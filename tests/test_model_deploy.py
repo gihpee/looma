@@ -325,3 +325,90 @@ def test_vllm_без_устройства_идёт_на_карту(stand, monkey
     # Либо развернулось, либо отвергнуто по другой причине (драйвер, память),
     # но НЕ из-за того, что устройство не названо.
     assert ответ.status_code != 400 or "vllm" not in ответ.json()["error"]["message"]
+
+
+# ------------------------------------------ многокарточная машина и vLLM
+def _узел(node_id, per_gpu, cuda="12.8"):
+    return {"node_id": node_id, "accepts_tasks": True, "cuda_version": cuda,
+            "gpus_total": len(per_gpu), "vram_free_bytes": sum(per_gpu),
+            "vram_free_per_gpu": list(per_gpu)}
+
+
+def test_для_torch_доля_узла_это_все_его_карты():
+    """Его загрузчик сам раскладывает срез по всем картам машины по PCIe."""
+    from looma.orchestrator.models import expand_ranks
+
+    ranks = expand_ranks([_узел("nv3", [24, 24, 24, 24])], "torch")
+
+    assert [(r["node_id"], r["vram"]) for r in ranks] == [("nv3", 96)]
+
+
+def test_для_vllm_доля_узла_это_карты_по_меньшей():
+    """Стадия vLLM поднимается на всех картах узла с tensor parallelism: каждый
+    слой режется поровну, и меньшая карта задаёт предел всем. Ранг при этом
+    остаётся узлом: дробить машину на ранги через сокет агента — не делаем,
+    карты одной машины должны говорить по NCCL."""
+    from looma.orchestrator.models import expand_ranks
+
+    ranks = expand_ranks([_узел("nv3", [24, 24, 24, 24])], "vllm")
+
+    assert [(r["node_id"], r["vram"]) for r in ranks] == [("nv3", 96)]
+
+
+def test_для_vllm_разные_карты_считаются_по_меньшей():
+    """24+12 — это не 36: большая карта не отдаст за маленькую."""
+    from looma.orchestrator.models import expand_ranks
+
+    ranks = expand_ranks([_узел("mixed", [24, 12])], "vllm")
+
+    assert ranks[0]["vram"] == 24
+
+
+def test_агент_постарше_без_списка_делит_сумму_поровну():
+    from looma.orchestrator.models import expand_ranks
+
+    ranks = expand_ranks([{"node_id": "old", "gpus_total": 2, "vram_free_bytes": 48,
+                          "vram_free_per_gpu": []}], "vllm")
+
+    assert [r["vram"] for r in ranks] == [48]
+
+
+def test_смешанный_кластер_режется_по_тому_что_стадия_реально_возьмёт():
+    """Машина с двумя картами по 24 и машина с одной на 72 под vLLM весят
+    48 и 72 — конвейер между машинами, TP внутри каждой."""
+    from looma.orchestrator.models import expand_ranks, split_layers
+
+    ranks = expand_ranks([_узел("two", [24, 24]), _узел("one", [72])], "vllm")
+    ranges = split_layers(30, len(ranks), [r["vram"] for r in ranks])
+
+    assert [(r["node_id"], r["vram"]) for r in ranks] == [("two", 48), ("one", 72)]
+    первая = ranges[0][1] - ranges[0][0]
+    вторая = ranges[1][1] - ranges[1][0]
+    # 2:3 с точностью до остатка, который split_layers отдаёт первым стадиям
+    assert 11 <= первая <= 13 and первая + вторая == 30
+
+
+def test_деплой_vllm_на_двухкарточном_узле_один_ранг_на_узел(stand, monkeypatch):
+    from looma.orchestrator.models import ModelInfo
+
+    orchestrator, _agent = stand
+    nodes = orchestrator.hub.node_list()
+    monkeypatch.setattr(orchestrator.hub, "node_list", lambda: [
+        {**nodes[0], "cuda_version": "12.8", "gpus_total": 2,
+         "vram_free_bytes": 48, "vram_free_per_gpu": [24, 24]}])
+    monkeypatch.setattr("looma.api.app.describe",
+                        lambda repo, **kw: ModelInfo(repo=repo, num_layers=36))
+    asked = {}
+    original = orchestrator.hub.submit_group
+
+    def watch(**kwargs):
+        asked.update(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(orchestrator.hub, "submit_group", watch)
+    answer = api(orchestrator).post("/admin/deploy", json=deploy_body(
+        repo="Qwen/Qwen3-4B", engine="vllm", node_ids=[nodes[0]["node_id"]]))
+
+    assert answer.status_code == 200, answer.text
+    assert asked["size"] == 1
+    assert asked["node_ids"] == [nodes[0]["node_id"]]

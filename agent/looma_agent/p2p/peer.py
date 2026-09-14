@@ -98,14 +98,34 @@ def _listen_addrs(port: int) -> List[str]:
     return addrs
 
 
-def _mdns_enabled() -> bool:
-    """Искать ли соседей в своей подсети широковещательно. По умолчанию нет.
+# Что показывать из внутреннего лога lattica. Свой, а не умолчание, ради
+# одной строки в конце: mDNS ругается на каждый интерфейс без маршрута, а у
+# машины с докером их десяток. Всё остальное оставляем как было — по этим
+# сообщениям разбирали не одну поломку. Значение оператора не трогаем.
+RUST_LOG_DEFAULT = "error,libp2p_mdns=off"
 
-    Включается LOOMA_P2P_MDNS=1. Задачу «найти соседа за тем же роутером»
-    штатно решает объявление локальных адресов (_lan_addrs); mDNS — запасной
-    путь, и он шумит в лог на каждом интерфейсе без маршрута.
+
+def _quiet_mdns_noise() -> None:
+    """Заглушить ровно mDNS во внутреннем логе lattica, до её запуска."""
+    os.environ.setdefault("RUST_LOG", RUST_LOG_DEFAULT)
+
+
+def _mdns_enabled() -> bool:
+    """Искать ли соседей в своей подсети широковещательно. По умолчанию да.
+
+    Отключается LOOMA_P2P_MDNS=0.
+
+    Сначала это было выключено — из-за шума в логе. Шум оказался лечим
+    точечно (RUST_LOG_DEFAULT), а необходимость — нет: объявление локальных
+    адресов (_lan_addrs) кладёт их в запись DHT, и мы видели, как та же пара
+    узлов через несколько часов перестала их там показывать. Запись живёт по
+    своим правилам и частные адреса подтвердить нечем.
+
+    mDNS от записи не зависит вовсе: соседи по подсети находят друг друга
+    сами, широковещательно, и находят заново, а не однажды. Для двух машин за
+    одним роутером — единственный механизм, который не выветривается.
     """
-    return os.environ.get("LOOMA_P2P_MDNS", "0").strip() in ("1", "true", "yes")
+    return os.environ.get("LOOMA_P2P_MDNS", "1").strip() not in ("0", "false", "no")
 
 
 def _lan_addrs(port: int) -> List[str]:
@@ -519,6 +539,7 @@ class PeerNode:
         ) from last
 
     def _build_on(self, port: int):
+        _quiet_mdns_noise()          # до первого касания lattica, не после
         from lattica import Lattica
 
         key_dir = self._usable_key_dir()
@@ -548,20 +569,14 @@ class PeerNode:
             # пробивания. Слушаем мы уже на 0.0.0.0, то есть порт на локальном
             # адресе открыт — не хватало только узнать этот адрес.
             #
-            # По умолчанию ВЫКЛЮЧЕН, и это измерено, а не осторожность. На
-            # нашем же прогоне тестов libp2p начал сыпать в лог по строке
-            # ERROR на каждый интерфейс без маршрута:
+            # Включён: это единственный способ найти соседа за тем же
+            # роутером, который не выветривается. Объявление локальных адресов
+            # ниже кладёт их в запись DHT, но та живёт своей жизнью — у той же
+            # пары узлов через несколько часов локальных адресов в ней уже не
+            # было, и кластер снова перестал собираться.
             #
-            #   libp2p_mdns::behaviour::iface: error sending packet on iface
-            #   address No route to host (os error 65) address=10.124.11.4
-            #
-            # У nv2 и nv3 по десятку докеровских мостов, то есть это десяток
-            # строк на каждый цикл опроса, навсегда. Лог агента — то, по чему
-            # разбирают поломки, и хоронить его нельзя.
-            #
-            # Ту же задачу решает объявление локальных адресов ниже, и решает
-            # тише. mDNS остаётся включаемым (LOOMA_P2P_MDNS=1) на случай, если
-            # объявления окажется мало.
+            # Шум, из-за которого он сперва был выключен (строка ERROR на
+            # каждый интерфейс без маршрута), снят точечно через RUST_LOG.
             .with_mdns(_mdns_enabled())
             # Ask the router to forward our port. Free when it works (a lot of
             # home routers support it), silent when it does not, and every node
@@ -753,6 +768,32 @@ class PeerNode:
         except Exception as exc:
             logger.debug("warming a route to %s failed: %s", peer_id, exc)
             return False
+
+    def describe(self, peer_id: str) -> dict:
+        """Каким путём мы, скорее всего, пойдём к соседу: RTT и есть ли у нас
+        его прямой адрес. Только для лога — вызов уходит в рантайм lattica и
+        зваться должен, пока рантайм не занят туннелями.
+
+        Зачем. На одной и той же паре узлов полоса скакала от 2.7 до 106
+        Мбит/с «без единого изменения». Изменялся путь: то через реле
+        (RTT ~190 мс), то напрямую (~75 мс), а видно этого не было нигде.
+        """
+        if self._lattica is None:
+            return {}
+        out: dict = {}
+        try:
+            info = self._lattica.get_peer_info(peer_id)
+            addrs = list(getattr(info, "addresses", None) or [])
+            out["direct_addr"] = any("/p2p-circuit" not in a for a in addrs)
+            out["known"] = len(addrs)
+        except Exception:
+            pass
+        try:
+            rtt = self._lattica.get_peer_rtt(peer_id)
+            out["rtt_ms"] = float(rtt) * 1000 if rtt and rtt < 100 else float(rtt or 0)
+        except Exception:
+            pass
+        return out
 
     def send(self, peer_id: str, message: dict, timeout_s: float = 0.0) -> dict:
         """One inter-stage message, straight to the peer that must handle it.

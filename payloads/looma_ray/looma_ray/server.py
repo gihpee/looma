@@ -189,7 +189,25 @@ def run_script(path: str, address: str) -> int:
     return subprocess.run([sys.executable, path], env=env).returncode
 
 
+def _grpc_fork_safe() -> None:
+    """Безопасный fork для gRPC во всём дереве Ray. До `ray start`.
+
+    Прокси клиентского сервера Ray форкает под каждого клиента отдельный
+    процесс, а сам при этом — работающий gRPC-сервер. С движком epoll1 (это
+    умолчание на Linux) ребёнок падает на внутренней проверке gRPC:
+    «Check failed: next_worker->state == KICKED». Со стенда: первое
+    подключение к кластеру отказывало с пустым логом, повтор проходил.
+
+    Свежий агент передаёт это в окружение задачи сам; здесь — на случай
+    агента постарше. setdefault, чтобы не спорить ни с агентом, ни с
+    оператором.
+    """
+    os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
+    os.environ.setdefault("GRPC_POLL_STRATEGY", "poll")
+
+
 def main(argv=None) -> int:
+    _grpc_fork_safe()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--size", type=int,
                         default=int(os.environ.get("LOOMA_GROUP_SIZE", "1")))

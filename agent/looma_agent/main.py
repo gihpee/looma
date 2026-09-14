@@ -34,6 +34,7 @@ from looma_agent.hwinfo import (
     detect_hardware,
     disk_bytes,
     free_vram_bytes,
+    free_vram_per_gpu,
 )
 from looma_agent.identity import BadJoinKey, default_node_id, parse_join_key
 from looma_agent import status
@@ -53,14 +54,14 @@ logger = logging.getLogger("looma_agent")
 
 
 def _setup_logging() -> None:
-    формат = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    ft = "%(asctime)s %(levelname)s %(name)s: %(message)s"
     logging.basicConfig(
         level=os.environ.get("LOOMA_LOG_LEVEL", "INFO").upper(),
-        format=формат,
+        format=ft,
     )
     # Рядом с выводом, а не вместо: `docker logs` на самой машине должен
     # работать как раньше, а оператору нужен тот же текст издалека.
-    recent.install(logging.Formatter(формат))
+    recent.install(logging.Formatter(ft))
 
 
 def hardware_message() -> agent_pb2.Hardware:
@@ -89,7 +90,57 @@ def hardware_message() -> agent_pb2.Hardware:
         host_ram_gb=hw.host_ram_gb,
         detection_source=hw.detection_source,
         cuda_version=f"{driver[0]}.{driver[1]}" if driver else "",
+        # По картам — для доли узла под vLLM (`карт × меньшая карта`). Сумма
+        # выше для этого непригодна: одинакова у одной карты на 96 ГБ и
+        # четырёх по 24.
+        vram_free_per_gpu=free_vram_per_gpu(),
     )
+
+
+# Сторож: как часто смотрит, через сколько молчания бьёт тревогу и как редко
+# повторяет снимок. Порог заметно больше удара сердца — оркестратор списывает
+# узел не сразу, и печатать стек из-за одной пропущенной отправки незачем.
+WATCHDOG_INTERVAL_S = float(os.environ.get("LOOMA_WATCHDOG_INTERVAL_S", "15"))
+STALL_AFTER_S = float(os.environ.get("LOOMA_STALL_AFTER_S", "60"))
+DUMP_EVERY_S = float(os.environ.get("LOOMA_STALL_DUMP_EVERY_S", "300"))
+
+
+def arm_stack_signal() -> str:
+    """Дать возможность спросить стек сигналом. Возвращает подсказку для лога.
+
+    Ставить py-spy на чужую машину — не то, о чём стоит просить владельца узла,
+    и на nv3 это как раз не сработало: sudo не видит conda-окружения. Сигнал
+    ничего не требует и есть везде.
+
+    SIGUSR1 выбран потому, что его никто не занимает: SIGTERM и SIGINT — наша
+    остановка, SIGQUIT на некоторых системах роняет процесс дампом ядра.
+    """
+    try:
+        import faulthandler
+        import signal
+
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+    except Exception:      # Windows, урезанный рантайм — не повод падать
+        return ""
+    return "стек всех потоков по запросу: kill -USR1 %d" % os.getpid()
+
+
+def _thread_dump() -> list:
+    """Стек каждого живого потока, строками. Ничего не блокирует.
+
+    Именно то, что мы четырежды снимали снаружи через py-spy — только теперь
+    его снимает сам агент, в тот момент, когда это происходит.
+    """
+    import sys
+    import traceback
+
+    names = {t.ident: t.name for t in threading.enumerate()}
+    rows = []
+    for ident, frame in sys._current_frames().items():
+        rows.append(f"  поток {names.get(ident, '?')} ({ident}):")
+        for shot in traceback.extract_stack(frame)[-12:]:
+            rows.append(f"    {shot.filename}:{shot.lineno} в {shot.name}")
+    return rows
 
 
 class Agent:
@@ -115,6 +166,10 @@ class Agent:
         self._last_report = None
         self._stuck_since = 0.0
         self._said_stuck_at = 0.0
+        # Когда узел в последний раз ДЕЙСТВИТЕЛЬНО отправил доклад наверх.
+        # Не «когда собрал» и не «когда проснулся цикл» — именно отправил.
+        self._sent_at = time.monotonic()
+        self._dumped_at = 0.0
         self.isolation = resolve_isolation()
         self.tasks = TaskRegistry(
             root=config.tasks_dir,
@@ -141,6 +196,11 @@ class Agent:
             # а байтовый туннель открывается на самом узле.
             peers=self.peers,
         )
+        # Пока на узле есть задача, опрос состояния p2p не должен трогать
+        # рантайм lattica: такой вызов держит GIL и замораживает весь процесс
+        # (p2p/layer.py, _busy). Задача — единственное, из-за чего появляются
+        # туннели, поэтому считаем её, а не их.
+        self.peers.set_busy_probe(self._has_tasks)
         self.updater = Updater(
             current_version=__version__,
             drain=self.tasks.drain,
@@ -248,10 +308,10 @@ class Agent:
         refusal = self.tasks.recount_devices(fresh.num_gpus)
         if refusal:
             return False, refusal
-        было = f"{self.hardware.device} x{self.hardware.num_gpus}"
+        was = f"{self.hardware.device} x{self.hardware.num_gpus}"
         self.hardware = fresh
         logger.info("железо перечитано по команде: было %s, стало %s x%d (%s)",
-                    было, fresh.device, fresh.num_gpus, fresh.detection_source)
+                    was, fresh.device, fresh.num_gpus, fresh.detection_source)
         # Сразу, а не со следующим ударом сердца: оператор нажал кнопку и
         # смотрит на экран именно теперь.
         if self.client.registered:
@@ -312,6 +372,7 @@ class Agent:
                 report = self._telemetry_or_none()
                 if report is not None:
                     self.client.send(report)
+                    self._sent_at = time.monotonic()
 
     def _telemetry_or_none(self):
         """Собрать доклад, но не ждать его дольше удара сердца.
@@ -330,25 +391,25 @@ class Agent:
             # Прошлый сбор ещё не вернулся. Заводить второй значит копить
             # потоки на том же самом месте, где застрял первый.
             return self._stale_report()
-        готово = []
+        reday = []
         self._collecting.set()
 
-        def собрать() -> None:
+        def build() -> None:
             try:
-                готово.append(self._telemetry())
+                reday.append(self._telemetry())
             except Exception:
                 logger.debug("доклад не собрался", exc_info=True)
             finally:
                 self._collecting.clear()
 
-        worker = threading.Thread(target=собрать, name="telemetry", daemon=True)
+        worker = threading.Thread(target=build, name="telemetry", daemon=True)
         worker.start()
         worker.join(self.config.heartbeat_interval_s)
-        if not готово:
+        if not reday:
             return self._stale_report()
-        self._last_report = готово[0]
+        self._last_report = reday[0]
         self._stuck_since = self._said_stuck_at = 0.0
-        return готово[0]
+        return reday[0]
 
     def _stale_report(self):
         """Прошлый доклад вместо молчания.
@@ -368,18 +429,23 @@ class Agent:
         видно, насколько содержимое отстало.
         """
         if self._last_report is None:
-            return None        # ещё ни одного удачного сбора — сказать нечего
-        сейчас = time.monotonic()
+            # Голый доклад вместо молчания. Даже он несёт главное: узел жив.
+            # Раньше здесь возвращался None, и узел, у которого ПЕРВЫЙ же сбор
+            # не вернулся, не отчитывался никогда — при живом цикле.
+            return agent_pb2.AgentMessage(telemetry=agent_pb2.Telemetry(
+                node_id=self.node_id,
+                reported_at_unix_ms=int(time.time() * 1000)))
+        now = time.monotonic()
         if not self._stuck_since:
-            self._stuck_since = сейчас
-        застряли = сейчас - self._stuck_since
+            self._stuck_since = now
+        locked = now - self._stuck_since
         # Раз в минуту, а не каждые пять секунд: это состояние может длиться
         # часами, и лог не должен быть его единственным следствием.
-        if сейчас - self._said_stuck_at >= 60:
-            self._said_stuck_at = сейчас
+        if now - self._said_stuck_at >= 60:
+            self._said_stuck_at = now
             logger.warning(
                 "сбор доклада не возвращается уже %.0f с; шлю прошлый, "
-                "чтобы узел не считался пропавшим", застряли)
+                "чтобы узел не считался пропавшим", locked)
         return self._last_report
 
     def _save_status(self) -> None:
@@ -407,6 +473,47 @@ class Agent:
             "updated_at": time.time(),
         })
 
+    def _watchdog_loop(self) -> None:
+        """Поток, который умеет только одно: заметить, что узел замолчал, и
+        рассказать ГДЕ он стоит.
+
+        Четыре раза подряд узел зависал так: процесс жив, контейнер up, ядро и
+        драйвер ни при чём, наверх не идёт ничего. Каждый раз причину искали
+        снаружи, py-spy по живому процессу, и каждый раз она оказывалась
+        другой: то снятие задачи прямо в приёмном потоке gRPC, то два ожидающих
+        на один `waitpid`, то заклинивший драйвер. Общего у них только
+        следствие, и снаружи они неотличимы.
+
+        Поэтому здесь не лечение, а прибор: если доклад не уходил дольше
+        STALL_AFTER_S, в лог печатается стек КАЖДОГО потока. Дальше причина
+        читается сразу и не требует, чтобы человек оказался у машины в нужную
+        минуту.
+
+        Сам поток не берёт ни одного замка агента и не заходит в чужие
+        рантаймы: `sys._current_frames` — это снимок интерпретатора, и больше
+        ему ничего не нужно. Если не выведется даже он — значит стоит весь
+        интерпретатор, и это тоже ответ.
+        """
+        while not self._stop.wait(WATCHDOG_INTERVAL_S):
+            silent = time.monotonic() - self._sent_at
+            if silent < STALL_AFTER_S:
+                continue
+            if time.monotonic() - self._dumped_at < DUMP_EVERY_S:
+                continue
+            self._dumped_at = time.monotonic()
+            logger.error("наверх не уходило %.0f с — снимаю стек всех потоков",
+                         silent)
+            for row in _thread_dump():
+                logger.error("%s", row)
+
+    def _has_tasks(self) -> bool:
+        """Есть ли на узле хоть одна задача — идущая или взятая."""
+        try:
+            snapshot = self.tasks.snapshot()
+        except Exception:
+            return True            # не знаем — значит считаем занятым
+        return bool(snapshot.get("running") or snapshot.get("tasks"))
+
     def _vram_loop(self) -> None:
         """Пересчитывать свободную VRAM своим потоком: снимок при старте
         устареет за минуту, а спрашивать драйвер из удара сердца нельзя.
@@ -432,6 +539,10 @@ class Agent:
             # из-за одного неудачного опроса.
             if free:
                 self.hardware.vram_free_bytes = free
+                per_gpu = free_vram_per_gpu()
+                if per_gpu:
+                    del self.hardware.vram_free_per_gpu[:]
+                    self.hardware.vram_free_per_gpu.extend(per_gpu)
                 self._vram_at = time.monotonic()
         except Exception:
             logger.debug("VRAM не измерилась", exc_info=True)
@@ -469,10 +580,17 @@ class Agent:
 
     def run(self) -> int:
         logger.info("agent %s: node %s -> %s", __version__, self.node_id, self.key.address)
+        # До подключения: всё, что осталось от задач прошлой жизни, — ничьё,
+        # и первая же новая задача упрётся в его порты.
+        self.tasks.sweep_leftovers()
+        hint = arm_stack_signal()
+        if hint:
+            logger.info("%s", hint)
         self._report_readiness()
         self.commands.start()
         threading.Thread(target=self._heartbeat_loop, name="heartbeat", daemon=True).start()
         threading.Thread(target=self._vram_loop, name="vram-sampler", daemon=True).start()
+        threading.Thread(target=self._watchdog_loop, name="watchdog", daemon=True).start()
         self.client.run_forever()
         # Ненулевой код здесь означает «остановился ради обновления», а не
         # поломку: пусковой слой не должен считать это падением.

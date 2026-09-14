@@ -86,6 +86,9 @@ class Task:
         self._watchdog: Optional[MemoryWatchdog] = None
         self._drained: Optional[threading.Thread] = None
         self._done = threading.Event()
+        # Каталог убран и задача забыта. Реестр ждёт его вместо сна: явное
+        # освобождение будит поток удержания сразу.
+        self.released = threading.Event()
 
     # ------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -214,6 +217,12 @@ class Task:
             # на os.cpu_count(), считает машину своей целиком — а на узле она
             # делится, и два таких соседа выедают её вдвоём.
             "LOOMA_TASK_CPUS": str(self.spec.resources.cpus),
+            # Безопасный fork для gRPC внутри задачи. Ray — это дерево
+            # процессов с gRPC в каждом, и прокси клиентского сервера форкает
+            # под каждого клиента отдельный процесс. Без этого ребёнок падал
+            # на внутренней проверке gRPC (см. looma_agent/__init__.py).
+            "GRPC_ENABLE_FORK_SUPPORT": "1",
+            "GRPC_POLL_STRATEGY": "poll",
         }
         env.update(self._model_cache_env())
         if self.spec.serve_port:
@@ -263,9 +272,20 @@ class Task:
         # The whole group, not the process: a task that started children would
         # otherwise leave them running on the owner's machine after it "ended".
         _signal_group(group, signal.SIGTERM)
-        try:
-            proc.wait(timeout=GRACE_S)
-        except subprocess.TimeoutExpired:
+        # Ждём СВОЁ событие, а не proc.wait(). Разница не косметическая.
+        #
+        # За процессом уже сидит `_watch`, и сидит он в `proc.wait()` БЕЗ
+        # срока — то есть внутри блокирующего waitpid, держа `_waitpid_lock`
+        # самого Popen. Второй ожидающий с тайм-аутом на этот замок и налетал:
+        # с дампа живого агента (py-spy) главный поток стоял ровно здесь, в
+        # subprocess._wait, а `_watch` — в waitpid. Пока это тянется, агент не
+        # разбирает НИ ОДНОЙ команды: снятие выполняется прямо в приёмном
+        # потоке gRPC.
+        #
+        # `_done` ставит `_finish`, то есть тот же `_watch`, когда процесс
+        # действительно кончился. Ждать его и дешевле, и честнее: один ожидающий
+        # на процесс, срок соблюдается всегда.
+        if not self.wait(timeout=GRACE_S):
             logger.warning("task %s ignored SIGTERM; killing it", self.spec.task_id)
             _signal_group(group, signal.SIGKILL)
 
@@ -310,33 +330,60 @@ class Task:
         self._finish(proc.poll())
 
     def _reap_group(self) -> None:
-        """Снести всё, что задача оставила после себя.
+        """Снести всё, что задача оставила после себя — по группе И по метке.
 
         `_kill` срабатывает только при снятии, а процесс может выйти и сам —
         оставив потомков, которых от себя отвязал. Ray именно так и делает:
         `ray start` разворачивает raylet и воркеров и завершается, а те живут
-        дальше.
+        дальше. И живут они в ДРУГОЙ группе процессов — `os.setpgrp()` в
+        `start_reaper` стоит у Ray намеренно.
 
         На чужой машине это сотни процессов, которых никто не ждёт. Следующая
-        задача упирается в них лимитом потоков ещё до собственного старта, и
-        выглядит это как её поломка:
+        задача упирается в них лимитом потоков или занятым портом ещё до
+        собственного старта, и выглядит это как её поломка:
 
             RuntimeError: can't start new thread
+            [Errno 98] Address already in use
 
-        Группа своя: задача делает setsid, так что агент сюда попасть не может.
+        Поэтому группа — только первый круг. Второй — все процессы с
+        LOOMA_TASK_ID этой задачи в окружении, где бы они ни были.
         """
-        if self._group is None:
-            return
-        _signal_group(self._group, signal.SIGTERM)
+        task_id = self.spec.task_id
+        if self._group is not None:
+            _signal_group(self._group, signal.SIGTERM)
+        # Не только группа. Ray делает `os.setpgrp()` НАМЕРЕННО — «чтобы
+        # жнец мог убирать процессы Ray, не трогая группу того, кто нас
+        # запустил», — и уводит raylet, GCS и воркеров в свою группу. killpg
+        # по группе задачи до них не дотягивается никогда. Со стенда: после
+        # «killing its group» воркер мёртвого кластера держал порт 30711, и
+        # следующий кластер стартовал с «Address already in use».
+        #
+        # Единственное, что потомок не может с себя снять, уходя в другую
+        # группу, — окружение. LOOMA_TASK_ID получает каждый процесс задачи
+        # при запуске и передаёт всем своим. По нему и ищем.
+        strays = _processes_of(task_id)
+        for pid in strays:
+            _signal(pid, signal.SIGTERM)
         # Короткая пауза на добровольный выход, потом наверняка. Ждать долго
         # незачем: задача уже кончилась, и это уборка, а не остановка.
         for _ in range(20):
-            if not _group_alive(self._group):
+            if not _group_alive(self._group) and not _processes_of(task_id):
                 return
             time.sleep(0.1)
-        logger.info("task %s left processes behind; killing its group",
-                    self.spec.task_id)
-        _signal_group(self._group, signal.SIGKILL)
+        left = _processes_of(task_id)
+        logger.info("task %s left %d process(es) behind, %d outside its group; "
+                    "killing them", task_id, len(left),
+                    len([pid for pid in left if not _in_group(pid, self._group)]))
+        if self._group is not None:
+            _signal_group(self._group, signal.SIGKILL)
+        for pid in left:
+            _signal(pid, signal.SIGKILL)
+        # SIGKILL не отменяется, но занять порт заново может успеть кто-то,
+        # кого мы ещё не видели: воркер, форкнутый за миг до этого. Один
+        # повторный проход закрывает и это.
+        time.sleep(0.2)
+        for pid in _processes_of(task_id):
+            _signal(pid, signal.SIGKILL)
 
     def _finish(self, code: Optional[int]) -> None:
         if self._watchdog is not None:
@@ -422,9 +469,92 @@ def _report_limits(task_id: str) -> None:
         shown(files), os.cpu_count())
 
 
-def _group_alive(group: int) -> bool:
+def _processes_of(task_id: str) -> list:
+    """PID всех живых процессов с LOOMA_TASK_ID=task_id в окружении.
+
+    Кроме нас самих и наших предков: метку они не несут, но проверка стоит
+    дёшево, а ошибка здесь стоила бы узла.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return []
+    me = os.getpid()
+    ancestors = set()
+    try:
+        parent = psutil.Process(me).parent()
+        while parent is not None:
+            ancestors.add(parent.pid)
+            parent = parent.parent()
+    except Exception:
+        pass
+    found = []
+    for proc in psutil.process_iter(attrs=["pid"]):
+        pid = proc.info["pid"]
+        if pid == me or pid in ancestors:
+            continue
+        try:
+            if proc.environ().get("LOOMA_TASK_ID") == task_id:
+                found.append(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+        except Exception:
+            continue
+    return found
+
+
+def _processes_of_any() -> list:
+    """PID всех живых процессов с ЛЮБОЙ меткой задачи. Для уборки при старте:
+    после перезапуска агента ни одна из них не наша."""
+    try:
+        import psutil
+    except ImportError:
+        return []
+    me = os.getpid()
+    ancestors = set()
+    try:
+        parent = psutil.Process(me).parent()
+        while parent is not None:
+            ancestors.add(parent.pid)
+            parent = parent.parent()
+    except Exception:
+        pass
+    found = []
+    for proc in psutil.process_iter(attrs=["pid"]):
+        pid = proc.info["pid"]
+        if pid == me or pid in ancestors:
+            continue
+        try:
+            if proc.environ().get("LOOMA_TASK_ID"):
+                found.append(pid)
+        except Exception:
+            continue
+    return found
+
+
+def _in_group(pid: int, group: Optional[int]) -> bool:
+    if group is None:
+        return False
+    try:
+        return os.getpgid(pid) == group
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _signal(pid: int, sig: int) -> None:
+    if pid == os.getpid():
+        return
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _group_alive(group: Optional[int]) -> bool:
     """Остался ли в группе хоть кто-то. Сигнал 0 ничего не шлёт, только
     проверяет, что адресат существует."""
+    if group is None:
+        return False
     try:
         os.killpg(group, 0)
         return True
@@ -433,6 +563,25 @@ def _group_alive(group: int) -> bool:
 
 
 def _signal_group(group: int, sig: int) -> None:
+    """Снять группу процессов задачи. Свою — никогда.
+
+    Проверка, а не рассуждение. Задача делает setsid и живёт в своей группе,
+    поэтому агент сюда попасть «не может» — но держалось это на том, что
+    preexec отработал. Не отработай он однажды (а он выполняется после fork в
+    многопоточном процессе, где ломается многое), `_group_of` вернул бы группу
+    АГЕНТА, и первое же снятие задачи убило бы узел вместе со всеми остальными
+    его задачами. Цена проверки — один системный вызов на снятие.
+    """
+    try:
+        свои = os.getpgid(0)
+    except OSError:
+        свои = None
+    if свои is not None and group == свои:
+        logger.error(
+            "отказываюсь снимать группу %d: это группа самого агента. Задача "
+            "не отделилась в свою (setsid не сработал), и снятие убило бы узел",
+            group)
+        return
     try:
         os.killpg(group, sig)
     except (ProcessLookupError, PermissionError):

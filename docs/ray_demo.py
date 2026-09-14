@@ -175,15 +175,30 @@ def gpu_matmul(size, repeats):
 
 
 @ray.remote(num_gpus=1)
-def stage(payload, layers):
-    """Кусок конвейера: прогнать вектор через несколько слоёв на своей карте."""
-    import torch
-    x = torch.as_tensor(payload, device="cuda", dtype=torch.float16)
-    width = x.shape[-1]
-    weight = torch.randn(width, width, device="cuda", dtype=torch.float16) / width
-    for _ in range(layers):
-        x = torch.tanh(x @ weight)
-    return x.cpu().numpy()
+class Stage:
+    """Кусок конвейера: несколько слоёв, живущих на своей карте постоянно.
+
+    Актор, а не функция, и это не стиль. Функция получает свежий воркер, и
+    каждый вызов платит за `import torch` и инициализацию CUDA — секунд семь.
+    В первой версии демо конвейер на 48 слоёв «занимал 15 секунд», и это
+    были два таких старта, а не слои: матмул 8x4096x4096 на A30 — микросекунды.
+    Так Looma и гоняет модели на самом деле: стадия — постоянный процесс, веса
+    загружены один раз, между вызовами по сети едет только вектор.
+    """
+
+    def __init__(self, width, layers):
+        import torch
+        self.torch = torch
+        self.layers = layers
+        self.weight = torch.randn(width, width, device="cuda",
+                                  dtype=torch.float16) / width
+        torch.cuda.synchronize()
+
+    def forward(self, payload):
+        x = self.torch.as_tensor(payload, device="cuda", dtype=self.torch.float16)
+        for _ in range(self.layers):
+            x = self.torch.tanh(x @ self.weight)
+        return x.cpu().numpy()
 
 
 # ------------------------------------------------------------- сценарии
@@ -207,8 +222,8 @@ def inventory(report):
     cards = sorted(k.split(":", 1)[1] for k in total if k.startswith("accelerator_type:"))
     if cards:
         print(f"\n  карты: {', '.join(cards)}")
-    print("\n  Ни у одной из этих машин нет публичного адреса и проброшенных портов.")
-    print("  Друг для друга они выглядят как соседние узлы в одной подсети.")
+    print("\n  Этот код не знает ни одного настоящего адреса этих машин и ни разу")
+    print("  не спросил, где они стоят и как между ними идёт связь.")
 
     report["total"] = dict(total)
     report["nodes"] = [
@@ -368,9 +383,22 @@ def bandwidth(nodes, report):
         print(f"    {mb:>3} МБ  за {spent:>7.3f} с   {mbits:>9.1f} Мбит/с")
         del ref
 
-    if points[0]["mbits"] * 2 < best:
-        print("\n  Мелкие блоки идут медленнее крупных: на них уходит фиксированная")
-        print("  плата за раскачку соединения. Полосой считаем лучшее число.")
+    # Полное время делить на объём нельзя: в каждой передаче сидит плата, не
+    # зависящая от размера (у Ray на запрос объекта через свежее соединение
+    # свой таймер повтора — порядка секунд). Со стенда: 1 МБ шёл 8.5 с при
+    # полосе, на которой он должен идти полсекунды. Поэтому — прямая по
+    # точкам: наклон и есть полоса, пересечение — плата.
+    n = len(points)
+    xs = [p["mb"] for p in points]
+    ys = [p["seconds"] for p in points]
+    mx, my = sum(xs) / n, sum(ys) / n
+    slope = (sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+             / max(sum((x - mx) ** 2 for x in xs), 1e-9))
+    setup = my - slope * mx
+    if slope > 0:
+        best = 8 / slope                       # МБ/с -> Мбит/с
+    print(f"\n  Прямая по трём точкам: плата за передачу {max(setup, 0):.1f} с,")
+    print(f"  дальше {best:.0f} Мбит/с на объём. Мелкие блоки почти целиком — плата.")
 
     # Сколько весит одна пересылка для каждой стратегии — считаем, а не помним.
     HIDDEN, DTYPE = 4096, 2                    # ширина скрытого состояния, fp16
@@ -396,7 +424,8 @@ def bandwidth(nodes, report):
     print("  двигать мегабайты и гигабайты там, где конвейеру хватает килобайт.")
 
     report["bandwidth"] = {"points": points, "best_mbits": best, "verdicts": verdicts,
-                           "token_bytes": token_bytes, "tokens_per_second": tokens}
+                           "setup_s": max(setup, 0), "token_bytes": token_bytes,
+                           "tokens_per_second": tokens}
     return best
 
 
@@ -465,24 +494,32 @@ def pipeline(ready, report):
     payload = np.random.randn(batch, width).astype("float16")
     hop_kb = payload.nbytes / 1024
 
+    # Поднять стадии один раз — это и есть «загрузить модель». Платится
+    # однажды и меряется отдельно от проходов.
+    started = time.perf_counter()
+    first = Stage.options(scheduling_strategy=on(ready[0]["NodeID"])).remote(width, layers)
+    second = Stage.options(scheduling_strategy=on(ready[1]["NodeID"])).remote(width, layers)
+    ray.get([first.forward.remote(payload), second.forward.remote(payload)])   # прогрев
+    warmup = time.perf_counter() - started
+
     times = []
-    for _ in range(3):
+    for _ in range(5):
         started = time.perf_counter()
-        mid = stage.options(scheduling_strategy=on(ready[0]["NodeID"])).remote(payload, layers)
-        out = stage.options(scheduling_strategy=on(ready[1]["NodeID"])).remote(mid, layers)
-        result = ray.get(out)
+        result = ray.get(second.forward.remote(first.forward.remote(payload)))
         times.append(time.perf_counter() - started)
-        del mid, out
 
     print(f"    {2 * layers} слоёв на двух картах, {batch} строк по {width}")
+    print(f"    подъём стадий (веса на карты, CUDA): {warmup:.1f} с — один раз")
     print(f"    через сеть за проход: {hop_kb:.0f} КБ")
     print(f"    проходы: {', '.join(f'{t:.2f} с' for t in times)}   лучший {min(times):.2f} с")
+    print(f"    из них счёт на картах — микросекунды; остальное — дорога вектора")
     print(f"    форма результата: {result.shape}, конечных значений "
           f"{int(np.isfinite(result).all())}")
     print("\n  Вектор между слоями — килобайты. Именно поэтому такая нарезка")
     print("  живёт на домашних каналах, а тензорный параллелизм — нет.")
 
-    report["pipeline"] = {"times": times, "hop_kb": hop_kb, "layers": 2 * layers}
+    report["pipeline"] = {"times": times, "hop_kb": hop_kb, "layers": 2 * layers,
+                          "warmup_s": warmup}
 
 
 def resilience(nodes, report):
@@ -623,7 +660,8 @@ def plot_bandwidth(ax, report):
             fontsize=8.5, color=PALETTE["warm"])
     ax.set_ylabel("Мбит/с")
     ax.set_ylim(0, max(values) * 1.35 or 1)
-    _style(ax, "Канал между машинами", "мелкие блоки медленнее: плата за раскачку")
+    _style(ax, "Канал между машинами",
+           f"полоса по наклону прямой; плата за передачу {data.get('setup_s', 0):.1f} с")
 
 
 def plot_verdicts(ax, report):
@@ -666,7 +704,8 @@ def plot_pipeline(ax, report):
     ax.set_ylabel("секунд на проход")
     ax.set_ylim(0, max(values) * 1.3 or 1)
     _style(ax, f"Конвейер: {data['layers']} слоёв на двух картах",
-           f"через сеть {data['hop_kb']:.0f} КБ за проход")
+           f"через сеть {data['hop_kb']:.0f} КБ за проход; подъём стадий "
+           f"{data.get('warmup_s', 0):.0f} с — один раз, в проходы не входит")
 
 
 def panels_for(report):
@@ -760,7 +799,7 @@ def summary_text(report):
         gpu = report["gpu"]
         lines.append(f"на картах      {gpu['total']:.1f} TFLOPS "
                      f"({gpu['cards_alive']} из {gpu['cards_seen']})")
-    lines += ["", "ни одного публичного адреса", "ни одного проброшенного порта"]
+    lines += ["", "адресов машин в коде: 0", "строк про сеть в коде: 0"]
     return "\n".join(lines)
 
 
@@ -818,6 +857,8 @@ def main():
         for line in summary_text(report).splitlines():
             print(f"    {line}")
         print("\n  Клиентский код — обычный Ray, без единой строчки про сеть.")
+        print("  Какие из машин публично достижимы, а какие за NAT, — видно в")
+        print("  консоли Looma, а не здесь: этому коду это ни для чего не нужно.")
 
         title("ЧТО СОХРАНЕНО")
         outdir = Path(__file__).resolve().parent / "charts"

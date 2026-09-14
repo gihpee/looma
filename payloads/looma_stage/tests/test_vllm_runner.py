@@ -101,112 +101,7 @@ def test_без_vllm_отказ_называет_причину(monkeypatch):
             pass
 
 
-# ---------------------------------------------------- спецификация KV-кэша
-class Wrapper:
-    """Обёртка vLLM: держит модель и НЕ пропускает её методы.
-
-    Ровно так ведёт себя cudagraph-обёртка — обращение падает с
-    «not exists in the runnable of cudagraph wrapper».
-    """
-
-    def __init__(self, runnable) -> None:
-        self.runnable = runnable
-
-    def __getattr__(self, name):
-        raise AttributeError(
-            f"Attribute {name} not exists in the runnable of cudagraph wrapper")
-
-
-class Model:
-    def __init__(self, spec="спецификация") -> None:
-        self.spec = spec
-
-    def get_kv_cache_spec(self):
-        return self.spec
-
-
-def test_исполнитель_спрашивается_первым():
-    """В свежих версиях vLLM метод переехал с модели на исполнитель — и
-    искать его надо там, где он есть сейчас, а не там, где был."""
-    from looma_stage.vllm_runner import _kv_spec_of
-
-    runner = Model("с исполнителя")
-    runner.model = Wrapper(Model("с модели"))
-    assert _kv_spec_of(runner) == "с исполнителя"
-
-
-def test_отказ_подсказывает_куда_метод_переехал():
-    """Чтобы не отправлять читать исходники vLLM: приём окупился дважды."""
-    from looma_stage.vllm_runner import _kv_spec_of
-
-    class Похожий:
-        def get_kv_cache_spec_v2(self):
-            return None
-
-    with pytest.raises(RunnerRefused, match="get_kv_cache_spec_v2"):
-        _kv_spec_of(Похожий())
-
-
-def test_обёртка_снимается_а_не_обходится():
-    """У первоисточника тут запасной путь — посчитать форму кэша по конфигу.
-    Мы так не делаем: неверная форма не падает, она портит внимание."""
-    from looma_stage.vllm_runner import _kv_spec_of
-
-    runner = types.SimpleNamespace(model=Wrapper(Model()))
-    assert _kv_spec_of(runner) == "спецификация"
-
-
-def test_несколько_слоёв_обёрток_тоже_снимаются():
-    from looma_stage.vllm_runner import _kv_spec_of
-
-    runner = types.SimpleNamespace(model=Wrapper(Wrapper(Model())))
-    assert _kv_spec_of(runner) == "спецификация"
-
-
-def test_голая_модель_отвечает_сразу():
-    from looma_stage.vllm_runner import _kv_spec_of
-
-    assert _kv_spec_of(types.SimpleNamespace(model=Model())) == "спецификация"
-
-
-def test_путь_через_get_model_предпочтителен():
-    """Он есть у самого vLLM и отдаёт настоящую модель — этим и надо
-    пользоваться, пока он работает."""
-    from looma_stage.vllm_runner import _kv_spec_of
-
-    runner = types.SimpleNamespace(
-        get_model=lambda: Model("из get_model"), model=Wrapper(Model("из обёртки")))
-    assert _kv_spec_of(runner) == "из get_model"
-
-
-def test_сломанный_get_model_не_мешает_остальным():
-    from looma_stage.vllm_runner import _kv_spec_of
-
-    def broken():
-        raise RuntimeError("не сейчас")
-
-    runner = types.SimpleNamespace(get_model=broken, model=Wrapper(Model()))
-    assert _kv_spec_of(runner) == "спецификация"
-
-
-def test_если_никто_не_ответил_отказ_перечисляет_где_смотрели():
-    from looma_stage.vllm_runner import _kv_spec_of
-
-    runner = types.SimpleNamespace(model=Wrapper(Wrapper(Wrapper(object()))))
-    with pytest.raises(RunnerRefused, match="смотрели"):
-        _kv_spec_of(runner)
-
-
-def test_бесконечная_матрёшка_не_вешает():
-    """Обёртка, ссылающаяся на себя, встречается реже, чем хотелось бы."""
-    from looma_stage.vllm_runner import _kv_spec_of
-
-    loop = types.SimpleNamespace()
-    loop.runnable = loop
-    with pytest.raises(RunnerRefused):
-        _kv_spec_of(types.SimpleNamespace(model=loop))
-
-
+# ---------------------------------------------------------------- кэш
 def test_рабочая_половина_кэша_обязательна():
     """Со стенда: кэш построен, модель загружена, а первый шаг падает на
 
@@ -215,15 +110,87 @@ def test_рабочая_половина_кэша_обязательна():
     Потому что рабочая половина — та, что выделяет тензоры и связывает их со
     слоями внимания, — не была вызвана вовсе. По сообщению об этом не
     догадаться: оно про пустой список, а не про пропущенный шаг.
+
+    Теперь она заводится в воркерах штатным `initialize_from_config`, а
+    планировщиковая половина — менеджер блоков — в драйвере, одна на все.
     """
     import inspect
 
     from looma_stage import vllm_runner
 
-    source = inspect.getsource(vllm_runner)
-    assert "initialize_kv_cache" in source, "рабочая половина кэша не заводится"
+    source = inspect.getsource(vllm_runner.lay_out_cache)
+    assert "initialize_from_config" in source, "рабочая половина кэша не заводится"
     # И планировщиковая тоже: без неё нечем выдавать блоки под батч.
     assert "KVCacheManager" in source
+
+
+class _Executor:
+    """Исполнитель vLLM, каким его видит раскладка кэша: отвечает на RPC."""
+
+    def __init__(self, room):
+        self.room = room
+        self.calls = []
+
+    def collective_rpc(self, method, args=(), kwargs=None, **_options):
+        self.calls.append((method, args))
+        if method == "get_kv_cache_spec":
+            return ["спецификация"] * len(self.room)
+        if method == "stage_cache_room":
+            return list(self.room)
+        return [None] * len(self.room)
+
+
+@pytest.fixture
+def vllm_cache(monkeypatch):
+    """Внутренности кэша vLLM: запоминают, с каким местом их позвали."""
+    asked = {}
+
+    def get_kv_cache_configs(*, vllm_config, kv_cache_specs, available_memory):
+        asked["memory"] = list(available_memory)
+        return ["раскладка"] * len(kv_cache_specs)
+
+    utils = types.ModuleType("vllm.v1.core.kv_cache_utils")
+    utils.get_kv_cache_configs = get_kv_cache_configs
+    utils.generate_scheduler_kv_cache_config = lambda configs: "для планировщика"
+    manager = types.ModuleType("vllm.v1.core.kv_cache_manager")
+    manager.KVCacheManager = lambda **kwargs: ("менеджер", kwargs)
+    for name in ("vllm", "vllm.v1", "vllm.v1.core"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.kv_cache_utils", utils)
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.kv_cache_manager", manager)
+    return asked
+
+
+def test_кэш_раскладывается_по_самой_занятой_карте(vllm_cache):
+    """Раскладка обязана быть одной на всех картах: блоки под одну и ту же
+    последовательность лежат на всех одинаково. Значит, задаёт её та карта,
+    где свободно меньше всего, — иначе на ней блоков не хватит."""
+    from looma_stage.vllm_runner import lay_out_cache
+
+    executor = _Executor(room=[8 * 2 ** 30, 5 * 2 ** 30, 7 * 2 ** 30])
+    config, (name, kwargs) = lay_out_cache(executor, "конфиг", block_size=16,
+                                           max_model_len=4096)
+    assert vllm_cache["memory"] == [5 * 2 ** 30] * 3
+    assert config == "для планировщика" and name == "менеджер"
+    assert kwargs["hash_block_size"] == 16 and kwargs["max_model_len"] == 4096
+
+
+def test_рабочая_половина_заводится_на_всех_воркерах(vllm_cache):
+    from looma_stage.vllm_runner import lay_out_cache
+
+    executor = _Executor(room=[2 ** 30, 2 ** 30])
+    lay_out_cache(executor, "конфиг", block_size=16, max_model_len=64)
+    settled = [args for method, args in executor.calls
+               if method == "initialize_from_config"]
+    assert settled == [(["раскладка", "раскладка"],)]
+
+
+def test_без_воркеров_раскладывать_нечего(vllm_cache):
+    from looma_stage.vllm_runner import lay_out_cache
+
+    with pytest.raises(RunnerRefused, match="ни один воркер"):
+        lay_out_cache(_Executor(room=[]), "конфиг", block_size=16,
+                      max_model_len=64)
 
 
 def test_буфер_под_входящие_заводится_до_шага():
@@ -244,3 +211,63 @@ def test_буфер_под_входящие_заводится_до_шага():
     assert "make_empty_intermediate_tensors" in source
     # И только у неголовной: первой входящие тензоры не приходят вовсе.
     assert "if not self.is_first_stage:" in source
+
+
+# ------------------------------------------------------ группа конвейера
+@pytest.fixture
+def vllm_groups(monkeypatch):
+    """Группа конвейера, какой её собрал vLLM: отвечает по номеру ранга."""
+    state = types.ModuleType("vllm.distributed.parallel_state")
+
+    class GroupCoordinator:
+        def __init__(self, ranks):
+            self.ranks = ranks
+            self.rank_in_group = 0
+            self.world_size = len(ranks)
+
+        @property
+        def is_first_rank(self):
+            return self.rank_in_group == 0
+
+        @property
+        def is_last_rank(self):
+            return self.rank_in_group == self.world_size - 1
+
+    state.GroupCoordinator = GroupCoordinator
+    state._PP = GroupCoordinator([3])
+    distributed = types.ModuleType("vllm.distributed")
+    distributed.parallel_state = state
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", state)
+    return state
+
+
+def test_группа_подменяется_на_месте_а_не_строится_заново(vllm_groups):
+    """Строить вторую группу — значит звать коллективный `new_group`, и при
+    tensor parallelism у каждого воркера свой список групп конвейера: такой
+    вызов повис бы на первом узле с двумя картами. Подменяется класс того же
+    объекта — коллективов у этого нет."""
+    from looma_stage.vllm_runner import replace_pipeline_group
+
+    before = vllm_groups._PP
+    replace_pipeline_group(12, 24, 36)
+    after = vllm_groups._PP
+    assert after is before, "группа построена заново"
+    assert (after.is_first_rank, after.is_last_rank) == (False, False)
+    assert after.ranks == [3], "состояние группы потеряно"
+
+
+def test_роль_по_слоям_а_не_по_рангу(vllm_groups):
+    from looma_stage.vllm_runner import replace_pipeline_group
+
+    replace_pipeline_group(24, 36, 36)
+    assert (vllm_groups._PP.is_first_rank, vllm_groups._PP.is_last_rank) == (False, True)
+
+
+def test_без_группы_отказ_называет_порядок(vllm_groups):
+    from looma_stage.vllm_runner import replace_pipeline_group
+
+    vllm_groups._PP = None
+    with pytest.raises(RunnerRefused, match="порядок инициализации"):
+        replace_pipeline_group(0, 12, 36)

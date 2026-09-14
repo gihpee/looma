@@ -108,6 +108,16 @@ class RankPorts:
     client_first: int
     client_last: int
 
+    def essential(self) -> List[int]:
+        """Порты, без которых этот ранг не поднимется или поднимется молча
+        ущербным. Проверяются на занятость ДО `ray start`: он о занятом порте
+        не скажет. Рабочие порты сюда не входят — их десятки, и Ray сам берёт
+        свободные из диапазона.
+        """
+        return [self.gcs, self.node_manager, self.object_manager,
+                self.runtime_env_agent, self.dashboard_grpc, self.metrics,
+                self.client_server]
+
     def crossing(self) -> List[int]:
         """Порты, до которых обязаны дотянуться ДРУГИЕ узлы.
 

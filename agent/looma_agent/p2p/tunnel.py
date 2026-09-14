@@ -24,16 +24,28 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import socket
 import threading
 from typing import Callable, Dict, Optional
 
 logger = logging.getLogger("looma_agent.p2p.tunnel")
 
-# Порция, которой ходят данные. Крупнее — меньше round trip'ов на мегабайт;
-# слишком крупно — сообщение упирается в лимиты транспорта и растёт задержка
-# на мелком обмене, которого у Ray большинство.
-CHUNK = 64 * 1024
+# Порция, которой ходят данные наружу. Запись стоит один круг до соседа на
+# порцию (унарный вызов, ждём ответа), поэтому полоса записи = порция ÷ RTT.
+# Измерено на стенде с 64 КБ: 129 Мбит/с по локальной сети (RTT ~4 мс) и
+# 2.7 Мбит/с через интернет (RTT ~190 мс) — одно ограничение, разный RTT.
+#
+# Мегабайт — по пробе живой lattica: унарное сообщение проходит до 8 МБ,
+# 1 МБ уходит за десятки миллисекунд. Мелкому обмену Ray, которого
+# большинство, это не вредит: recv() отдаёт столько, сколько есть, а не ждёт
+# полной порции. Цена — до ~1.3 МБ (base64) памяти на соединение в полёте.
+#
+# Это первая ступень, не последняя: следующая — стрим с окном вместо унарных
+# вызовов, чтобы круг ушёл с критического пути вовсе. У стрима lattica нет
+# противодавления (проверено: читает генератор вперёд без ограничений),
+# поэтому окно придётся вести самим.
+CHUNK = int(os.environ.get("LOOMA_TUNNEL_CHUNK", str(1024 * 1024)))
 # Сколько ждать локальное соединение на той стороне. Целевой процесс — сосед по
 # машине, так что это либо мгновенно, либо не будет вовсе.
 CONNECT_TIMEOUT_S = 5.0
@@ -47,7 +59,7 @@ SPARE_TIMEOUT_S = 0.5
 CALL_TIMEOUT_S = 30
 # Потолок на число одновременных туннелей через один узел. Ray открывает много
 # соединений, но не бесконечно: без потолка чужая ошибка становится нашей.
-MAX_CONNECTIONS = int(__import__("os").environ.get("LOOMA_TUNNEL_MAX", "512"))
+MAX_CONNECTIONS = int(os.environ.get("LOOMA_TUNNEL_MAX", "512"))
 
 
 class TunnelRefused(RuntimeError):
@@ -237,6 +249,13 @@ def pump(local: socket.socket, remote: "RemoteSide", *, closed: threading.Event)
     # «Ray закрыл соединение» и «сосед перестал отвечать» — разные диагнозы, а
     # выглядели одинаково, потому что побеждал тот, кто успел первым.
     reason: dict = {}
+    # Сколько записей и байт ушло наружу. Ради одного вопроса: какого размера
+    # порции РЕАЛЬНО уходят. CHUNK — только верхняя граница; сколько байт
+    # успел выложить в сокет Ray между двумя нашими чтениями, решает его
+    # оконное управление потоком (HTTP/2). Если средняя запись ~64 КБ при
+    # CHUNK в мегабайт — полоса упирается в окно Ray, а не в нашу порцию, и
+    # каждое его окно стоит ещё и наш круг до соседа.
+    stats = {"writes": 0, "bytes": 0}
 
     def why(side: str, text: str) -> None:
         reason.setdefault(side, text)
@@ -248,6 +267,8 @@ def pump(local: socket.socket, remote: "RemoteSide", *, closed: threading.Event)
                 if not piece:
                     why("наружу", "местная сторона закрыла соединение")
                     break
+                stats["writes"] += 1
+                stats["bytes"] += len(piece)
                 if not remote.write(piece):
                     why("наружу", "сосед не принял данные")
                     break
@@ -288,9 +309,16 @@ def pump(local: socket.socket, remote: "RemoteSide", *, closed: threading.Event)
     remote.close()
     # Оба направления, а не одно: пара «наружу … / внутрь …» отвечает на
     # вопрос, кто из двоих кончился первым и по своей ли воле.
-    return " | ".join(f"{side}: {reason[side]}"
-                      for side in ("наружу", "внутрь") if side in reason) \
+    summary = " | ".join(f"{side}: {reason[side]}"
+                         for side in ("наружу", "внутрь") if side in reason) \
         or "обе стороны замолчали"
+    if stats["bytes"] >= 1024 * 1024:
+        # Только для передач, где есть что мерить: у управляющего обмена Ray
+        # записи мелкие по природе, и говорить о них нечего.
+        summary += (f" | наружу {stats['bytes'] / 2**20:.1f} МБ за "
+                    f"{stats['writes']} записей, в среднем "
+                    f"{stats['bytes'] / stats['writes'] / 1024:.0f} КБ")
+    return summary
 
 
 class RemoteSide:
@@ -317,6 +345,13 @@ class RemoteSide:
         return self.stub.tunnel_open({"conn": self.conn_id})
 
     def write(self, data: bytes) -> bool:
+        if self._closed:
+            # У себя, не спрашивая соседа. `close()` уходит к нему не дожидаясь
+            # ответа — ждать нельзя, при снятии кластера их десятки, — и
+            # запись, отправленная следом, обгоняла закрытие: сосед ещё держал
+            # соединение и отвечал «ок». Закрытый туннель не принимает данные
+            # по определению, а не по тому, кто из двух вызовов доехал первым.
+            return False
         answer = _settled(self.stub.tunnel_write({
             "conn": self.conn_id, "data": base64.b64encode(data).decode()}))
         return bool(answer.get("ok", False))

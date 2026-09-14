@@ -132,6 +132,14 @@ class TaskCommands:
             name=f"submit-{spec.task_id}", daemon=True,
         ).start()
 
+    def _path_line(self, peer_id: str) -> str:
+        info = getattr(self.peers, "describe", lambda _p: {})(peer_id) or {}
+        путь = ("прямой адрес есть" if info.get("direct_addr")
+                else "только через реле" if "direct_addr" in info else "адреса неизвестны")
+        rtt = info.get("rtt_ms")
+        return (f"{peer_id[:12]} — {путь}"
+                + (f", RTT {rtt:.0f} мс" if rtt else ""))
+
     def _warm_group(self, group) -> None:
         """Навести маршруты ко всем соседям по группе, не дожидаясь первого байта.
 
@@ -159,8 +167,12 @@ class TaskCommands:
             for попытка in range(WARM_ATTEMPTS):
                 остались = [p for p in остались if not self.peers.warm(p)]
                 if not остались:
-                    logger.info("маршруты к соседям по группе %s наведены",
-                                group.group_id)
+                    # Каким путём пойдём — прямо в лог, по каждому соседу.
+                    # Рантайм в этот момент ещё не занят туннелями, поэтому
+                    # спросить его безопасно; во время кластера — уже нет.
+                    logger.info("маршруты к соседям по группе %s наведены: %s",
+                                group.group_id, "; ".join(
+                                    self._path_line(p) for p in соседи))
                     return
                 time.sleep(WARM_RETRY_S)
             logger.warning(

@@ -21,9 +21,10 @@
 конкретную архитектуру. Именно поэтому здесь нет и не будет файлов вида
 `qwen3.py`: слои строит сам vLLM, мы только говорим ему, какие.
 
-Распределённая группа при этом настоящая, но из одного процесса: vLLM без неё
-не поднимается, а обмен между стадиями всё равно идёт не через неё, а через
-агента.
+Распределённая группа при этом настоящая — по процессу на каждую карту
+узла, NCCL между ними, каждый слой порезан поровну (tensor parallelism). Но
+это группа ВНУТРИ машины: обмен между стадиями через неё не идёт, он идёт
+через агента. Всё отсюда накладывается в каждом воркере (см. vllm_worker.py).
 """
 
 from __future__ import annotations
@@ -101,80 +102,15 @@ def coordinator_for(start_layer: int, end_layer: int, num_layers: int):
     return StageGroupCoordinator
 
 
-def _kv_spec_of(runner):
-    """Спросить, какой нужен KV-кэш. У кого именно — зависит от версии.
-
-    Мест два, и они менялись между версиями vLLM: метод бывает на самом
-    исполнителе и бывает на модели, спрятанной под cudagraph-обёрткой (та не
-    пропускает его наружу и падает с «not exists in the runnable of cudagraph
-    wrapper»).
-
-    У первоисточника здесь запасной путь: посчитать форму кэша по конфигу —
-    число голов, размер головы. Мы так не делаем. Неверная форма кэша не
-    падает, она портит внимание: ответы остаются связными и становятся
-    неправильными, и найти это можно только по качеству.
-
-    Поэтому спрашиваем везде, где он бывает, а не угадываем.
-    """
-    tried = []
-    for name, candidate in _candidates(runner):
-        tried.append(name)
-        ask = getattr(candidate, "get_kv_cache_spec", None)
-        if ask is None:
-            continue
-        try:
-            return ask()
-        except AttributeError:
-            continue      # ещё одна обёртка, идём глубже
-    raise RunnerRefused(
-        "никто не рассказал про KV-кэш (смотрели: " + ", ".join(tried) + "). "
-        "Похоже на это: " + _hints(runner) + ". Угадывать форму нельзя: "
-        "неверная не падает, а портит внимание")
-
-
-def _candidates(runner):
-    """Кого спрашивать, от самого вероятного к самому глубокому."""
-    # Сам исполнитель — в свежих версиях метод переехал сюда.
-    yield "runner", runner
-    get_model = getattr(runner, "get_model", None)
-    if callable(get_model):
-        try:
-            yield "runner.get_model()", get_model()
-        except Exception:
-            pass
-    model = getattr(runner, "model", None)
-    seen = 0
-    while model is not None and seen < 5:
-        yield f"model{'.runnable' * seen}", model
-        model = getattr(model, "runnable", None) or getattr(model, "module", None)
-        seen += 1
-
-
-def _hints(runner) -> str:
-    """Что похожее нашлось поблизости.
-
-    Чтобы следующий отказ называл, куда метод переехал, а не отправлял читать
-    исходники vLLM. Этот приём здесь окупился уже дважды.
-    """
-    found = []
-    for name, candidate in _candidates(runner):
-        for attribute in dir(candidate):
-            if "kv_cache" in attribute and callable(
-                    getattr(candidate, attribute, None)):
-                found.append(f"{name}.{attribute}")
-        if len(found) > 8:
-            break
-    return ", ".join(found[:8]) or "ничего похожего"
-
-
 def stage_runner_class(start_layer: int, end_layer: int, num_layers: int):
     """Исполнитель vLLM, знающий свой срез.
 
     Собирается внутри функции по той же причине, что и координатор: базовый
     тип живёт в vLLM, а модуль обязан импортироваться и там, где его нет.
 
-    Добавляет к штатному ровно две вещи — заведение KV-кэша под наши слои и
-    шаг, умеющий принять и отдать промежуточные тензоры.
+    Добавляет к штатному ровно одно — шаг, умеющий принять промежуточные
+    тензоры снаружи. Кэш под наши слои раскладывает драйвер на все воркеры
+    сразу (`lay_out_cache`), а не каждый исполнитель себе.
     """
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -185,62 +121,6 @@ def stage_runner_class(start_layer: int, end_layer: int, num_layers: int):
         end_layer_index = end_layer
         is_first_stage = is_first
         is_last_stage = is_last
-
-        def __init__(self, *args, **kwargs) -> None:
-            super().__init__(*args, **kwargs)
-
-        # ------------------------------------------------------- KV-кэш
-        def prepare_cache(self, *, block_size: int, max_model_len: int):
-            """Завести кэш под наши слои и только под них.
-
-            Спецификацию спрашиваем у самой модели: сколько голов и какого
-            размера — знает она, а угадывать это по конфигу значит однажды
-            угадать неверно и получить кэш не той формы. Такая ошибка не
-            падает, она портит внимание.
-            """
-            import torch
-            from vllm.v1.core.kv_cache_utils import (generate_scheduler_kv_cache_config,
-                                                     get_kv_cache_configs)
-            from vllm.v1.core.kv_cache_manager import KVCacheManager
-
-            spec = _kv_spec_of(self)
-
-            free, _total = torch.cuda.mem_get_info(self.device.index or 0)
-            available = int(free * self.cache_config.gpu_memory_utilization)
-            logger.info("под KV-кэш: %.1f ГБ из %.1f ГБ свободных",
-                        available / 1024**3, free / 1024**3)
-
-            configs = get_kv_cache_configs(vllm_config=self.vllm_config,
-                                           kv_cache_specs=[spec],
-                                           available_memory=[available])
-
-            # У кэша две половины, и путать их нельзя.
-            #
-            # РАБОЧАЯ живёт в исполнителе: она выделяет сами тензоры и
-            # связывает их со слоями внимания, попутно собирая attn_groups.
-            # Без неё модель грузится, кэш «есть», а первый же шаг падает на
-            #     IndexError: list index out of range
-            # в attn_groups[0] — и по этому сообщению не догадаться, что
-            # пропущен целый шаг инициализации.
-            #
-            # ПЛАНИРОВЩИКОВАЯ — это менеджер блоков: он решает, кому какие
-            # блоки выдать, и именно его зовёт наша сборка батча.
-            settle = getattr(self, "initialize_kv_cache", None)
-            if settle is None:
-                raise RunnerRefused(
-                    "исполнитель не умеет initialize_kv_cache — без неё слои "
-                    "внимания останутся без кэша, и первый же шаг упадёт")
-            settle(configs[0])
-
-            self.kv_cache_config = generate_scheduler_kv_cache_config(configs)
-            self.kv_cache_manager = KVCacheManager(
-                kv_cache_config=self.kv_cache_config, max_model_len=max_model_len,
-                enable_caching=False, use_eagle=False, log_stats=False,
-                enable_kv_cache_events=False, dcp_world_size=1,
-                hash_block_size=block_size)
-            logger.info("кэш разложен: групп внимания %d",
-                        len(getattr(self, "attn_groups", []) or []))
-            return self.kv_cache_manager
 
         # --------------------------------------------------------- шаг
         def execute_model(self, scheduler_output, intermediate_tensors=None,
@@ -277,14 +157,74 @@ def stage_runner_class(start_layer: int, end_layer: int, num_layers: int):
     return StageRunner
 
 
+def lay_out_cache(executor, config, *, block_size: int, max_model_len: int):
+    """Завести KV-кэш под наши слои на всех воркерах и вернуть менеджер блоков.
+
+    У кэша две половины, и путать их нельзя.
+
+    РАБОЧАЯ живёт в воркерах: она выделяет сами тензоры и связывает их со
+    слоями внимания, попутно собирая attn_groups. Без неё модель грузится,
+    кэш «есть», а первый же шаг падает на
+        IndexError: list index out of range
+    в attn_groups[0] — и по этому сообщению не догадаться, что пропущен целый
+    шаг инициализации. Заводится штатным `initialize_from_config`.
+
+    ПЛАНИРОВЩИКОВАЯ — это менеджер блоков: он решает, кому какие блоки
+    выдать, и именно его зовёт наша сборка батча. Он один, в драйвере: состав
+    батча один на все карты, и блоки под него обязаны совпасть на всех.
+
+    Спецификацию кэша спрашиваем у самих воркеров, а не считаем по конфигу:
+    сколько голов достаётся карте при tensor parallelism — знает модель, а
+    угадать это по конфигу значит однажды угадать неверно и получить кэш не
+    той формы. Такая ошибка не падает, она портит внимание.
+
+    Места берём наименьшее по картам: раскладка обязана быть одной на всех,
+    и карта, где свободно меньше, задаёт её всем.
+    """
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.kv_cache_utils import (generate_scheduler_kv_cache_config,
+                                             get_kv_cache_configs)
+
+    specs = executor.collective_rpc("get_kv_cache_spec")
+    room = executor.collective_rpc("stage_cache_room")
+    if not specs or not room:
+        raise RunnerRefused("ни один воркер не рассказал про KV-кэш")
+    least = min(int(size) for size in room)
+    if len(room) > 1 and least < max(room):
+        logger.info("под кэш берём %.1f ГБ — столько свободно на самой занятой "
+                    "карте (на самой свободной %.1f ГБ)",
+                    least / 1024 ** 3, max(room) / 1024 ** 3)
+
+    configs = get_kv_cache_configs(vllm_config=config, kv_cache_specs=specs,
+                                   available_memory=[least] * len(specs))
+    executor.collective_rpc("initialize_from_config", args=(configs,))
+
+    scheduler_config = generate_scheduler_kv_cache_config(configs)
+    manager = KVCacheManager(
+        kv_cache_config=scheduler_config, max_model_len=max_model_len,
+        enable_caching=False, use_eagle=False, log_stats=False,
+        enable_kv_cache_events=False, dcp_world_size=1,
+        hash_block_size=block_size)
+    logger.info("кэш разложен на %d воркерах: блоков %s", len(specs),
+                getattr(scheduler_config, "num_blocks", "?"))
+    return scheduler_config, manager
+
+
 def replace_pipeline_group(start_layer: int, end_layer: int, num_layers: int) -> None:
     """Подменить группу конвейера на ту, что считает по слоям.
 
     Отдельным шагом после `initialize_model_parallel`: vLLM собирает свою
     группу сам, и переопределить в ней два свойства проще, чем построить свою
     с нуля со всем, что к ней прилагается.
+
+    Подменяется КЛАСС уже собранной группы, а не строится вторая. Строить
+    вторую значило бы звать `torch.distributed.new_group`, а это коллективная
+    операция: её обязаны позвать все процессы узла с одним и тем же списком
+    групп. При tensor parallelism у каждого воркера своя группа конвейера из
+    него одного, списки разные — и такой вызов повис бы на первом же узле с
+    двумя картами. У подмены класса коллективов нет: свойства меняются у
+    объекта, который у каждого свой.
     """
-    import torch
     from vllm.distributed import parallel_state
 
     existing = parallel_state._PP
@@ -292,14 +232,6 @@ def replace_pipeline_group(start_layer: int, end_layer: int, num_layers: int) ->
         raise RunnerRefused(
             "vLLM не поднял группу конвейера; порядок инициализации нарушен")
 
-    made = coordinator_for(start_layer, end_layer, num_layers)(
-        group_ranks=[existing.ranks],
-        local_rank=existing.local_rank,
-        torch_distributed_backend=torch.distributed.get_backend(existing.device_group),
-        use_device_communicator=existing.use_device_communicator,
-        use_message_queue_broadcaster=existing.mq_broadcaster is not None,
-        group_name="pp",
-    )
-    parallel_state._PP = made
+    existing.__class__ = coordinator_for(start_layer, end_layer, num_layers)
     logger.info("группа конвейера считает по слоям: первая=%s, последняя=%s",
-                made.is_first_rank, made.is_last_rank)
+                existing.is_first_rank, existing.is_last_rank)

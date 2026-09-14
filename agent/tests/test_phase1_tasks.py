@@ -623,11 +623,14 @@ def test_задача_видна_переписи_пока_собирается_
         assert строим.wait(10), "сборка окружения не началась"
         assert "медленная" in reg.claimed(), "задачи нет в переписи узла"
         assert reg.snapshot()["running"] == 1, "узел показывает себя свободным"
+        отпустить.set()
+        submitting.join(timeout=30)
+        # А когда пошла — она в переписи как обычная задача, и дважды её там
+        # нет. Проверяется ДО снятия: снятая задача из переписи уходит сразу,
+        # результата, за которым придут, у неё нет.
+        assert reg.claimed() == []
+        assert [t.spec.task_id for t in reg.list()] == ["медленная"]
     finally:
         отпустить.set()
         submitting.join(timeout=30)
         reg.stop_all()
-
-    # А когда пошла — она в переписи как обычная задача, и дважды её там нет.
-    assert reg.claimed() == []
-    assert [t.spec.task_id for t in reg.list()] == ["медленная"]
