@@ -289,6 +289,10 @@ function Chat({ model }: { model: string }) {
   const toast = useToast();
   const [prompt, setPrompt] = useState("");
   const [maxTokens, setMaxTokens] = useState("128");
+  // Пусто — поле не уезжает, и стадия берёт своё умолчание. Ноль — жадный
+  // выбор, и он уезжает как ноль: у gpt-oss на нём рассуждение уходит в
+  // повтор, поэтому «не задано» и «0» обязаны различаться.
+  const [temperature, setTemperature] = useState("");
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [usage, setUsage] = useState<Usage | null>(null);
@@ -313,6 +317,7 @@ function Chat({ model }: { model: string }) {
         body: JSON.stringify({
           model, stream: true, messages: [{ role: "user", content: prompt }],
           max_tokens: Number(maxTokens) || 128,
+          ...(temperature.trim() === "" ? {} : { temperature: Number(temperature) }),
         }),
       });
       if (!r.ok || !r.body) {
@@ -396,6 +401,13 @@ function Chat({ model }: { model: string }) {
           <Field label="max_tokens">
             <input type="number" value={maxTokens}
                    onChange={(e) => setMaxTokens(e.target.value)} />
+          </Field>
+        </div>
+        <div style={{ width: 110 }}>
+          <Field label="temperature">
+            <input type="number" value={temperature} placeholder="модели"
+                   min={0} max={2} step={0.1}
+                   onChange={(e) => setTemperature(e.target.value)} />
           </Field>
         </div>
         <Button kind="primary" onClick={ask} disabled={busy || !prompt}>
