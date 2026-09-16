@@ -252,21 +252,6 @@ def test_если_тензоров_нет_нигде_отказ_называет
         vllm_engine._hidden_from(types.SimpleNamespace(), {})
 
 
-def test_логиты_ищутся_и_в_ответе_и_в_состоянии():
-    ответ = types.SimpleNamespace(logits="прямо")
-    assert vllm_engine._logits_from(types.SimpleNamespace(), ответ, expected=1) == "прямо"
-
-    runner = types.SimpleNamespace(
-        execute_model_state=types.SimpleNamespace(logits="в состоянии"))
-    assert vllm_engine._logits_from(runner, object(), expected=1) == "в состоянии"
-
-
-def test_если_логитов_нет_отказ_называет_что_пришло():
-    with pytest.raises(RunnerRefused, match="вернул int"):
-        vllm_engine._logits_from(types.SimpleNamespace(execute_model_state=None), 7,
-                                 expected=1)
-
-
 def test_неголовной_стадии_без_тензоров_считать_нечего(monkeypatch, sequence_module):
     """Иначе она посчитает мусор из неинициализированного буфера и отдаст его
     дальше — молча."""
@@ -447,41 +432,6 @@ def test_если_урезать_нечем_читаем_целиком(monkeypa
 
 
 # ------------------------------------------------------- батч из нескольких
-class _Answer:
-    def __init__(self, logits):
-        self.logits = logits
-
-
-class _Rows:
-    """Тензор ровно настолько, насколько его щупает _logits_from."""
-
-    def __init__(self, *shape):
-        self.shape = shape
-
-
-def test_число_строк_логитов_сверяется_с_батчем():
-    """Строка логитов не подписана именем запроса: соответствие держится
-    только на порядке. Разойдись оно молча — токен уехал бы чужому клиенту."""
-    from looma_stage import vllm_engine
-
-    with pytest.raises(vllm_engine.RunnerRefused, match="строк логитов"):
-        vllm_engine._logits_from(object(), _Answer(_Rows(2, 151936)), expected=3)
-
-
-def test_совпавший_батч_логитов_проходит():
-    from looma_stage import vllm_engine
-
-    logits = _Rows(3, 151936)
-    assert vllm_engine._logits_from(object(), _Answer(logits), expected=3) is logits
-
-
-def test_одномерные_логиты_считаются_одной_строкой():
-    from looma_stage import vllm_engine
-
-    logits = _Rows(151936)
-    assert vllm_engine._logits_from(object(), _Answer(logits), expected=1) is logits
-
-
 def test_шаг_без_последовательностей_отвергается():
     from looma_stage import vllm_engine
 
@@ -510,29 +460,30 @@ def test_промпты_без_токенов_отвергаются():
 
 
 # --------------------------------------------------- двухфазный шаг vLLM
-class _Logits:
-    def __init__(self, rows=1, vocab=7):
-        self.shape = (rows, vocab)
-        self.copied = False
+class _Sampled:
+    """ModelRunnerOutput: токены, которые выбрал сэмплер vLLM."""
 
-    def clone(self):
-        made = _Logits(*self.shape)
-        made.copied = True
-        return made
+    def __init__(self, tokens, ids=None):
+        self.sampled_token_ids = [list(t) if isinstance(t, (list, tuple)) else [t]
+                                  for t in tokens]
+        self.req_ids = list(ids or [f"r{i}" for i in range(len(tokens))])
 
 
 class _TwoPhaseRunner:
-    """Исполнитель vLLM 0.14: шаг разделён надвое."""
+    """Исполнитель vLLM 0.14: шаг разделён надвое, токены отдаёт вторая
+    половина."""
 
-    def __init__(self, rows=1):
-        self.execute_model_state = types.SimpleNamespace(logits=_Logits(rows))
+    def __init__(self, tokens=(7,), ids=None):
+        self.execute_model_state = types.SimpleNamespace(logits="логиты")
         self.sampled = 0
+        self._tokens, self._ids = tokens, ids
 
     def sample_tokens(self, _grammar):
         if self.execute_model_state is None:
             raise AssertionError("позвали, когда закрывать было нечего")
         self.execute_model_state = None
         self.sampled += 1
+        return _Sampled(self._tokens, self._ids)
 
 
 def test_шаг_закрывается_и_следующий_проходит(sequence_module):
@@ -543,18 +494,62 @@ def test_шаг_закрывается_и_следующий_проходит(se
     assert runner.execute_model_state is None and runner.sampled == 1
 
 
-def test_логиты_забираются_копией(sequence_module):
-    """Сэмплер vLLM правит их на месте, а выбирать токен мы будем сами."""
-    _hidden, logits = vllm_engine.collect(_TwoPhaseRunner(), None, is_last=True,
-                                          expected=1)
-    assert logits.copied
+def test_токен_берётся_у_сэмплера_vllm_а_не_выбирается_заново(sequence_module):
+    """Со стенда: при температуре 1 у Qwen3 выпадали слоги, gpt-oss шёл
+    кашей, при 0 — всё чисто. Исполнитель vLLM на последнем ранге продолжает
+    с токена, который выбрал ЕГО сэмплер, а присланный игнорирует; выбирая
+    свой поверх его логитов, мы показывали клиенту не тот токен, от которого
+    модель продолжила. При argmax это совпадало — потому и не всплывало."""
+    runner = _TwoPhaseRunner(tokens=(11, 22), ids=["a", "b"])
+    _hidden, chosen = vllm_engine.collect(runner, None, is_last=True, expected=2)
+    assert chosen == {"a": 11, "b": 22}
 
 
-def test_средняя_стадия_отдаёт_тензоры_а_не_логиты(sequence_module):
+def test_старая_версия_отдаёт_токены_одним_вызовом(sequence_module):
+    """До 0.14 `execute_model` возвращал всё сразу — тогда `sample_tokens`
+    звать нечего, токены уже в ответе."""
+    runner = types.SimpleNamespace()               # без sample_tokens
+    _hidden, chosen = vllm_engine.collect(runner, _Sampled([5], ["x"]),
+                                          is_last=True, expected=1)
+    assert chosen == {"x": 5}
+
+
+def test_асинхронный_вывод_дожидается_а_не_читает_заглушки(sequence_module):
+    """С async scheduling `sample_tokens` отдаёт объект с `get_output`, а
+    в самом ответе вместо токенов -1. Мы его выключили; но если версия
+    включила — дожидаемся."""
+    class Deferred:
+        def get_output(self):
+            return _Sampled([9], ["x"])
+
+    runner = types.SimpleNamespace(
+        execute_model_state=object(), sample_tokens=lambda _g: Deferred())
+    _hidden, chosen = vllm_engine.collect(runner, None, is_last=True, expected=1)
+    assert chosen == {"x": 9}
+
+
+def test_состав_разошёлся_отказ_а_не_чужой_токен(sequence_module):
+    """Токен не подписан ничем, кроме request_id; лишний или недостающий —
+    значит порядок батча уже не тот, и молча продолжать нельзя."""
+    with pytest.raises(RunnerRefused, match="состав батча разошёлся"):
+        vllm_engine.collect(_TwoPhaseRunner(tokens=(1, 2)), None, is_last=True,
+                            expected=1)
+    with pytest.raises(RunnerRefused, match="не выбрал токен"):
+        vllm_engine.collect(_TwoPhaseRunner(tokens=([],)), None, is_last=True,
+                            expected=1)
+
+
+def test_без_токенов_отказ_называет_что_пришло(sequence_module):
+    runner = types.SimpleNamespace(execute_model_state=None)     # закрывать нечего
+    with pytest.raises(RunnerRefused, match="вернул int"):
+        vllm_engine.collect(runner, 7, is_last=True, expected=1)
+
+
+def test_средняя_стадия_отдаёт_тензоры_а_не_токены(sequence_module):
     runner = _TwoPhaseRunner()
     answer = Intermediate()
-    hidden, logits = vllm_engine.collect(runner, answer, is_last=False, expected=1)
-    assert hidden is answer and logits is None
+    hidden, chosen = vllm_engine.collect(runner, answer, is_last=False, expected=1)
+    assert hidden is answer and chosen is None
     assert runner.sampled == 0, "у средней стадии закрывать нечего"
 
 
@@ -593,9 +588,9 @@ def test_драйвер_шлёт_батч_всем_и_читает_нулево�
     assert isinstance(hidden, Intermediate) and logits is None
 
 
-def test_драйвер_отдаёт_логиты_последней_стадии(sequence_module):
-    driver, _executor = _driver(reply=(None, "логиты"))
-    assert driver.run("батч", None, expected=1) == (None, "логиты")
+def test_драйвер_отдаёт_выбор_последней_стадии(sequence_module):
+    driver, _executor = _driver(reply=(None, {"a": 3}))
+    assert driver.run("батч", None, expected=1) == (None, {"a": 3})
 
 
 def test_молчание_нулевого_воркера_отказ(sequence_module):
@@ -609,7 +604,7 @@ def test_шаг_собирает_батч_в_драйвере_и_шлёт_вор
     состав в одном и том же порядке."""
     from looma_stage.scheduler import Sequence
 
-    driver, executor = _driver(reply=(None, "логиты"))
+    driver, executor = _driver(reply=(None, {"a": 3}))
     formed = []
     monkeypatch.setattr("looma_stage.vllm_batch.prefill",
                         lambda batch, runner: formed.append(("prefill", runner)) or "батч")
@@ -620,16 +615,16 @@ def test_шаг_собирает_батч_в_драйвере_и_шлёт_вор
         is_last=True, dtype="bfloat16", runner=driver)
 
     assert vllm_engine.step(shard, [Sequence("a", [1, 2])], incoming={},
-                            first_step=True) == (None, "логиты")
+                            first_step=True) == (None, {"a": 3})
     assert formed == [("prefill", driver)]
     assert executor.calls[-1][1][0] == "батч"
 
 
 def test_старая_версия_закрывать_нечего():
     """До 0.14 всё отдавалось одним вызовом."""
-    vllm_engine._finish_step(types.SimpleNamespace())          # нет sample_tokens
-    vllm_engine._finish_step(types.SimpleNamespace(sample_tokens=None,
-                                                   execute_model_state=None))
+    assert vllm_engine._finish_step(types.SimpleNamespace()) is None   # нет sample_tokens
+    assert vllm_engine._finish_step(types.SimpleNamespace(
+        sample_tokens=None, execute_model_state=None)) is None
 
 
 # ------------------------------------------------------ компилятор для Triton
@@ -686,3 +681,21 @@ def test_компилятор_даётся_до_воркеров(monkeypatch):
     vllm_engine.load_shard("модель", start_layer=0, end_layer=18,
                            num_model_layers=36)
     assert order.index("компилятор") < order.index("воркеры")
+
+
+# ---------------------------------------------------------- раскладка выбора
+def test_выбор_раскладывается_по_порядку_батча(sequence_module):
+    from looma_stage.scheduler import Sequence
+
+    engine = vllm_engine.VllmEngine.__new__(vllm_engine.VllmEngine)
+    tokens = engine.sample_batch({"b": 2, "a": 1}, [Sequence("a", [0]), Sequence("b", [0])])
+    assert tokens == [1, 2]
+
+
+def test_нет_токена_для_кого_то_из_батча_отказ(sequence_module):
+    """Подставить чужой — уехать ответом не тому клиенту."""
+    from looma_stage.scheduler import Sequence
+
+    engine = vllm_engine.VllmEngine.__new__(vllm_engine.VllmEngine)
+    with pytest.raises(RunnerRefused, match="не выбрал токен для b"):
+        engine.sample_batch({"a": 1}, [Sequence("a", [0]), Sequence("b", [0])])

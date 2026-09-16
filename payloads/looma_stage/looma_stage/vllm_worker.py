@@ -160,7 +160,8 @@ def worker_class():
             Входящие тензоры приходят аргументом на КАЖДЫЙ воркер целиком:
             при tensor parallelism скрытое состояние на входе слоя одно на
             всех картах. Результат отдаёт только ранг 0 — у остальных он тот
-            же самый, и возить его через очередь незачем.
+            же самый (сэмплер vLLM на всех рангах сидит на одном seed), и
+            возить его через очередь незачем.
 
             На процессор, а не картой: тензор в очереди исполнителя едет
             через pickle, а CUDA-тензор через pickle — это IPC-дескриптор,
@@ -183,11 +184,11 @@ def worker_class():
                     if self.is_last_stage:
                         vllm_engine._finish_step(self.model_runner)
                     return None
-                hidden, logits = vllm_engine.collect(self.model_runner, answer,
+                hidden, chosen = vllm_engine.collect(self.model_runner, answer,
                                                      is_last=self.is_last_stage,
                                                      expected=expected)
-                if logits is not None:
-                    return None, logits.cpu()
+                if chosen is not None:
+                    return None, chosen
                 return ({name: value.cpu() for name, value in hidden.tensors.items()},
                         None)
 

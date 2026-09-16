@@ -404,10 +404,15 @@ def _build_config(model_path: str, *, dtype: str, max_model_len: int,
                                  gpu_memory_utilization=utilisation,
                                  swap_space=0, cache_dtype="auto"),
         parallel_config=parallel,
-        scheduler_config=SchedulerConfig(
+        # Без асинхронного планирования — явно. vLLM включает его сам, и в
+        # этом режиме `sample_tokens` отдаёт вместо токенов заглушки `-1`, а
+        # настоящие копирует с карты в фоне для своего же планировщика. Цикл
+        # ведём мы, синхронно, и токен нужен нам сразу и здесь.
+        scheduler_config=_config_with(SchedulerConfig,
             max_num_batched_tokens=max(max_batched_tokens, model.max_model_len),
             max_num_seqs=max_sequences, max_model_len=model.max_model_len,
-            is_encoder_decoder=False, enable_chunked_prefill=False),
+            is_encoder_decoder=False, enable_chunked_prefill=False,
+            async_scheduling=False),
         # Без номера: каждый воркер берёт карту по своему рангу.
         device_config=DeviceConfig(device="cuda"),
         load_config=LoadConfig(load_format="auto"),
@@ -591,9 +596,9 @@ class StageDriver:
                 timeout=STEP_TIMEOUT_S)
         if answer is None:
             raise RunnerRefused("нулевой воркер не отдал результата шага")
-        hidden, logits = answer
+        hidden, chosen = answer
         if hidden is None:
-            return None, logits
+            return None, chosen
         from vllm.sequence import IntermediateTensors
 
         return IntermediateTensors(hidden), None
@@ -681,9 +686,8 @@ def load_shard(model_path: str, *, start_layer: int, end_layer: int,
 def step(shard: LoadedShard, sequences, *, incoming=None, first_step: bool):
     """Один шаг движка над батчем, который выбрали снаружи.
 
-    Возвращает то же, что и собственный исполнитель стадии: скрытые состояния
-    на всех стадиях кроме последней, логиты — на последней. Различать их
-    вызывающему не нужно.
+    Возвращает скрытые состояния на всех стадиях кроме последней, а на
+    последней — выбранные токены: карту `request_id -> токен`.
 
     Батч собирается здесь, в драйвере, и уезжает воркерам готовым: блоки
     KV-кэша под него выданы один раз, и все карты получают один и тот же
@@ -710,42 +714,80 @@ def step(shard: LoadedShard, sequences, *, incoming=None, first_step: bool):
 
 def collect(runner, answer, *, is_last: bool, expected: int):
     """Забрать результат шага у исполнителя vLLM — в воркере, сразу после
-    `execute_model`. Возвращает `(тензоры, логиты)`, ровно одно из двух."""
+    `execute_model`. Возвращает `(тензоры, токены)`, ровно одно из двух."""
     if is_last:
-        # Копией и ДО закрытия шага: сэмплер vLLM правит логиты на месте
-        # (делит на температуру, режет по top-p), а выбирать токен мы будем
-        # сами и по своим правилам — иначе один и тот же промпт даёт разные
-        # ответы в зависимости от того, каким движком считали.
-        logits = _logits_from(runner, answer, expected=expected).clone()
-        _finish_step(runner)
-        return None, logits
+        return None, _chosen_from(runner, answer, expected=expected)
     return _hidden_from(runner, answer), None
 
 
-def _finish_step(runner) -> None:
-    """Закрыть шаг так, как того требует эта версия vLLM.
+def _chosen_from(runner, answer, *, expected: int) -> dict:
+    """Токены последней стадии — те, что выбрал сэмплер vLLM. Карта
+    `request_id -> токен`.
 
-    С 0.14 шаг последней стадии разделён надвое: `execute_model` считает
-    логиты, кладёт их во временное состояние и возвращает **None**, а забрать
-    результат и очистить это состояние обязан `sample_tokens`.
+    Именно его, а не наш поверх его логитов, и это исправление, а не вкус.
+    Со стенда: при температуре 1 ответы Qwen3 шли с выпавшими слогами
+    («Сажно учеркнуть»), а gpt-oss разваливался в кашу; при температуре 0 —
+    всё чисто. Причина в самом vLLM: на последнем ранге его исполнитель
+    **игнорирует** токен, присланный планировщиком, и продолжает с того,
+    который выбрал его собственный сэмплер — «чтобы планировщику не надо
+    было слать их назад» (gpu_model_runner._update_states, ветки
+    `if not is_last_rank`). Мы же выбирали свой: при argmax оба совпадают,
+    при случайной выборке — нет, и клиент видел не тот токен, от которого
+    модель продолжила.
 
-    Не позвать его — значит оставить состояние непустым. Текущий шаг при этом
-    проходит целиком: логиты лежат в состоянии, мы их оттуда и берём. Падает
-    СЛЕДУЮЩИЙ, на «State error: sample_tokens() must be called after
-    execute_model() returns None» — и по этому тексту не видно ни того, что
-    виноват предыдущий шаг, ни того, что первый токен уже успел уехать
-    клиенту.
+    Значит выбирать на последней стадии может только vLLM; наши
+    temperature/top_p/seed он получает через `SamplingParams`. Заодно
+    отпадают логиты в очереди — 800 КБ на шаг.
 
-    Одиночной проверкой это не ловится вовсе: один шаг всегда проходит.
+    С 0.14 шаг разделён надвое: `execute_model` возвращает None, а токены
+    отдаёт `sample_tokens` — и она же переводит движок в состояние, из
+    которого можно считать дальше. Не позвать её — значит уронить
+    СЛЕДУЮЩИЙ шаг на «State error: sample_tokens() must be called after
+    execute_model() returns None», уже после того, как первый токен уехал.
+    Версии до 0.14 отдают всё одним вызовом — тогда ответ уже с токенами.
+    """
+    output = answer if _has_tokens(answer) else _finish_step(runner)
+    if hasattr(output, "get_output"):
+        # Асинхронный вывод: токены ещё на карте. Мы его выключили, но если
+        # версия его всё же включила — дождёмся, а не прочитаем заглушки.
+        output = output.get_output()
+    if not _has_tokens(output):
+        got = answer if output is None else output
+        raise RunnerRefused(
+            f"шаг не отдал токенов, а вернул {type(got).__name__}; в этой "
+            "версии vLLM они лежат где-то ещё")
+    ids = list(getattr(output, "req_ids", None) or [])
+    rows = list(output.sampled_token_ids or [])
+    if len(ids) != expected or len(rows) != len(ids):
+        raise RunnerRefused(
+            f"движок отдал токены для {len(ids)} запросов ({len(rows)} строк) "
+            f"на {expected} последовательностей; состав батча разошёлся")
+    chosen = {}
+    for request_id, row in zip(ids, rows):
+        if not row:
+            raise RunnerRefused(
+                f"движок не выбрал токен для {request_id}: пустая строка "
+                "(так бывает при неполном prefill, который у нас выключен)")
+        chosen[str(request_id)] = int(row[-1])
+    return chosen
 
-    Результат `sample_tokens` не нужен — токен выбираем мы. Зовём ради того,
-    чтобы движок вернулся в состояние, из которого можно считать дальше.
+
+def _has_tokens(candidate) -> bool:
+    return (candidate is not None
+            and getattr(candidate, "sampled_token_ids", None) is not None)
+
+
+def _finish_step(runner):
+    """Вторая половина шага (0.14+): сэмплер vLLM и его результат.
+
+    Обязана быть позвана на КАЖДОМ ранге, не только на нулевом: состояние
+    шага у каждого воркера своё, а коллективы NCCL ждут всех.
     """
     finish = getattr(runner, "sample_tokens", None)
     if finish is None or getattr(runner, "execute_model_state", None) is None:
         # Версии до 0.14 отдают всё одним вызовом, закрывать нечего.
-        return
-    finish(None)
+        return None
+    return finish(None)
 
 
 class VllmEngine:
@@ -788,18 +830,19 @@ class VllmEngine:
 
     # ------------------------------------------------------------ счёт
     def step_batch(self, sequences, *, incoming=None, first_step: bool):
-        """Один шаг над батчем. Возвращает `(карта тензоров, логиты)`.
+        """Один шаг над батчем. Возвращает `(карта тензоров, выбор)`.
 
-        Ровно одно из двух не None: на последней стадии логиты, на прочих —
-        тензоры. Так же отвечает и собственный исполнитель.
+        Ровно одно из двух не None: на последней стадии — выбранные токены
+        (карта `request_id -> токен`), на прочих — тензоры. Голова зовёт
+        `sample_batch` с тем, что пришло вторым, и не различает движков.
         """
-        hidden, logits = step(self.shard, sequences,
+        hidden, chosen = step(self.shard, sequences,
                               incoming=self._incoming(incoming),
                               first_step=first_step)
         for sequence in sequences:
             self._live.add(sequence.request_id)
         if hidden is None:
-            return None, logits
+            return None, chosen
         return dict(hidden.tensors), None
 
     def _incoming(self, tensors):
@@ -817,29 +860,21 @@ class VllmEngine:
         # процессора, и каждый положит их на свою.
         return IntermediateTensors(dict(tensors))
 
-    def sample_batch(self, logits, sequences) -> list:
-        """По токену на последовательность, в порядке батча."""
-        from looma_stage import batch_wire
+    def sample_batch(self, chosen, sequences) -> list:
+        """По токену на последовательность, в порядке батча.
 
-        rows = logits if getattr(logits, "dim", lambda: 1)() > 1 else logits[None]
-        batch_wire.check_rows(list(sequences), int(rows.shape[0]))
-        return [self.sample(row, temperature=sequence.temperature,
-                            top_p=sequence.top_p, seed=sequence.seed)
-                for row, sequence in zip(rows, sequences)]
-
-    def sample(self, logits, *, temperature: float = 0.0, top_p: float = 1.0,
-               seed: Optional[int] = None) -> int:
-        """Выбор токена — тот же, что у собственного исполнителя.
-
-        Не из vLLM: его сэмплер живёт внутри его же планировщика, которого мы
-        как раз обходим. Одинаковый выбор на обоих движках стоит дороже, чем
-        экономия на этих десяти строках, — иначе один и тот же промпт даёт
-        разные ответы в зависимости от того, чем считали.
+        Выбор уже сделан сэмплером vLLM внутри шага (см. `_chosen_from`);
+        здесь он только раскладывается по порядку батча. Отсутствие токена
+        для кого-то из батча — отказ: подставить чужой значило бы уехать
+        ответом не тому клиенту.
         """
-        from looma_stage.executor import ShardExecutor
-
-        return ShardExecutor.sample(self, logits, temperature=temperature,
-                                    top_p=top_p, seed=seed)
+        chosen = dict(chosen or {})
+        missing = [s.request_id for s in sequences if s.request_id not in chosen]
+        if missing:
+            raise RunnerRefused(
+                f"движок не выбрал токен для {', '.join(missing)}; есть только "
+                f"для {sorted(chosen)}")
+        return [int(chosen[sequence.request_id]) for sequence in sequences]
 
     # ------------------------------------------------------------ уборка
     def free(self, request_id: str) -> None:
@@ -874,32 +909,6 @@ def _hidden_from(runner, answer):
             return found
     raise RunnerRefused(
         f"шаг не отдал промежуточных тензоров, а вернул {type(answer).__name__}; "
-        "в этой версии vLLM они лежат где-то ещё")
-
-
-def _logits_from(runner, answer, *, expected: int):
-    """Логиты последней стадии — по строке на последовательность.
-
-    Строка логитов не подписана именем запроса: соответствие держится только
-    на порядке батча. Поэтому число строк сверяется с числом последовательностей
-    здесь и сразу. Разойдись оно молча — токен уехал бы чужому клиенту, и
-    заметить это можно было бы разве что по жалобе на бессвязный ответ.
-    """
-    state = getattr(runner, "execute_model_state", None)
-    for source in (answer, state):
-        found = getattr(source, "logits", None)
-        if found is None:
-            continue
-        shape = list(getattr(found, "shape", []) or [])
-        rows = shape[0] if len(shape) > 1 else 1
-        if rows != expected:
-            raise RunnerRefused(
-                f"движок вернул {rows} строк логитов на {expected} "
-                f"последовательностей (форма {shape}); соответствие строки и "
-                "запроса держится только на порядке батча, а он уже разошёлся")
-        return found
-    raise RunnerRefused(
-        f"шаг не отдал логитов, а вернул {type(answer).__name__}; "
         "в этой версии vLLM они лежат где-то ещё")
 
 
@@ -1106,20 +1115,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                         if args.load_hidden else None)
             answer["последовательностей в батче"] = len(prompts)
             answer["токенов в батче"] = sum(len(ids) for ids in prompts)
-            hidden, logits = _prompts(shard, prompts, incoming=incoming)
+            hidden, chosen = _prompts(shard, prompts, incoming=incoming)
             if hidden is not None:
                 answer["отдала"] = "скрытые состояния"
                 answer["тензоры"] = sorted(hidden.tensors)
                 if args.dump_hidden:
                     answer["сложено"] = _save_hidden(hidden.tensors, args.dump_hidden)
-            if logits is not None:
-                answer["отдала"] = "логиты"
-                answer["форма логитов"] = list(getattr(logits, "shape", []))
-                # По строке на последовательность, в порядке батча. Печатаем
-                # выбранные токены: одинаковые токены на разных промптах —
-                # первый признак, что батч склеился в одну последовательность.
-                answer["токены"] = [int(row.argmax().item()) for row in
-                                    (logits if logits.dim() > 1 else logits[None])]
+            if chosen is not None:
+                answer["отдала"] = "токены"
+                # По токену на промпт, в порядке батча (температура 0 —
+                # argmax). Одинаковые токены на разных промптах — первый
+                # признак, что батч склеился в одну последовательность.
+                answer["токены"] = [chosen[f"проверка-{index}"]
+                                    for index in range(len(prompts))]
     except RunnerRefused as exc:
         print(f"не вышло: {exc}")
         return 2

@@ -309,16 +309,19 @@ def test_отвечает_только_нулевой_и_с_процессора
     assert second.model_runner.executed, "считать обязан и ненулевой"
 
 
-def test_последняя_стадия_отдаёт_логиты_копией(fake_vllm):
+def test_последняя_стадия_отдаёт_токены_сэмплера_vllm(fake_vllm):
     worker = _worker(fake_vllm, start=24, end=36)
     worker.model_runner.answer = None
-    worker.model_runner.execute_model_state = types.SimpleNamespace(
-        logits=_Tensor("логиты", "cuda:0"))
-    worker.model_runner.sample_tokens = lambda _grammar: setattr(
-        worker.model_runner, "execute_model_state", None)
-    hidden, logits = worker.stage_step("батч", {"hidden_states": _Tensor("h")},
+    worker.model_runner.execute_model_state = types.SimpleNamespace(logits="л")
+
+    def sample_tokens(_grammar):
+        worker.model_runner.execute_model_state = None
+        return types.SimpleNamespace(req_ids=["q"], sampled_token_ids=[[42]])
+
+    worker.model_runner.sample_tokens = sample_tokens
+    hidden, chosen = worker.stage_step("батч", {"hidden_states": _Tensor("h")},
                                        expected=1)
-    assert hidden is None and logits.where == "cpu"
+    assert hidden is None and chosen == {"q": 42}
     assert worker.model_runner.execute_model_state is None, "шаг не закрыт"
 
 

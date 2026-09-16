@@ -11,7 +11,7 @@ import pytest
 from looma_stage.engine import EngineRefused, build
 
 
-CONTRACT = ("step_batch", "sample_batch", "sample", "free", "active_requests")
+CONTRACT = ("step_batch", "sample_batch", "free", "active_requests")
 
 
 def test_переносимый_исполнитель_удовлетворяет_шву():
