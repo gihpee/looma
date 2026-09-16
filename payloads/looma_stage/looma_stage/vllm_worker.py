@@ -70,16 +70,9 @@ def worker_class():
         return _CLASS
 
     import torch
-    import torch._dynamo
     from vllm.v1.worker.gpu_worker import Worker
 
     from looma_stage import vllm_engine, vllm_patch
-
-    # На узле нет компилятора, а vLLM при TP>1 зовёт функцию под
-    # @torch.compile (см. vllm_engine.forbid_compile). Флаг проверяется на
-    # каждом вызове, так что ставить его здесь не поздно, даже если torch уже
-    # импортирован.
-    torch._dynamo.config.disable = True
 
     class StageWorker(Worker):
         """Штатный воркер vLLM плюс срез слоёв и шаг с тензорами снаружи."""

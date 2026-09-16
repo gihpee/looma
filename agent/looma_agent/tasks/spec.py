@@ -3,6 +3,8 @@
 A spec is data only. Nothing here touches the machine — deciding whether the
 node can honour it belongs to the registry, and carrying it out belongs to the
 runner.
+
+(ТИПИЗИРОВАННЫЙ КОНТРАКТ МЕЖДУ ОРКЕСТРАТОРОМ И АГЕНТОМ)
 """
 
 from __future__ import annotations

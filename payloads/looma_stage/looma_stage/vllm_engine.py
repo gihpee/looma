@@ -417,29 +417,62 @@ def _build_config(model_path: str, *, dtype: str, max_model_len: int,
     )
 
 
-def forbid_compile() -> None:
-    """Не давать torch.compile'у собирать ядра: на узле нет компилятора.
+#: Куда кладётся обёртка компилятора. Каталог с коротким путём есть у каждой
+#: задачи (агент даёт его под unix-сокеты); тут он просто удобен: живёт
+#: столько же, сколько задача, и точно доступен ей на запись.
+COMPILER_WRAPPER = "looma-cc"
 
-    Со стенда (nv3, 2 карты): модель поднялась, а первый шаг упал с
-        Failed to find C compiler. Please specify via CC environment variable
-    из недр Triton. Виновник — `VocabParallelEmbedding.forward` в vLLM: при
-    `tp_size > 1` он зовёт `get_masked_input_and_mask`, обёрнутую в
-    `@torch.compile(backend="inductor")`. Inductor генерирует Triton-ядро,
-    Triton при первом запуске компилирует свой C-модуль — и ему нужен `cc`.
-    На одной карте ветка не выполняется, поэтому раньше это не всплывало.
 
-    Функция чисто поэлементная и в eager считается так же, только без
-    слияния в одно ядро: одна операция на шаг над индексами токенов. Ставить
-    ради неё gcc в образ агента — плюс полторы сотни мегабайт на каждый узел.
+def provide_compiler() -> str:
+    """Дать Triton C-компилятор. Возвращает путь к нему или пустую строку.
 
-    Переменную читает `torch._dynamo.config` при импорте, поэтому ставится
-    ДО подъёма воркеров — они наследуют окружение. В самом воркере флаг
-    дублируется прямо в конфиге (см. vllm_worker): на случай, если torch там
-    уже импортирован к моменту, когда до этого дошло.
+    Со стенда, дважды. Qwen3 при TP=2: `VocabParallelEmbedding` зовёт функцию
+    под `@torch.compile`, inductor строит Triton-ядро, Triton ищет `cc`.
+    gpt-oss-20b: Triton зван напрямую — маршрутизация экспертов у MoE и
+    внимание с sinks на картах без FlashAttention-3 в vLLM 0.14 реализованы
+    только Triton-ядрами. Обходить это запретом torch.compile (так было
+    закрыто первое) бесполезно против второго, и вообще неправильно: Triton
+    компилирует свой C-модуль один раз, ему просто нужен компилятор.
+    Плотные модели на одной карте на это не наступают — потому и не всплывало.
+
+    Компилятор ищется так же, как ищет его сам Triton (`$CC`, потом gcc или
+    clang в PATH). Нет — берётся `zig cc` из pip-пакета `ziglang`, который
+    оркестратор ставит в окружение vLLM: пишется обёртка-скрипт, и CC
+    указывает на неё. Обёртка, а не прямой путь: CC для Triton — один
+    исполняемый файл, а `zig cc` — это `python -m ziglang cc`.
+
+    Ставится ДО подъёма воркеров: они наследуют окружение, а компилируют
+    именно они.
     """
     import os
+    import shutil
+    import stat
+    import sys
 
-    os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+    found = os.environ.get("CC") or shutil.which("gcc") or shutil.which("clang")
+    if found:
+        return found
+    try:
+        import ziglang  # noqa: F401  — нужен только факт установки
+    except ImportError:
+        logger.warning(
+            "на узле нет C-компилятора и нет пакета ziglang: MoE-модели и "
+            "модели с attention sinks упадут на первом шаге с «Failed to find "
+            "C compiler». Плотные модели это не трогает")
+        return ""
+    where = os.environ.get("LOOMA_TASK_TMP") or os.environ.get("TMPDIR") or "/tmp"
+    path = os.path.join(where, COMPILER_WRAPPER)
+    try:
+        with open(path, "w") as handle:
+            handle.write(f'#!/bin/sh\nexec "{sys.executable}" -m ziglang cc "$@"\n')
+        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except OSError as exc:
+        logger.warning("обёртку компилятора не записать в %s (%s); Triton "
+                       "останется без компилятора", where, exc)
+        return ""
+    os.environ["CC"] = path
+    logger.info("C-компилятор для Triton: zig cc из ziglang (%s)", path)
+    return path
 
 
 def start_executor(config):
@@ -620,7 +653,7 @@ def load_shard(model_path: str, *, start_layer: int, end_layer: int,
                                   "num_model_layers": num_model_layers})
     _hold_config(config)
     warn_if_shm_tight(cards)
-    forbid_compile()
+    provide_compiler()
 
     driver = StageDriver(start_executor(config), cards=cards,
                          is_first=is_first, is_last=is_last)

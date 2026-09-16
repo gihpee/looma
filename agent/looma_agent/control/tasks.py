@@ -134,10 +134,10 @@ class TaskCommands:
 
     def _path_line(self, peer_id: str) -> str:
         info = getattr(self.peers, "describe", lambda _p: {})(peer_id) or {}
-        путь = ("прямой адрес есть" if info.get("direct_addr")
+        way = ("прямой адрес есть" if info.get("direct_addr")
                 else "только через реле" if "direct_addr" in info else "адреса неизвестны")
         rtt = info.get("rtt_ms")
-        return (f"{peer_id[:12]} — {путь}"
+        return (f"{peer_id[:12]} — {way}"
                 + (f", RTT {rtt:.0f} мс" if rtt else ""))
 
     def _warm_group(self, group) -> None:
@@ -157,32 +157,32 @@ class TaskCommands:
         """
         if self.peers is None:
             return
-        соседи = [m.peer_id for rank, m in group.members.items()
+        neighbours = [m.peer_id for rank, m in group.members.items()
                   if rank != group.rank and m.peer_id]
-        if not соседи:
+        if not neighbours:
             return
 
-        def наводить() -> None:
-            остались = list(соседи)
-            for попытка in range(WARM_ATTEMPTS):
-                остались = [p for p in остались if not self.peers.warm(p)]
-                if not остались:
+        def guide() -> None:
+            remain = list(neighbours)
+            for attempt in range(WARM_ATTEMPTS):
+                remain = [p for p in remain if not self.peers.warm(p)]
+                if not remain:
                     # Каким путём пойдём — прямо в лог, по каждому соседу.
                     # Рантайм в этот момент ещё не занят туннелями, поэтому
                     # спросить его безопасно; во время кластера — уже нет.
                     logger.info("маршруты к соседям по группе %s наведены: %s",
                                 group.group_id, "; ".join(
-                                    self._path_line(p) for p in соседи))
+                                    self._path_line(p) for p in neighbours))
                     return
                 time.sleep(WARM_RETRY_S)
             logger.warning(
                 "к соседям %s маршрут навести не удалось за %.0f с; если они за "
                 "NAT, кластер Ray может не собраться: байтовый туннель через "
                 "реле не открывается",
-                ", ".join(p[:12] for p in остались),
+                ", ".join(p[:12] for p in remain),
                 WARM_ATTEMPTS * WARM_RETRY_S)
 
-        threading.Thread(target=наводить, name=f"warm-{group.group_id}",
+        threading.Thread(target=guide, name=f"warm-{group.group_id}",
                          daemon=True).start()
 
     def input_chunk(self, chunk: agent_pb2.InputChunk) -> None:
@@ -413,9 +413,9 @@ class TaskCommands:
         if not ports and not external:
             raise TaskRefused("в раскладке нет ни одного порта")
         own = hosts.get(group.rank, "")
-        мои = list(ports.get(group.rank, [])) + list(external)
-        if мои:
-            self._task_ports.setdefault(task_id, []).extend(мои)
+        mine = list(ports.get(group.rank, [])) + list(external)
+        if mine:
+            self._task_ports.setdefault(task_id, []).extend(mine)
         # Свой адрес нужен раньше слушателей: на нём поднимется САМ Ray этого
         # ранга, а не наш проброс. Без него `ray start --node-ip-address` падает
         # на «Can't assign requested address» — там, где адреса на петле не
@@ -458,15 +458,15 @@ class TaskCommands:
         ports = self._task_ports.pop(task_id, [])
         if ports:
             self.allowed_ports.difference_update(ports)
-            for порт in ports:
-                self.inbound_host.pop(порт, None)
-        закрыто = self.tunnels.close_task(task_id)
+            for port in ports:
+                self.inbound_host.pop(port, None)
+        closed = self.tunnels.close_task(task_id)
         endpoint = getattr(self._peer_node(), "tunnels", None)
         if endpoint is not None and endpoint is not self.tunnels:
-            закрыто += endpoint.close_task(task_id)
-        if ports or закрыто:
+            closed += endpoint.close_task(task_id)
+        if ports or closed:
             logger.info("задача %s: убрал %d разрешённых портов и %d входящих "
-                        "туннелей", task_id, len(ports), закрыто)
+                        "туннелей", task_id, len(ports), closed)
 
     def _allow_inbound(self, ports: List[int], host: str = "") -> None:
         """Открыть НАШИ порты снаружи. По умолчанию закрыто всё: иначе через

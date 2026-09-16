@@ -235,6 +235,19 @@ def test_vllm_ставится_с_версией():
     assert pinned and "==" in pinned[0], packages
 
 
+def test_vllm_едет_с_компилятором_для_triton():
+    """Со стенда: gpt-oss-20b поднялся, а первый запрос упал из Triton с
+    «Failed to find C compiler». У MoE и моделей с attention sinks Triton —
+    единственная реализация в vLLM. Компилятор — pip-пакетом, а не в образе
+    агента: образ тонкий и обновляется владельцем руками."""
+    from looma.orchestrator.models import TRITON_COMPILER, stage_requirements
+
+    packages = stage_requirements("vllm")
+    assert TRITON_COMPILER in packages and "==" in TRITON_COMPILER
+    assert not any(name.startswith("ziglang") for name in stage_requirements("torch")), \
+        "переносимому движку Triton не нужен"
+
+
 def test_переносимому_движку_vllm_не_ставится():
     """Это гигабайты и полчаса на узел — за то, чем он не будет считать."""
     from looma.orchestrator.models import stage_requirements

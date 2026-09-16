@@ -30,6 +30,9 @@ pp_group.is_last_rank     строить ли lm_head
 
 ## Все карты узла: tensor parallelism внутри, конвейер снаружи
 
+Подробно — история изменений, устройство, замеры и ловушки со стенда — в
+[TENSOR_PARALLEL.md](TENSOR_PARALLEL.md). Здесь коротко.
+
 Между машинами — pipeline parallelism: у каждой свой диапазон слоёв,
 активации ходят через агента. Внутри машины — **tensor parallelism**: стадия
 поднимается через штатный исполнитель vLLM (`MultiprocExecutor`) с
@@ -124,7 +127,7 @@ SIGBUS без единой строки в логе. Стадия предупр
 | Симптом | Причина |
 |---|---|
 | `not exists in the runnable of cudagraph wrapper` | спецификацию кэша спрашивали у модели, а она под обёрткой; теперь её спрашивает сам воркер vLLM (`get_kv_cache_spec`), как в штатном движке |
-| `Failed to find C compiler` из Triton на первом шаге при TP>1 | `VocabParallelEmbedding` при `tp_size > 1` зовёт функцию под `@torch.compile(backend="inductor")`; на узле нет `cc`. Стадия ставит `TORCH_COMPILE_DISABLE=1` воркерам и `torch._dynamo.config.disable` в них — функция считается в eager |
+| `Failed to find C compiler` из Triton на первом шаге (Qwen3 при TP>1 — через `torch.compile` в `VocabParallelEmbedding`; gpt-oss/Mixtral/любой MoE и модели с attention sinks на картах без FA3 — Triton напрямую) | на узле нет `cc`, а Triton компилирует свой C-модуль при первом ядре. Компилятор едет в окружение vLLM pip-пакетом `ziglang` (`TRITON_COMPILER` в оркестраторе), стадия пишет обёртку и ставит `CC` (`provide_compiler`). См. [warning/triton-compiler.md](../warning/triton-compiler.md) |
 | `WorkerProc initialization failed… see stack trace` | воркер упал на подъёме; причина — в его логе выше по выводу (строки `WorkerProc failed`), сюда доходит только общая фраза |
 | воркер исчез молча, стадия ждёт | SIGBUS на записи в переполненный `/dev/shm` (см. выше) или зависшая NCCL-коллектива; шаг ограничен `STEP_TIMEOUT_S`, чтобы второе не длилось вечно |
 | `IndexError` в `attn_groups[0]` | сделана только планировщиковая половина кэша |

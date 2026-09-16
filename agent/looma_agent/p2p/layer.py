@@ -181,11 +181,11 @@ class PeerLayer:
             return
         # Свежие, а не запомненные при старте: ради этого всё и откладывалось.
         try:
-            видно = self.node.visible_addrs()
+            reached = self.node.visible_addrs()
         except Exception:
-            видно = list(identity.visible_addrs)
-        if видно:
-            identity = replace(identity, visible_addrs=видно)
+            reached = list(identity.visible_addrs)
+        if reached:
+            identity = replace(identity, visible_addrs=reached)
         if identity.symmetric_nat:
             logger.warning(
                 "this node is behind a symmetric NAT: peers cannot open a direct "

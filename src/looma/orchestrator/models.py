@@ -260,6 +260,26 @@ VLLM_TORCH = ("torch==2.9.1", "torchvision==0.24.1", "torchaudio==2.9.1")
 # годный для одного узла, сделал бы неустановимым другой.
 STAGE_REQUIREMENTS = ("torch", "transformers", "safetensors", "huggingface-hub")
 
+# C-компилятор для Triton — pip-пакетом, а не в образе агента.
+#
+# Triton при первом запуске любого своего ядра компилирует маленький C-модуль
+# (`cuda_utils`) и без компилятора падает: «Failed to find C compiler». В
+# образе агента компилятора нет намеренно — образ тонкий, и владелец узла
+# обновляет его руками. У плотных моделей (Qwen3) Triton на горячем пути не
+# нужен, у MoE (gpt-oss, Mixtral, DeepSeek) и у моделей с attention sinks —
+# единственная реализация в vLLM, обойти нельзя.
+#
+# `ziglang` — колесо с `zig cc` внутри (clang-совместимый компилятор, ~90 МБ),
+# ставится как обычный пакет в окружение задачи. Стадия сама пишет обёртку и
+# ставит CC на неё (looma_stage/vllm_engine.py: provide_compiler). Проверено
+# на стенде (nv3): cuda_utils Triton собирается, одно безобидное
+# предупреждение про _POSIX_C_SOURCE.
+#
+# С версией — по той же причине, что и vLLM: отпечаток окружения считается
+# от строк, и непинованный пакет означал бы разные компиляторы под одним
+# именем каталога.
+TRITON_COMPILER = "ziglang==0.16.0"
+
 
 def stage_requirements(engine: str) -> List[str]:
     """Что поставить на узле под этот движок."""
@@ -268,7 +288,7 @@ def stage_requirements(engine: str) -> List[str]:
     # Свой torch вместо непинованного: иначе первый проход поставит с индекса
     # одну версию, а vLLM вторым проходом стянет другую с PyPI.
     rest = [name for name in STAGE_REQUIREMENTS if name != "torch"]
-    return [*VLLM_TORCH, *rest, VLLM_PIN]
+    return [*VLLM_TORCH, *rest, VLLM_PIN, TRITON_COMPILER]
 
 
 def cuda_tuple(version: str) -> Optional[Tuple[int, int]]:

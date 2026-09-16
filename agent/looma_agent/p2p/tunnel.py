@@ -130,11 +130,11 @@ class Endpoint:
         # на петлю, и тогда оба локальных адреса отвечают отказом о работающем
         # сервере.
         candidates = [self.host_for(port) or "127.0.0.1"]
-        for спутник in ("127.0.0.1", _own_address()):
-            if спутник and спутник not in candidates:
-                candidates.append(спутник)
+        for companion in ("127.0.0.1", _own_address()):
+            if companion and companion not in candidates:
+                candidates.append(companion)
         sock, refusals = None, []
-        for место, host in enumerate(candidates):
+        for place, host in enumerate(candidates):
             # Первому — полный срок, запасным — короткий, и вот почему.
             #
             # Ray ждёт соединения ПЯТЬ секунд и потом объявляет узел
@@ -144,7 +144,7 @@ class Endpoint:
             # сдавался, ни разу не попав в окно, когда голова уже готова.
             # Раньше отказ был мгновенным, Ray переоткрывал соединение сотни
             # раз за минуту и попадал.
-            срок = CONNECT_TIMEOUT_S if место == 0 else SPARE_TIMEOUT_S
+            срок = CONNECT_TIMEOUT_S if place == 0 else SPARE_TIMEOUT_S
             try:
                 sock = socket.create_connection((host, port), timeout=срок)
                 break

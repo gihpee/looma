@@ -632,23 +632,57 @@ def test_старая_версия_закрывать_нечего():
                                                    execute_model_state=None))
 
 
-def test_воркеры_наследуют_запрет_компиляции(monkeypatch):
-    """Переменную torch читает при импорте, воркеры — отдельные процессы:
-    ставить её надо до их подъёма, у себя."""
-    monkeypatch.delenv("TORCH_COMPILE_DISABLE", raising=False)
+# ------------------------------------------------------ компилятор для Triton
+def test_компилятор_из_ziglang_когда_своего_нет(monkeypatch, tmp_path):
+    """Со стенда: gpt-oss-20b (MoE + attention sinks) упал на первом шаге с
+    «Failed to find C compiler» — Triton зван напрямую, запрет torch.compile
+    тут не при чём. Компилятор едет pip-пакетом, обёртка пишется задачей."""
+    import sys
+    import types
+
+    monkeypatch.delenv("CC", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setitem(sys.modules, "ziglang", types.ModuleType("ziglang"))
+    monkeypatch.setenv("LOOMA_TASK_TMP", str(tmp_path))
+
+    path = vllm_engine.provide_compiler()
+
+    import os
+    assert path == str(tmp_path / vllm_engine.COMPILER_WRAPPER)
+    assert os.environ["CC"] == path, "воркеры берут CC из окружения"
+    assert os.access(path, os.X_OK)
+    text = open(path).read()
+    assert text.startswith("#!/bin/sh") and "-m ziglang cc" in text
+    assert sys.executable in text, "zig зовётся тем же интерпретатором, где он стоит"
+
+
+def test_свой_компилятор_не_перекрывается(monkeypatch):
+    monkeypatch.setenv("CC", "/usr/bin/cc")
+    assert vllm_engine.provide_compiler() == "/usr/bin/cc"
+    monkeypatch.delenv("CC")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/gcc" if name == "gcc" else None)
+    assert vllm_engine.provide_compiler() == "/usr/bin/gcc"
+
+
+def test_без_ziglang_предупреждение_а_не_падение(monkeypatch, caplog):
+    """Плотные модели без компилятора работают — отказывать нельзя. Но пусть
+    в логе будет, почему MoE упадёт."""
+    import logging
+    import sys
+
+    monkeypatch.delenv("CC", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setitem(sys.modules, "ziglang", None)    # ImportError при импорте
+    with caplog.at_level(logging.WARNING, logger="looma_stage.vllm_engine"):
+        assert vllm_engine.provide_compiler() == ""
+    assert "ziglang" in caplog.text and "MoE" in caplog.text
+
+
+def test_компилятор_даётся_до_воркеров(monkeypatch):
     order = []
-    monkeypatch.setattr(vllm_engine, "forbid_compile",
-                        lambda: order.append("запрет"))
+    monkeypatch.setattr(vllm_engine, "provide_compiler",
+                        lambda: order.append("компилятор") or "")
     _loading(monkeypatch, built=18, order=order)
     vllm_engine.load_shard("модель", start_layer=0, end_layer=18,
                            num_model_layers=36)
-    assert order.index("запрет") < order.index("воркеры")
-
-
-def test_запрет_не_перекрывает_выставленное_оператором(monkeypatch):
-    monkeypatch.setenv("TORCH_COMPILE_DISABLE", "0")
-    vllm_engine.forbid_compile()
-    assert __import__("os").environ["TORCH_COMPILE_DISABLE"] == "0"
-    monkeypatch.delenv("TORCH_COMPILE_DISABLE")
-    vllm_engine.forbid_compile()
-    assert __import__("os").environ["TORCH_COMPILE_DISABLE"] == "1"
+    assert order.index("компилятор") < order.index("воркеры")

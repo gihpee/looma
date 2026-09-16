@@ -172,12 +172,12 @@ class TaskRegistry:
         from looma_agent.tasks import runner as runner_mod
         from looma_agent.tasks.directory import _scratch_name
 
-        убито = 0
+        killed = 0
         for pid in runner_mod._processes_of_any():
             runner_mod._signal(pid, signal.SIGKILL)
-            убито += 1
+            killed += 1
 
-        каталогов = 0
+        dirs = 0
         try:
             for entry in self.root.iterdir():
                 if not entry.is_dir():
@@ -186,7 +186,7 @@ class TaskRegistry:
                 shutil.rmtree(short, ignore_errors=True)
                 try:
                     shutil.rmtree(entry)
-                    каталогов += 1
+                    dirs += 1
                 except OSError:
                     logger.warning("не убрал остаток задачи %s", entry, exc_info=True)
         except FileNotFoundError:
@@ -197,14 +197,14 @@ class TaskRegistry:
             for short in Path("/tmp").glob("looma-????????"):
                 if short.is_dir():
                     shutil.rmtree(short, ignore_errors=True)
-                    каталогов += 1
+                    dirs += 1
         except OSError:
             pass
 
-        if убито or каталогов:
+        if killed or dirs:
             logger.info("уборка после прошлой жизни: снял %d процесс(ов), "
-                        "убрал %d каталог(ов)", убито, каталогов)
-        return {"processes": убито, "directories": каталогов}
+                        "убрал %d каталог(ов)", killed, dirs)
+        return {"processes": killed, "directories": dirs}
 
     # ----------------------------------------------------------------- submit
     def submit(self, spec: TaskSpec, deliver_input=None, group=None) -> Task:
