@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 import types
 
@@ -381,6 +382,26 @@ def test_известные_поля_доходят():
 
     made = vllm_engine._config_with(Новый, model="м", enforce_eager=True)
     assert made.enforce_eager is True
+
+
+def test_поля_initvar_доходят_до_конструктора():
+    """Со стенда: у SchedulerConfig `is_encoder_decoder` и `max_model_len` —
+    InitVar. Конструктор их требует, `dataclasses.fields()` не показывает;
+    отброшенные как неизвестные, они уронили подъём на «Field required»."""
+    # `dataclasses` нужен в глобалах модуля: с отложенными аннотациями
+    # InitVar распознаётся по имени модуля, а локальный импорт не виден.
+    @dataclasses.dataclass
+    class Планировщик:
+        max_num_seqs: int = 0
+        max_model_len: dataclasses.InitVar[int] = 0
+        is_encoder_decoder: dataclasses.InitVar[bool] = False
+
+        def __post_init__(self, max_model_len, is_encoder_decoder):
+            self.seen = (max_model_len, is_encoder_decoder)
+
+    made = vllm_engine._config_with(Планировщик, max_num_seqs=4, max_model_len=4096,
+                                    is_encoder_decoder=False, async_scheduling=False)
+    assert made.seen == (4096, False) and made.max_num_seqs == 4
 
 
 def test_не_датакласс_собирается_как_есть():

@@ -311,13 +311,22 @@ def _config_with(kind, **options):
     поднятие целиком — сообщением про имя, а не про то, что версия другая.
     Отброшенное называется вслух: молча потерянный `enforce_eager` вернул бы
     захват графов и падение внутри него.
+
+    «Есть ли поле» спрашивается у КОНСТРУКТОРА, а не у `dataclasses.fields`.
+    Со стенда: у `SchedulerConfig` поля `is_encoder_decoder` и `max_model_len`
+    объявлены как `InitVar` — конструктор их требует, а `fields()` не
+    показывает. Отброшенные как «неизвестные», они уронили подъём на
+    «Field required» — ровно то, от чего эта функция должна защищать.
     """
-    import dataclasses
+    import inspect
 
     try:
-        known = {field.name for field in dataclasses.fields(kind)}
-    except TypeError:
+        parameters = inspect.signature(kind).parameters
+    except (TypeError, ValueError):
         return kind(**options)
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return kind(**options)
+    known = set(parameters)
     dropped = sorted(set(options) - known)
     if dropped:
         logger.warning("%s не знает про %s — эта версия vLLM устроена иначе",
