@@ -54,3 +54,18 @@ def test_выбор_оператора_не_перекрывается(monkeypat
     _allow_mps_fallback()
 
     assert os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] == "0"
+
+
+# ------------------------------------------------------------ метаданные
+def test_шаблон_чата_отдельным_файлом_качается_с_метаданными():
+    """Со стенда: gpt-oss-20b хранит шаблон чата в chat_template.jinja, а не в
+    tokenizer_config.json. Без него токенизатор поднимался без шаблона, стадия
+    молча склеивала промпт плоским текстом, и модель отвечала чушью про
+    «формат разговора» — при том что forward и decode были верны."""
+    from looma_stage.loader import _METADATA_PATTERNS
+    from fnmatch import fnmatch
+
+    for name in ("chat_template.jinja", "tokenizer_config.json", "config.json",
+                 "tokenizer.json", "model.safetensors.index.json"):
+        assert any(fnmatch(name, pattern) for pattern in _METADATA_PATTERNS), name
+    assert not any(fnmatch("model-00001-of-00002.safetensors", p) for p in _METADATA_PATTERNS)

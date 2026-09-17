@@ -553,7 +553,14 @@ class ShardModel:
         raise RuntimeError("tie_word_embeddings=True but no embedding weights found")
 
 
-_METADATA_PATTERNS = ["*.json", "*.model", "*.txt", "tokenizer*"]
+# Что считать метаданными и качать всегда. `*.jinja` — не мелочь: свежий
+# transformers сохраняет шаблон чата отдельным файлом `chat_template.jinja`,
+# а не внутри tokenizer_config.json. Без него токенизатор загружается БЕЗ
+# шаблона, и стадия молча склеивает промпт плоским текстом `user: …` —
+# модель, обученная на своём формате, отвечает на такое чушью. Со стенда:
+# gpt-oss-20b (формат Harmony) выдумывал диалоги про «формат разговора», а
+# Qwen3, у которого шаблон внутри json, отвечал нормально.
+_METADATA_PATTERNS = ["*.json", "*.model", "*.txt", "*.jinja", "tokenizer*"]
 
 
 def resolve_model_path(

@@ -545,6 +545,21 @@ def _as_token_ids(encoded) -> List[int]:
     return encoded
 
 
+_no_template_said = False
+
+
+def _warn_no_template() -> None:
+    global _no_template_said
+    if _no_template_said:
+        return
+    _no_template_said = True
+    logger.warning(
+        "у токенизатора нет шаблона чата: промпт склеивается плоским текстом "
+        "«role: content». Для базовой модели это нормально; instruct-модель "
+        "на такое отвечает чушью. Если шаблон у модели есть, проверьте, что на "
+        "узел доехал chat_template.jinja или tokenizer_config.json с ним")
+
+
 def _encode_chat(
     tokenizer, messages: List[dict], template_kwargs: Optional[dict] = None
 ) -> List[int]:
@@ -564,6 +579,12 @@ def _encode_chat(
                     **(template_kwargs or {}),
                 )
             )
+        # Не молча. Плоский текст — законный путь для базовой модели без
+        # шаблона, но у instruct-модели он ломает ответ целиком, и по ответу
+        # этого не понять: со стенда, gpt-oss выдумывал диалоги про «формат
+        # разговора», пока шаблон просто не доехал на узел (loader,
+        # _METADATA_PATTERNS). Один раз на процесс, а не на каждый запрос.
+        _warn_no_template()
     except Exception:
         logger.warning(
             "chat template failed; falling back to plain concatenation", exc_info=True
