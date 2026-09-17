@@ -999,12 +999,37 @@ def _prompts(shard: LoadedShard, prompts: List[List[int]], *, incoming=None):
     следующая стадия, собрав батч из тех же промптов. В этом и смысл проверки:
     состав батча не пересчитывается на каждой стадии, а повторяется, и если бы
     он разъехался, тензоры пришли бы не той длины.
+
+    Возвращает `(тензоры, токены, батч)` — батч нужен, чтобы продолжить
+    decode-шагами (`_continue`).
     """
     from looma_stage.scheduler import Sequence
 
     batch = [Sequence(request_id=f"проверка-{index}", prompt_ids=list(ids))
              for index, ids in enumerate(prompts)]
-    return step(shard, batch, incoming=incoming, first_step=True)
+    hidden, chosen = step(shard, batch, incoming=incoming, first_step=True)
+    return hidden, chosen, batch
+
+
+def _continue(shard: LoadedShard, batch, chosen: dict, steps: int) -> List[List[int]]:
+    """Столько-то decode-шагов вслед за prefill, при температуре 0.
+
+    Тем же путём, что и сервер: токен с прошлого шага дописывается в
+    последовательность, батч собирается заново, воркеры считают один токен.
+    Ради проверки, которую одним prefill не сделать: со стенда, gpt-oss на
+    двух картах отдавал верный первый токен и чушь дальше — то есть ломался
+    не forward, а именно продолжение.
+    """
+    made = [[chosen[sequence.request_id]] for sequence in batch]
+    for sequence, tokens in zip(batch, made):
+        sequence.output_ids.append(tokens[0])
+    for _ in range(max(0, steps)):
+        _hidden, chosen = step(shard, batch, first_step=False)
+        for sequence, tokens in zip(batch, made):
+            token = chosen[sequence.request_id]
+            tokens.append(token)
+            sequence.output_ids.append(token)
+    return made
 
 
 def _parse_prompts(text: str) -> List[List[int]]:
@@ -1104,6 +1129,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="куда сложить промежуточные тензоры")
     parser.add_argument("--load-hidden", default="",
                         help="откуда их взять — для стадии, которая не первая")
+    parser.add_argument("--steps", type=int, default=0,
+                        help="сколько decode-шагов сделать после prefill (только "
+                             "на стадии, которая и первая, и последняя)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO,
@@ -1124,7 +1152,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         if args.load_hidden else None)
             answer["последовательностей в батче"] = len(prompts)
             answer["токенов в батче"] = sum(len(ids) for ids in prompts)
-            hidden, chosen = _prompts(shard, prompts, incoming=incoming)
+            hidden, chosen, batch = _prompts(shard, prompts, incoming=incoming)
             if hidden is not None:
                 answer["отдала"] = "скрытые состояния"
                 answer["тензоры"] = sorted(hidden.tensors)
@@ -1137,6 +1165,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 # признак, что батч склеился в одну последовательность.
                 answer["токены"] = [chosen[f"проверка-{index}"]
                                     for index in range(len(prompts))]
+                if args.steps:
+                    if not (shard.is_first and shard.is_last):
+                        raise RunnerRefused(
+                            "продолжать decode-шагами можно только на стадии, "
+                            "которая держит всю модель")
+                    answer["продолжение"] = _continue(shard, batch, chosen, args.steps)
     except RunnerRefused as exc:
         print(f"не вышло: {exc}")
         return 2
