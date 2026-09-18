@@ -47,6 +47,7 @@ def группа(rank: int = 0) -> Group:
 def хранитель(peers) -> TaskCommands:
     keeper = TaskCommands.__new__(TaskCommands)
     keeper.peers = peers
+    keeper.links = None
     return keeper
 
 
@@ -119,3 +120,36 @@ def test_прогрев_называет_путь_и_rtt_к_каждому_со�
     assert дождаться(lambda: "наведены" in caplog.text)
     assert "12D3KooWDee4 — прямой адрес есть, RTT 75 мс" in caplog.text
     assert "12D3KooWM7Bs — только через реле, RTT 75 мс" in caplog.text
+
+
+def test_прогрев_сообщает_таблице_маршрутов_каким_вышло_соединение(caplog):
+    """Два агента за одним роутером снаружи оба «недостижимы», а между собой у
+    них прямое соединение. Таблица маршрутов об этом узнаёт от прогрева, а
+    не гадает по топологии."""
+    import logging
+
+    from looma_agent.p2p.links import LinkTable, Neighbour
+
+    caplog.set_level(logging.INFO)
+
+    class СоседиСОписанием(Соседи):
+        def describe(self, peer_id):
+            return {"direct_addr": peer_id.endswith("nv3"), "rtt_ms": 1.0}
+
+    peers = СоседиСОписанием(отвечают={"12D3KooWDee4-nv3", "12D3KooWM7Bs-nv2"})
+    keeper = хранитель(peers)
+    keeper.links = LinkTable()
+    keeper.links.attach(send_direct=lambda peer, message: None, dial=None)
+    группа_ = Group(group_id="g1", rank=0, members={
+        0: Member(rank=0, node_id="me", peer_id="12D3KooWXXXX-me"),
+        1: Member(rank=1, node_id="nv3", peer_id="12D3KooWDee4-nv3", addrs=("/ip4/10.0.0.5/tcp/1",)),
+        2: Member(rank=2, node_id="nv2", peer_id="12D3KooWM7Bs-nv2", addrs=("/ip4/10.0.0.6/tcp/1",)),
+    })
+    keeper._route_group(группа_)
+    # По топологии — никто не достижим: всё через оркестратор.
+    assert not keeper.links.direct_available("g1", 1)
+    keeper._warm_group(группа_)
+    assert дождаться(lambda: "наведены" in caplog.text)
+    # Прогрев увидел прямое соединение к nv3 — и только к нему.
+    assert keeper.links.direct_available("g1", 1)
+    assert not keeper.links.direct_available("g1", 2)

@@ -12,8 +12,8 @@ placed, and this holds what it said.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,11 @@ class Member:
     rank: int
     node_id: str
     peer_id: str = ""
+    # Куда звонить и дозвонятся ли — как узел сам о себе объявил. Это то, по
+    # чему таблица маршрутов (`p2p.LinkTable`) решает, идти к соседу прямо
+    # или через оркестратор.
+    addrs: Tuple[str, ...] = field(default_factory=tuple)
+    reachable: bool = False
 
 
 @dataclass(frozen=True)
@@ -87,6 +92,8 @@ def group_from_proto(message) -> Optional[Group]:
     return Group(
         group_id=message.group_id,
         rank=message.rank,
-        members={m.rank: Member(rank=m.rank, node_id=m.node_id, peer_id=m.peer_id)
+        members={m.rank: Member(rank=m.rank, node_id=m.node_id, peer_id=m.peer_id,
+                                addrs=tuple(getattr(m, "addrs", ()) or ()),
+                                reachable=bool(getattr(m, "reachable", False)))
                  for m in message.members},
     )

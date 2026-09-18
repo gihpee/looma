@@ -743,9 +743,16 @@ class AgentHub:
             record.tasks[rank] = task_id
             record.nodes[rank] = node_id
             session = self.sessions[node_id]
+            # Адреса и достижимость — чтобы сосед мог выбрать прямой путь.
+            # Без них агент знает только peer_id, а по одному peer_id его
+            # таблица маршрутов считает соседа недозвонимым, и каждое
+            # сообщение конвейера едет через нас (со стенда: 0 прямых при
+            # прямом соединении libp2p между узлами).
             members.append(agent_pb2.GroupMember(
                 rank=rank, node_id=node_id,
                 peer_id=session.node.peer_id,
+                addrs=list(session.node.visible_addrs),
+                reachable=bool(session.node.reachable),
             ))
         self.groups[group_id] = record
 

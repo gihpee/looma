@@ -120,6 +120,7 @@ class TaskCommands:
         group = group_from_proto(command.group)
         if group is not None:
             self.groups.join(spec.task_id, group)
+            self._route_group(group)
             self._warm_group(group)
         expected = list(command.inputs)
         if expected:
@@ -132,9 +133,40 @@ class TaskCommands:
             name=f"submit-{spec.task_id}", daemon=True,
         ).start()
 
+    def _route_group(self, group) -> None:
+        """Сказать таблице маршрутов, кто соседи по группе и куда им звонить.
+
+        Без этого сообщения задач шли через оркестратор всегда: таблица
+        заполнялась из топологии старого LoadShard, и с переходом на группы
+        задач заполнять её стало некому — при прямом libp2p-соединении
+        между узлами панель честно показывала «0 прямых».
+        """
+        if self.links is None:
+            return
+        from looma_agent.p2p.links import Neighbour
+
+        self.links.set_neighbours(group.group_id, [
+            Neighbour(stage_index=rank, node_id=member.node_id,
+                      peer_id=member.peer_id, addrs=list(member.addrs),
+                      reachable=member.reachable)
+            for rank, member in group.members.items()
+            if rank != group.rank and member.peer_id
+        ])
+
+    def _unroute_group(self, task_id: str) -> None:
+        """Последняя местная задача группы ушла — её маршруты тоже."""
+        group = self.groups.of(task_id)
+        self.groups.leave(task_id)
+        if group is not None and self.links is not None \
+                and group.group_id not in self.groups.groups():
+            self.links.forget(group.group_id)
+
     def _path_line(self, peer_id: str) -> str:
         info = getattr(self.peers, "describe", lambda _p: {})(peer_id) or {}
-        way = ("прямой адрес есть" if info.get("direct_addr")
+        direct = bool(info.get("direct_addr"))
+        if self.links is not None and "direct_addr" in info:
+            self.links.observed_direct(peer_id, direct)
+        way = ("прямой адрес есть" if direct
                 else "только через реле" if "direct_addr" in info else "адреса неизвестны")
         rtt = info.get("rtt_ms")
         return (f"{peer_id[:12]} — {way}"
@@ -209,7 +241,7 @@ class TaskCommands:
     def release(self, command: agent_pb2.ReleaseTask) -> None:
         self.forward.close(command.task_id)
         self.forget_task(command.task_id)
-        self.groups.leave(command.task_id)
+        self._unroute_group(command.task_id)
         self._close_input(command.task_id)
         self.registry.release(command.task_id)
         self._ack(command.command_id, True, "")
@@ -262,7 +294,7 @@ class TaskCommands:
         # держать чужие порты занятыми на машине владельца.
         self.forward.close(spec.task_id)
         self.forget_task(spec.task_id)
-        self.groups.leave(spec.task_id)
+        self._unroute_group(spec.task_id)
 
     def _deliver(self, task_id: str, expected: List[agent_pb2.InputFile]):
         def deliver(inbox: Inbox) -> None:

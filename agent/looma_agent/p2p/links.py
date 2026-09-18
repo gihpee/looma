@@ -115,6 +115,9 @@ class LinkTable:
         # Peers we have already explained ourselves about, so the reason is
         # logged once rather than on every token.
         self._told: Dict[str, bool] = {}
+        # peer_id -> было ли соединение прямым, когда его последний раз
+        # смотрели (см. observed_direct).
+        self._seen_direct: Dict[str, bool] = {}
         self._pending: "queue.Queue" = queue.Queue(maxsize=PENDING_ACKS)
         self._watcher: Optional[threading.Thread] = None
         self.stats = {"direct": 0, "relay": 0, "fallbacks": 0}
@@ -177,6 +180,28 @@ class LinkTable:
             )
             or "empty",
         )
+
+    def forget(self, pipeline_id: str) -> None:
+        """Группа кончилась: её строки больше не нужны. Только её — другие
+        конвейеры этого узла остаются со своими маршрутами."""
+        with self._lock:
+            self._neighbours = {
+                key: value for key, value in self._neighbours.items()
+                if key[0] != pipeline_id
+            }
+
+    def observed_direct(self, peer_id: str, direct: bool) -> None:
+        """Каким соединение к соседу получилось на самом деле.
+
+        Правило `_worth_using` — по топологии: кто-то из двоих принимает
+        входящие. Оно не видит соседа за тем же роутером: оба «недостижимы»
+        снаружи, а между собой у libp2p прямое соединение по локальному
+        адресу (со стенда: два агента на одном ПК, RTT 0 мс — и всё через
+        оркестратор). Прогрев группы спрашивает у lattica, без круга ли
+        соединение, и говорит сюда; это сильнее догадки по топологии.
+        """
+        with self._lock:
+            self._seen_direct[peer_id] = bool(direct)
 
     def neighbour(self, pipeline_id: str, stage_index: int) -> Optional[Neighbour]:
         with self._lock:
@@ -262,6 +287,8 @@ class LinkTable:
         Latency is still measured, and still reported. It just does not decide
         anything: what matters here is topology, and topology is known.
         """
+        if self._seen_direct.get(peer.peer_id):
+            return True
         return bool(peer.reachable or self._self_reachable)
 
     @staticmethod

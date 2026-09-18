@@ -129,6 +129,11 @@ message GroupMember {
   uint32 rank = 1;
   string node_id = 2;
   string peer_id = 3;         // libp2p id, empty when the node has no p2p stack
+  // Where to dial that peer and whether anything can: what the node announced
+  // about itself, as the orchestrator last heard it. Without these a member
+  // is only reachable through the orchestrator, however close it is.
+  repeated string addrs = 4;
+  bool reachable = 5;
 }
 
 message TaskGroup {

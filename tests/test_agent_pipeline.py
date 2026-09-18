@@ -86,6 +86,38 @@ def test_a_group_is_placed_where_it_was_told(two_nodes):
     assert set(group.nodes.values()) == {"node-0", "node-1"}
 
 
+def test_члены_группы_знают_адреса_друг_друга(two_nodes, monkeypatch):
+    """Со стенда: при прямом libp2p-соединении между узлами все сообщения
+    конвейера шли через оркестратор, потому что агент знал о соседе один
+    peer_id, а по нему таблица маршрутов соседа не набирает. Теперь с
+    группой едут адреса и достижимость — как узел сам о себе сообщил."""
+    from looma.proto_gen import agent_pb2
+
+    seen = []
+    for node_id in ("node-0", "node-1"):
+        session = two_nodes.hub.sessions[node_id]
+        session.node.peer_id = f"12D3KooW-{node_id}"
+        session.node.visible_addrs = [f"/ip4/10.0.0.{node_id[-1]}/tcp/4001"]
+        session.node.reachable = node_id == "node-0"
+        original = session.send
+
+        def spy(message, original=original):
+            if message.HasField("run_task"):
+                seen.append(message.run_task.group)
+            original(message)
+
+        monkeypatch.setattr(session, "send", spy)
+
+    two_nodes.hub.submit_group(
+        size=2, command=[sys.executable, "-c", "import time; time.sleep(2)"],
+        timeout_s=60, node_ids=["node-0", "node-1"])
+    assert len(seen) == 2
+    members = {m.rank: m for m in seen[0].members}
+    assert isinstance(members[0], agent_pb2.GroupMember)
+    assert list(members[0].addrs) == ["/ip4/10.0.0.0/tcp/4001"] and members[0].reachable
+    assert list(members[1].addrs) == ["/ip4/10.0.0.1/tcp/4001"] and not members[1].reachable
+
+
 def test_a_group_with_nothing_to_spread_for_may_share_a_node(two_nodes):
     """Two stages on one machine cost no network at all. That is the good case,
     not a placement failure."""
