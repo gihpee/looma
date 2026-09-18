@@ -957,8 +957,13 @@ def main(argv=None) -> None:
     # угадать его снаружи нельзя (loader.best_device).
     parser.add_argument("--device", default=os.environ.get("LOOMA_SHARD_DEVICE", "auto"))
     parser.add_argument("--dtype", default=os.environ.get("LOOMA_SHARD_DTYPE", "float32"))
+    # Сколько ждать соседей и следующий токен. Со стенда, Qwen3-Next на 10
+    # узлов: первый запрос после деплоя компилирует Triton-ядра на каждой
+    # стадии по очереди — минуты, — и 120 с обрывали его на середине. Прогрев
+    # при подъёме (vllm_worker.stage_warm_up) убирает основную часть, но не
+    # всё: форма, которой в прогреве не было, компилируется на запросе.
     parser.add_argument(
-        "--stage-timeout-s", type=float, default=float(os.environ.get("LOOMA_STAGE_TIMEOUT_S", "120"))
+        "--stage-timeout-s", type=float, default=float(os.environ.get("LOOMA_STAGE_TIMEOUT_S", "900"))
     )
     parser.add_argument(
         "--engine",

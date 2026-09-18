@@ -185,6 +185,19 @@ def test_рабочая_половина_заводится_на_всех_вор
     assert settled == [(["раскладка", "раскладка"],)]
 
 
+def test_ядра_греются_после_раскладки_кэша_и_до_первого_запроса(vllm_cache):
+    """Со стенда: без прогрева ядра компилировались на первом запросе на
+    каждой стадии по очереди — десять минут до первого токена. Греть можно
+    только когда кэш уже заведён: прогон с вниманием ходит по его блокам."""
+    from looma_stage.vllm_runner import lay_out_cache
+
+    executor = _Executor(room=[2 ** 30])
+    lay_out_cache(executor, "конфиг", block_size=16, max_model_len=64)
+    methods = [method for method, _args in executor.calls]
+    assert "stage_warm_up" in methods
+    assert methods.index("stage_warm_up") > methods.index("initialize_from_config")
+
+
 def test_без_воркеров_раскладывать_нечего(vllm_cache):
     from looma_stage.vllm_runner import lay_out_cache
 

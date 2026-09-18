@@ -198,6 +198,9 @@ def lay_out_cache(executor, config, *, block_size: int, max_model_len: int):
     configs = get_kv_cache_configs(vllm_config=config, kv_cache_specs=specs,
                                    available_memory=[least] * len(specs))
     executor.collective_rpc("initialize_from_config", args=(configs,))
+    # Ядра под настоящие формы — сейчас, на всех стадиях сразу, а не на
+    # первом запросе по очереди через весь конвейер.
+    executor.collective_rpc("stage_warm_up")
 
     scheduler_config = generate_scheduler_kv_cache_config(configs)
     manager = KVCacheManager(

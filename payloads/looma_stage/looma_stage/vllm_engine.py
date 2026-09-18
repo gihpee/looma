@@ -440,6 +440,35 @@ def _build_config(model_path: str, *, dtype: str, max_model_len: int,
 COMPILER_WRAPPER = "looma-cc"
 
 
+def keep_triton_cache() -> str:
+    """Кэш скомпилированных Triton-ядер — туда, где он переживёт задачу.
+
+    По умолчанию Triton пишет в `~/.triton/cache`, а `HOME` задачи — её
+    рабочий каталог, который агент убирает вместе с ней. Каждый деплой
+    компилировал всё заново на каждом узле: для DeltaNet и MoE это минуты
+    на стадию. Каталог моделей (`HF_HOME`) агент отдаёт задаче именно как
+    постоянный — кладём рядом с весами. Явно заданный `TRITON_CACHE_DIR`
+    не трогается. Возвращает выбранный путь или пустую строку.
+    """
+    import os
+
+    if os.environ.get("TRITON_CACHE_DIR"):
+        return os.environ["TRITON_CACHE_DIR"]
+    home = os.environ.get("HF_HOME", "")
+    if not home or not os.path.isdir(home):
+        return ""
+    path = os.path.join(home, "triton-cache")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        logger.warning("кэш Triton останется в каталоге задачи: %s недоступен (%s)",
+                       path, exc)
+        return ""
+    os.environ["TRITON_CACHE_DIR"] = path
+    logger.info("кэш Triton: %s (переживает задачу)", path)
+    return path
+
+
 def provide_compiler() -> str:
     """Дать Triton C-компилятор. Возвращает путь к нему или пустую строку.
 
@@ -671,6 +700,7 @@ def load_shard(model_path: str, *, start_layer: int, end_layer: int,
     _hold_config(config)
     warn_if_shm_tight(cards)
     provide_compiler()
+    keep_triton_cache()
 
     driver = StageDriver(start_executor(config), cards=cards,
                          is_first=is_first, is_last=is_last)

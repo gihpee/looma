@@ -27,6 +27,7 @@ vLLM, которого на машине без карты нет, а модул
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from looma_stage.vllm_runner import (RunnerRefused, layer_range, replace_pipeline_group,
@@ -191,6 +192,42 @@ def worker_class():
                     f"(не хватает {-room / gib:.1f} ГБ). Дайте стадии меньше "
                     "слоёв, уменьшите max_model_len или max_batched_tokens")
             return room
+
+        def stage_warm_up(self) -> None:
+            """Скомпилировать ядра под формы настоящих батчей до первого запроса.
+
+            Triton собирает ядро под форму при первом вызове: декод (1 токен),
+            префилл (много токенов одной последовательности), и отдельно —
+            длины, кратные 16, и не кратные. Прогревочный замер памяти шёл
+            под одну форму «максимальный батч», и всё остальное компилировалось
+            на первом запросе — на каждой стадии по очереди, потому что
+            следующая не начнёт, пока предыдущая не досчитала. Со стенда: 10
+            стадий × минута = первый токен через десять минут и обрыв по
+            таймауту. Здесь те же прогоны, что vLLM делает под захват графов,
+            но на всех стадиях параллельно и до того, как стадия скажет «готова».
+
+            Не удалось — предупреждение, не отказ: настоящий запрос скажет
+            точнее, а прогрев мог упасть по своей, дежурной причине.
+            """
+            shapes = (
+                # (токенов, смешанный батч): чистый декод одной
+                # последовательности; префилл на 19 + 18 декодов (не кратно
+                # 16, не 1); префилл на 32 + 32 декода (кратно 16).
+                (1, False), (37, True), (64, True),
+            )
+            started = time.perf_counter()
+            for num_tokens, mixed in shapes:
+                try:
+                    with torch.inference_mode():
+                        self.model_runner._dummy_run(
+                            num_tokens, create_mixed_batch=mixed,
+                            force_attention=True)
+                except Exception:
+                    logger.exception("прогрев на %d токенов не удался; ядра под "
+                                     "эту форму соберутся на первом запросе",
+                                     num_tokens)
+            torch.cuda.synchronize(self.device)
+            logger.info("ядра прогреты за %.0f с", time.perf_counter() - started)
 
         # ---------------------------------------------------------- шаг
         def stage_step(self, scheduler_output, incoming: Optional[dict], *,

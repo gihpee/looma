@@ -176,7 +176,8 @@ def fake_vllm(monkeypatch):
 
     torch = module("torch")
     torch.cuda = types.SimpleNamespace(
-        mem_get_info=lambda index: (10 * 2 ** 30, 24 * 2 ** 30))
+        mem_get_info=lambda index: (10 * 2 ** 30, 24 * 2 ** 30),
+        synchronize=lambda device=None: None)
     torch.inference_mode = contextlib.nullcontext
     for name, made in modules.items():
         monkeypatch.setitem(sys.modules, name, made)
@@ -281,6 +282,32 @@ def test_место_под_кэш_берётся_из_прогона_vllm(fake_v
     worker.peak_activation_memory, worker.non_torch_memory = 2 ** 30, 2 ** 29
     assert worker.stage_cache_room() == 3 * 2 ** 30
     assert worker.stage_layers_built() == 12
+
+
+def test_прогрев_идёт_по_формам_декода_и_префилла(fake_vllm):
+    """Один токен (декод), и два смешанных батча — с длиной префилла не
+    кратной 16 и кратной: Triton собирает ядро под каждую из них отдельно."""
+    worker = _worker(fake_vllm)
+    seen = []
+    worker.model_runner._dummy_run = (
+        lambda num_tokens, **kwargs: seen.append((num_tokens, kwargs)))
+    worker.stage_warm_up()
+    assert [n for n, _k in seen] == [1, 37, 64]
+    assert [k["create_mixed_batch"] for _n, k in seen] == [False, True, True]
+    assert all(k["force_attention"] for _n, k in seen)
+
+
+def test_упавший_прогрев_не_роняет_стадию(fake_vllm, caplog):
+    """Настоящий запрос скажет точнее; прогрев мог упасть по своей причине."""
+    worker = _worker(fake_vllm)
+
+    def boom(num_tokens, **_kwargs):
+        raise RuntimeError("dummy run refused")
+
+    worker.model_runner._dummy_run = boom
+    with caplog.at_level("WARNING"):
+        worker.stage_warm_up()
+    assert caplog.text.count("прогрев на") == 3
 
 
 def test_шаг_не_влез_в_долю_это_отказ_на_подъёме(fake_vllm):

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import sys
 import types
 
@@ -702,6 +703,30 @@ def test_компилятор_даётся_до_воркеров(monkeypatch):
     vllm_engine.load_shard("модель", start_layer=0, end_layer=18,
                            num_model_layers=36)
     assert order.index("компилятор") < order.index("воркеры")
+
+
+def test_кэш_triton_кладётся_рядом_с_весами(monkeypatch, tmp_path):
+    """HOME задачи умирает вместе с ней, а HF_HOME агент отдаёт как
+    постоянный: ядра, собранные одним деплоем, достаются следующему."""
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    assert vllm_engine.keep_triton_cache() == str(tmp_path / "triton-cache")
+    assert os.environ["TRITON_CACHE_DIR"] == str(tmp_path / "triton-cache")
+    assert (tmp_path / "triton-cache").is_dir()
+
+
+def test_явный_кэш_triton_не_трогается(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRITON_CACHE_DIR", "/свой/путь")
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    assert vllm_engine.keep_triton_cache() == "/свой/путь"
+    assert not (tmp_path / "triton-cache").exists()
+
+
+def test_без_постоянного_каталога_кэш_остаётся_где_был(monkeypatch):
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    monkeypatch.delenv("HF_HOME", raising=False)
+    assert vllm_engine.keep_triton_cache() == ""
+    assert "TRITON_CACHE_DIR" not in os.environ
 
 
 # ---------------------------------------------------------- раскладка выбора
