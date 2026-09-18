@@ -70,9 +70,30 @@ class ShardExecutor:
         )
 
     # ------------------------------------------------------------- lifecycle
-    def _state(self, request_id: str) -> RequestState:
+    def _new_cache(self):
+        """Кэш запроса — по конфигу среза, как это делает сама модель.
+
+        Пустой `DynamicCache()` дописывает себе слои лениво, из `update()`,
+        которого хватает attention-слоям. Слой DeltaNet (Qwen3-Next) `update`
+        не зовёт: он ждёт, что место под его состояние заведено при создании,
+        и лезет в `layers[idx]` сразу — со стенда, `IndexError: list index out
+        of range` на первом же слое. `DynamicCache(config=…)` заводит по слою
+        нужного типа заранее; конфиг — среза, а не всей модели, иначе типы
+        слоёв разошлись бы с номерами (loader, `build`).
+        """
         from transformers import DynamicCache
 
+        config = getattr(self.shard, "shard_config", None)
+        if config is None:
+            return DynamicCache()
+        try:
+            return DynamicCache(config=config)
+        except TypeError:
+            # Старый transformers, без `config=`: ленивый кэш, и гибридных
+            # моделей в нём всё равно нет.
+            return DynamicCache()
+
+    def _state(self, request_id: str) -> RequestState:
         with self._lock:
             state = self._states.get(request_id)
             if state is None:
@@ -82,7 +103,7 @@ class ShardExecutor:
                     oldest = min(self._states.values(), key=lambda s: s.created_at)
                     self._states.pop(oldest.request_id, None)
                     logger.warning("evicted stale request state %s", oldest.request_id)
-                state = RequestState(request_id=request_id, cache=DynamicCache())
+                state = RequestState(request_id=request_id, cache=self._new_cache())
                 self._states[request_id] = state
             return state
 

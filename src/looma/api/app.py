@@ -40,8 +40,11 @@ from looma.orchestrator.models import (
     split_layers,
     stage_payload,
     stage_requirements,
+    training_refusal,
+    training_stage_bytes,
     vllm_refusal,
 )
+from looma.usage.training import DONE, FAILED, RUNNING, STOPPED, MemoryTrainingJobs
 from looma.orchestrator.connectivity import prefer_meshy, verdict
 from looma.orchestrator.payloads import PayloadMissing, ray_payload
 from looma.orchestrator.rendezvous import relay_addrs
@@ -133,8 +136,11 @@ def _requirements_of(raw) -> list:
 
 def create_app(*, agents=None, releases=None, keystore=None, config=None,
                public_address=None, accounts=None, ledger=None,
-               deployments=None) -> FastAPI:
+               deployments=None, training=None) -> FastAPI:
     app = FastAPI(title="Looma", version="0.2.0")
+    # Задания на дообучение: без базы — в памяти, чтобы форма работала и на
+    # оркестраторе без учётных записей.
+    training = training if training is not None else MemoryTrainingJobs()
     auth = Authenticator(accounts=accounts,
                          emergency_token=getattr(config, "admin_token", "") or "")
 
@@ -1126,6 +1132,205 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
                        "start_layer": s, "end_layer": e}
                       for i, (s, e) in enumerate(ranges)],
         }
+
+    # ------------------------------------------------------------ training
+    TRAIN_MAX_DATASET = 64 * 1024 * 1024
+
+    async def _start_training(raw: dict, *, account_id=None):
+        """Дообучить модель LoRA по конвейеру (docs/TRAINING.md).
+
+        Та же механика, что у развёртывания: узнать модель, выбрать узлы,
+        разрезать слои по памяти, отправить стадии. Отличия: движок `train`,
+        датасет и настройки едут входными файлами, задача кончается сама и
+        оставляет адаптер в результатах головы.
+        """
+        if agents is None:
+            return need_agents()
+        try:
+            model = describe((raw.get("repo") or "").strip())
+        except ModelError as exc:
+            return _error(400, str(exc))
+        precision = (raw.get("precision") or "bf16").strip().lower()
+        if precision not in ("bf16", "nf4"):
+            return _error(400, f"точность {precision!r}: bf16 или nf4")
+        refusal = training_refusal(model, precision)
+        if refusal:
+            return _error(400, refusal)
+
+        dataset_b64 = raw.get("dataset") or ""
+        if not dataset_b64:
+            return _error(400, "нужен датасет: поле dataset — JSONL в base64")
+        try:
+            dataset = base64.b64decode(dataset_b64)
+        except (ValueError, TypeError) as exc:
+            return _error(400, f"датасет не base64: {exc}")
+        if len(dataset) > TRAIN_MAX_DATASET:
+            return _error(413, f"датасет больше {TRAIN_MAX_DATASET // 2**20} МБ; "
+                               "такие пока не принимаем через форму")
+        if not dataset.strip():
+            return _error(400, "датасет пуст")
+
+        available = [n for n in agents.node_list() if n["accepts_tasks"]]
+        if not available:
+            return _error(409, "ни один подключённый узел не берёт задачи")
+        named = list(raw.get("node_ids") or [])
+        if named:
+            by_id = {n["node_id"]: n for n in available}
+            missing = [n for n in named if n not in by_id]
+            if missing:
+                return _error(409, f"эти узлы не подключены или не берут работу: {missing}")
+            chosen = [by_id[n] for n in named]
+        else:
+            stages = int(raw.get("stages") or 1)
+            if stages > len(available):
+                return _error(409, f"просят {stages} стадий, а работу берут {len(available)} узлов")
+            chosen = sorted(available, key=lambda n: -n["vram_free_bytes"])[:stages]
+
+        ranks = expand_ranks(chosen, "torch")
+        try:
+            ranges = split_layers(model.num_layers, len(ranks), [r["vram"] for r in ranks])
+            payload = stage_payload()
+        except ModelError as exc:
+            return _error(400, str(exc))
+
+        schedule = dict(raw.get("schedule") or {})
+        lora = dict(raw.get("lora") or {})
+        max_len = int(raw.get("max_len") or 2048)
+        micro = int(schedule.get("micro_size") or 2)
+        batch = int(schedule.get("batch_size") or 8)
+        # Влезает ли — по каждой стадии, до того как что-то запущено.
+        plan, short = [], []
+        for index, ((start, end), rank) in enumerate(zip(ranges, ranks)):
+            need = training_stage_bytes(
+                model, layers=end - start, is_first=index == 0,
+                is_last=index == len(ranks) - 1, precision=precision,
+                lora_r=int(lora.get("r") or 16), micro_tokens=micro * max_len,
+                micros_in_flight=max(1, -(-batch // micro)))
+            have = int(rank["vram"])
+            plan.append({"rank": index, "node_id": rank["node_id"],
+                         "start_layer": start, "end_layer": end,
+                         "need_bytes": need["total"], "have_bytes": have, "need": need})
+            if need["total"] > have:
+                short.append(f"стадия {index} на {rank['node_id']}: нужно "
+                             f"{need['total'] / 2**30:.1f} ГБ, свободно {have / 2**30:.1f}")
+        if short and not raw.get("force"):
+            hint = ("возьмите nf4" if precision == "bf16" else "добавьте узлов")
+            return _error(409, "не влезает: " + "; ".join(short) + f" — {hint} "
+                               "или уменьшите micro_size/max_len (force=true — всё равно запустить)")
+
+        label = (raw.get("label") or f"train-{model.repo.split('/')[-1]}").strip()
+        config = {
+            "base_model": model.repo, "dataset": "train.jsonl", "max_len": max_len,
+            "precision": precision, "lora": lora, "schedule": schedule,
+            "checkpointing": bool(raw.get("checkpointing", True)), "label": label,
+        }
+        dtype = "bfloat16" if precision in ("bf16", "nf4") else "float32"
+        per_rank = [{
+            "command": [
+                "python", "-m", "looma_stage.server",
+                "--model-id", label, "--weights-uri", model.repo,
+                "--start-layer", str(start), "--end-layer", str(end),
+                "--device", "auto", "--dtype", dtype,
+                "--engine", "train", "--train-config", "train.json",
+                "--num-model-layers", str(model.num_layers),
+            ],
+        } for start, end in ranges]
+        requirements = list(stage_requirements("torch"))
+        if precision == "nf4":
+            requirements.append("bitsandbytes")
+
+        try:
+            record = agents.submit_group(
+                size=len(ranks), command=per_rank[0]["command"], per_rank=per_rank,
+                node_ids=[r["node_id"] for r in ranks], label=label, serve_port=1,
+                inputs={**payload, "train.json": json.dumps(config).encode(),
+                        "train.jsonl": dataset},
+                environment={"kind": "python", "requirements": requirements},
+                resources=None,
+                timeout_s=int(raw.get("timeout_s") or 7 * 24 * 3600),
+                env={"HF_TOKEN": os.environ.get("HF_TOKEN", "")} if os.environ.get("HF_TOKEN") else None,
+            )
+        except AgentError as exc:
+            return _error(409, str(exc))
+        await _start_billing(account_id, record, COMPUTE, nodes=len(chosen),
+                             label=label, gpus=sum(int(n.get("gpus_total") or 1) for n in chosen))
+        remembered = {k: v for k, v in raw.items() if k != "dataset"}
+        remembered["dataset_bytes"] = len(dataset)
+        job = await training.remember(group_id=record.group_id, label=label,
+                                      request=remembered, account_id=account_id)
+        return {**job.as_dict(), "group": record.as_dict(), "model": model.as_dict(),
+                "plan": plan, "warning": "; ".join(short)}
+
+    async def _training_progress(record) -> dict:
+        """progress.json головы, если голова ещё жива или результат лежит."""
+        head_task = record.tasks.get(0)
+        if not head_task:
+            return {}
+        try:
+            payload = await agents.collect(head_task, "progress.json")
+            return json.loads(payload or b"{}")
+        except (AgentError, ValueError):
+            return {}
+
+    async def _training_view(job) -> dict:
+        record = agents.groups.get(job.group_id) if agents is not None else None
+        view = job.as_dict()
+        view["group"] = record.as_dict() if record else None
+        view["finished"] = agents.group_finished(record) if record else True
+        progress = await _training_progress(record) if record else {}
+        view["progress"] = progress
+        # Состояние сводится здесь: голова пишет исход в progress.json, а
+        # запись в базе закрывается по нему один раз.
+        if job.state == RUNNING and progress.get("state") in ("done", "failed"):
+            state = DONE if progress["state"] == "done" else FAILED
+            await training.finish(job.group_id, state=state,
+                                  result=progress.get("result"), error=progress.get("error", ""))
+            view.update(state=state, result=progress.get("result"), error=progress.get("error", ""))
+        elif job.state == RUNNING and record and view["finished"] and not progress:
+            await training.finish(job.group_id, state=FAILED,
+                                  error="задачи кончились, а результата нет — смотрите лог головы")
+            view.update(state=FAILED, error="задачи кончились, а результата нет — смотрите лог головы")
+        head_task = record.tasks.get(0) if record else None
+        if head_task and view.get("result"):
+            base = f"/admin/tasks/{head_task}/results/adapter"
+            view["files"] = {"adapter_config.json": f"{base}/adapter_config.json",
+                             "adapter_model.safetensors": f"{base}/adapter_model.safetensors"}
+        return view
+
+    @app.post("/admin/train")
+    async def admin_train(request: Request,
+                          x_looma_admin_token: str | None = Header(default=None)):
+        return await _start_training(await _body(request),
+                                     account_id=whoami(request).account_id)
+
+    @app.get("/admin/train")
+    async def admin_train_list(x_looma_admin_token: str | None = Header(default=None)):
+        jobs = await training.list()
+        return {"jobs": [await _training_view(job) for job in jobs]}
+
+    @app.get("/admin/train/{group_id}")
+    async def admin_train_one(group_id: str,
+                              x_looma_admin_token: str | None = Header(default=None)):
+        job = await training.get(group_id)
+        if job is None:
+            return _error(404, f"нет обучения {group_id!r}")
+        return await _training_view(job)
+
+    @app.post("/admin/train/{group_id}/stop")
+    async def admin_train_stop(group_id: str,
+                               x_looma_admin_token: str | None = Header(default=None)):
+        job = await training.get(group_id)
+        if job is None:
+            return _error(404, f"нет обучения {group_id!r}")
+        if agents is None:
+            return need_agents()
+        try:
+            await _stop_billing(group_id)
+            record = agents.stop_group(group_id, reason="training stopped from the admin page")
+        except AgentError as exc:
+            return _error(409, str(exc))
+        await training.finish(group_id, state=STOPPED, error="остановлено")
+        return {**(await _training_view(await training.get(group_id))), "group": record.as_dict()}
 
     @app.post("/admin/deploy")
     async def admin_deploy(request: Request,

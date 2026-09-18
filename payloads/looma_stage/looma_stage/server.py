@@ -238,6 +238,16 @@ def handle_stage_message(msg: dict) -> None:
                        kind)
         return
 
+    if str(kind).startswith("train_"):
+        # Обучение: всё, что после `train_`, разбирает сама стадия обучения
+        # (looma_stage/train/run.py). Сервер только возит.
+        run = STATE.get("train")
+        if run is None:
+            logger.error("сообщение обучения %s пришло стадии инференса", kind)
+            return
+        run.on_message(msg)
+        return
+
     if kind == "free":
         request_id = msg.get("request_id", "")
         if topology["is_first"]:
@@ -882,6 +892,49 @@ def _build_engine(args, spec: ShardSpec):
     return engines.build("torch", shard, max_requests=args.max_sequences), config
 
 
+def _serve_training(args, spec: ShardSpec) -> None:
+    """Стадия в режиме обучения: срез + адаптеры, голова ведёт цикл.
+
+    Процесс кончается сам: голова — когда адаптер собран (или обучение
+    упало), остальные — когда голова сказала «конец». Для агента это
+    обычная задача, которая отработала и вышла; результат — в `out/`.
+    """
+    from looma_stage.train.run import TrainConfig, TrainingRun
+
+    config = TrainConfig.load(args.train_config)
+    shard, _model_config = build_shard(spec)
+    tokenizer = None
+    if spec.is_first:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(spec.model_path)
+        STATE["tokenizer"] = tokenizer
+
+    def done(code: int) -> None:
+        logger.info("стадия обучения %d/%d выходит с кодом %d",
+                    args.stage_index, args.num_stages, code)
+        # Дать логам и последнему ответу уйти, потом выйти: задача окончена.
+        threading.Timer(1.0, lambda: os._exit(code)).start()
+
+    run = TrainingRun(
+        shard=shard, config=config, rank=args.stage_index, size=args.num_stages,
+        send=relay, out_dir=os.environ.get("LOOMA_TASK_OUT") or os.path.join(os.getcwd(), "out"),
+        work_dir=os.getcwd(), tokenizer=tokenizer, on_done=done)
+    STATE["train"] = run
+    STATE["ready"] = True
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+    _watch_parent()
+    logger.info("стадия обучения %d/%d готова на порту %d (слои [%d, %d), %s)",
+                args.stage_index, args.num_stages, args.port,
+                args.start_layer, args.end_layer, config.precision)
+    run.start()
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="Looma pipeline-stage server")
     parser.add_argument("--model-id", required=True)
@@ -909,14 +962,19 @@ def main(argv=None) -> None:
     )
     parser.add_argument(
         "--engine",
-        choices=("torch", "vllm"),
+        choices=("torch", "vllm", "train"),
         default=os.environ.get("LOOMA_STAGE_ENGINE", "torch"),
         help=(
-            "чем считать слои: transformers (переносимо, работает на CPU) или "
+            "чем считать слои: transformers (переносимо, работает на CPU), "
             "vLLM (батч из нескольких последовательностей в одном шаге, только "
-            "CUDA)"
+            "CUDA) или train — дообучение LoRA по тому же конвейеру "
+            "(looma_stage/train)"
         ),
     )
+    parser.add_argument(
+        "--train-config",
+        default=os.environ.get("LOOMA_TRAIN_CONFIG", "train.json"),
+        help="для --engine train: JSON с настройками обучения (во входах задачи)")
     parser.add_argument(
         "--num-model-layers",
         type=int,
@@ -988,6 +1046,9 @@ def main(argv=None) -> None:
     )
     # Fetch only the safetensors files this stage's layers live in.
     spec.model_path = resolve_model_path(args.weights_uri, shard=spec)
+    if args.engine == "train":
+        _serve_training(args, spec)
+        return
     engine, config = _build_engine(args, spec)
     STATE["engine"] = engine
 

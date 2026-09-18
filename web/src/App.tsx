@@ -13,12 +13,13 @@ import { Ray } from "./screens/Ray";
 import { SignIn } from "./screens/SignIn";
 import { Release } from "./screens/Release";
 import { Tasks } from "./screens/Tasks";
+import { Training } from "./screens/Training";
 
-const SCREENS = ["Overview", "Nodes", "Models", "Ray", "Tasks", "Accounts", "Keys", "Release"] as const;
+const SCREENS = ["Overview", "Nodes", "Models", "Training", "Ray", "Tasks", "Accounts", "Keys", "Release"] as const;
 type Screen = (typeof SCREENS)[number];
 
 const TITLE: Record<Screen, string> = {
-  Overview: "Обзор", Nodes: "Узлы", Models: "Модели", Ray: "Ray",
+  Overview: "Обзор", Nodes: "Узлы", Models: "Модели", Training: "Обучение", Ray: "Ray",
   Tasks: "Задачи", Accounts: "Клиенты", Keys: "Ключи", Release: "Обновление",
 };
 
@@ -48,7 +49,7 @@ function Shell({ who, onLeave }: { who: Who; onLeave: () => void }) {
 
   const view = {
     Overview: <Overview go={go} />, Nodes: <Nodes />, Models: <Models />,
-    Ray: <Ray />, Tasks: <Tasks />, Accounts: <Accounts />,
+    Training: <Training />, Ray: <Ray />, Tasks: <Tasks />, Accounts: <Accounts />,
     Keys: <Keys />, Release: <Release />,
   }[screen];
 

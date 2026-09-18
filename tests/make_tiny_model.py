@@ -18,7 +18,9 @@ CHAT_TEMPLATE = (
 
 def ensure_tiny_model(path: Path = TINY_MODEL_DIR, num_layers: int = 6) -> Path:
     """Create the model once; reuse it on later runs."""
-    if (path / "model.safetensors").exists():
+    # Оба файла: каталог в /tmp переживает что угодно, и однажды в нём
+    # остались веса без config.json — стадия падала на «Unrecognized model».
+    if (path / "model.safetensors").exists() and (path / "config.json").exists():
         if not _has_chat_template(path):
             _save_byte_tokenizer(path)  # refresh a cache from before the template
         return path

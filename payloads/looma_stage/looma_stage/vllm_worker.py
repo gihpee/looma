@@ -140,16 +140,56 @@ def worker_class():
             return vllm_engine._count_layers(self.model_runner)
 
         def stage_cache_room(self) -> int:
-            """Сколько на ЭТОЙ карте есть под KV-кэш.
+            """Сколько на ЭТОЙ карте есть под KV-кэш — по замеру, не по прикидке.
+
+            Штатный vLLM перед раскладкой кэша прогоняет пустой батч самого
+            большого размера и смотрит, сколько взял шаг: активации, рабочие
+            буферы Triton-ядер, память вне torch. Мы этого не делали и брали
+            долю свободного, оставляя на шаг постоянные 2 ГБ (`OVERHEAD_BYTES`
+            в драйвере). Со стенда, Qwen3-Next на 10 узлов: стадия поднялась,
+            кэш забрал свободное, и первый же шаг упал на запуске ядра —
+            `Triton Error [CUDA]: out of memory`. Здесь тот же прогон, что у
+            vLLM: `determine_available_memory` возвращает долю карты минус
+            веса, минус то, что шаг взял на самом деле.
 
             Драйвер возьмёт наименьшее по картам: раскладка кэша у всех
             воркеров обязана быть одной, иначе блоки под одну и ту же
             последовательность лягут на картах по-разному.
             """
-            free, _total = torch.cuda.mem_get_info(self.device.index or 0)
-            room = int(free * self.cache_config.gpu_memory_utilization)
-            logger.info("под KV-кэш: %.1f ГБ из %.1f ГБ свободных на %s",
-                        room / 1024 ** 3, free / 1024 ** 3, self.device)
+            share = self.cache_config.gpu_memory_utilization
+            try:
+                room = int(self.determine_available_memory())
+            except Exception as exc:
+                if "out of memory" in str(exc).lower():
+                    # Не влез даже пустой батч: с настоящим будет то же самое.
+                    raise RunnerRefused(
+                        f"прогревочный шаг не влез на {self.device}: {exc}. "
+                        "Дайте стадии меньше слоёв или уменьшите "
+                        "max_model_len") from exc
+                # Прогон не удался не из-за памяти — значит, что-то в нём
+                # разошлось с нашей стадией. Не повод не поднимать модель,
+                # которая без замера работала; повод сказать об этом вслух.
+                logger.exception("прогревочный шаг не удался; под кэш берётся "
+                                 "доля свободного без замера активаций")
+                free, _total = torch.cuda.mem_get_info(self.device.index or 0)
+                room = int(free * share)
+                logger.info("под KV-кэш: %.1f ГБ из %.1f ГБ свободных на %s",
+                            room / 1024 ** 3, free / 1024 ** 3, self.device)
+                return room
+            gib = 1024 ** 3
+            logger.info(
+                "под KV-кэш на %s: %.1f ГБ = доля %.2f от карты минус веса "
+                "%.1f ГБ, активации шага %.1f ГБ, вне torch %.1f ГБ",
+                self.device, room / gib, share,
+                float(getattr(self.model_runner, "model_memory_usage", 0)) / gib,
+                float(getattr(self, "peak_activation_memory", 0)) / gib,
+                float(getattr(self, "non_torch_memory", 0)) / gib)
+            if room <= 0:
+                raise RunnerRefused(
+                    f"на {self.device} под KV-кэш не остаётся места: доля "
+                    f"{share:.2f} карты ушла на веса и один шаг целиком "
+                    f"(не хватает {-room / gib:.1f} ГБ). Дайте стадии меньше "
+                    "слоёв, уменьшите max_model_len или max_batched_tokens")
             return room
 
         # ---------------------------------------------------------- шаг

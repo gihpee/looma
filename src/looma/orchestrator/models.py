@@ -31,6 +31,15 @@ class ModelInfo:
     num_layers: int
     hidden_size: int = 0
     architecture: str = ""
+    # Остальное — чтобы посчитать, сколько весит слой, не скачивая весов.
+    # Нули означают «в конфиге не сказано»; оценка тогда берёт запас.
+    intermediate_size: int = 0
+    num_attention_heads: int = 0
+    num_key_value_heads: int = 0
+    head_dim: int = 0
+    vocab_size: int = 0
+    tie_word_embeddings: bool = False
+    quantization: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -38,7 +47,36 @@ class ModelInfo:
             "num_layers": self.num_layers,
             "hidden_size": self.hidden_size,
             "architecture": self.architecture,
+            "intermediate_size": self.intermediate_size,
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
+            "vocab_size": self.vocab_size,
+            "quantization": self.quantization,
+            "layer_params": self.layer_params,
+            "params": self.params,
         }
+
+    @property
+    def layer_params(self) -> int:
+        """Параметров в одном слое декодера: внимание + MLP. Нормы не в
+        счёт — их доли процента."""
+        h = self.hidden_size
+        if not h:
+            return 0
+        heads = self.num_attention_heads or 1
+        kv = self.num_key_value_heads or heads
+        head_dim = self.head_dim or h // heads
+        attention = h * heads * head_dim * 2 + h * kv * head_dim * 2
+        mlp = 3 * h * (self.intermediate_size or 4 * h)
+        return attention + mlp
+
+    @property
+    def params(self) -> int:
+        """Всего, вместе с эмбеддингами и головой."""
+        if not self.hidden_size:
+            return 0
+        ends = self.vocab_size * self.hidden_size * (1 if self.tie_word_embeddings else 2)
+        return self.layer_params * self.num_layers + ends
 
 
 def describe(repo: str, *, token: str = "") -> ModelInfo:
@@ -87,11 +125,19 @@ def describe(repo: str, *, token: str = "") -> ModelInfo:
             "нельзя разрезать между узлами"
         )
     architectures = config.get("architectures") or []
+    quantization = config.get("quantization_config") or {}
     return ModelInfo(
         repo=repo,
         num_layers=int(layers),
         hidden_size=int(config.get("hidden_size") or 0),
         architecture=architectures[0] if architectures else "",
+        intermediate_size=int(config.get("intermediate_size") or 0),
+        num_attention_heads=int(config.get("num_attention_heads") or 0),
+        num_key_value_heads=int(config.get("num_key_value_heads") or 0),
+        head_dim=int(config.get("head_dim") or 0),
+        vocab_size=int(config.get("vocab_size") or 0),
+        tie_word_embeddings=bool(config.get("tie_word_embeddings", False)),
+        quantization=str(quantization.get("quant_method") or "") if quantization else "",
     )
 
 
@@ -131,6 +177,64 @@ def expand_ranks(nodes: list, engine: str) -> list:
         ranks.append({"node_id": node["node_id"],
                       "vram": len(per_gpu) * min(per_gpu)})
     return ranks
+
+
+# ------------------------------------------------------------ обучение
+#: Байт на параметр базы по точности. NF4 — полбайта плюс масштабы.
+PRECISION_BYTES = {"bf16": 2.0, "fp16": 2.0, "fp32": 4.0, "nf4": 0.55}
+
+
+def training_stage_bytes(model: "ModelInfo", *, layers: int, is_first: bool,
+                         is_last: bool, precision: str, lora_r: int,
+                         micro_tokens: int, micros_in_flight: int,
+                         dtype_bytes: float = 2.0) -> dict:
+    """Сколько памяти попросит стадия обучения — по слагаемым.
+
+    Оценка, а не измерение, и в каждом слагаемом заложен запас: недобрать
+    хуже, чем перебрать — нехватка вылезет посреди эпохи, а не при подъёме.
+
+    - веса среза в выбранной точности (эмбеддинги и голова — bf16 всегда);
+    - адаптеры в float32 и оптимизатор AdamW (ещё два таких же);
+    - активации: при пересчёте по слоям на forward хранится вход каждого
+      слоя каждого микробатча в полёте, плюс рабочее место одного слоя
+      целиком на backward (внимание × длина);
+    - логиты на последней стадии: токены × словарь × 4 байта — у моделей
+      со словарём 150k это гигабайты;
+    - запас 1.5 ГБ на CUDA-контекст и фрагментацию.
+    """
+    bytes_per_param = PRECISION_BYTES.get((precision or "bf16").lower(), 2.0)
+    h = model.hidden_size or 4096
+    weights = model.layer_params * layers * bytes_per_param
+    ends = model.vocab_size * h * dtype_bytes
+    if is_first:
+        weights += ends
+    if is_last and not (is_first and model.tie_word_embeddings):
+        weights += ends
+    # LoRA на семи проекциях: r × (in + out) на каждую; грубо 7 × r × 2 × h
+    # плюс MLP-проекции пошире. Считаем как r × 2 × (сумма in+out).
+    inter = model.intermediate_size or 4 * h
+    per_layer_adapter = lora_r * (4 * 2 * h + 3 * (h + inter))
+    adapters = per_layer_adapter * layers * 4.0
+    optimizer = adapters * 2
+    per_micro = micro_tokens * h * dtype_bytes
+    activations = per_micro * layers * micros_in_flight + per_micro * 12
+    logits = micro_tokens * model.vocab_size * 4.0 if is_last else 0
+    overhead = 1.5 * 1024 ** 3
+    total = weights + adapters + optimizer + activations + logits + overhead
+    return {"weights": int(weights), "adapters": int(adapters), "optimizer": int(optimizer),
+            "activations": int(activations), "logits": int(logits),
+            "overhead": int(overhead), "total": int(total)}
+
+
+def training_refusal(model: "ModelInfo", engine_precision: str) -> str:
+    """Почему эту модель нельзя дообучать нашим движком. Пусто — можно."""
+    if model.quantization:
+        return (f"чекпоинт {model.repo} квантован ({model.quantization}); переносимый "
+                "движок считает только по bf16/fp16-весам — возьмите неквантованную "
+                "версию модели")
+    if not model.hidden_size:
+        return f"в config.json у {model.repo} нет hidden_size — не оценить память"
+    return ""
 
 
 def split_layers(num_layers: int, stages: int,

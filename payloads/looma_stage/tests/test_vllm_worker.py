@@ -271,10 +271,49 @@ def test_не_тот_срез_отказ_при_загрузке(fake_vllm):
         _worker(fake_vllm, start=12, end=18)
 
 
-def test_место_под_кэш_считается_от_свободного_на_своей_карте(fake_vllm):
+def test_место_под_кэш_берётся_из_прогона_vllm(fake_vllm):
+    """Со стенда: доля свободного минус 2 ГБ «на глаз» — и первый шаг упал
+    на запуске Triton-ядра по памяти. Теперь кэш кладётся в то, что осталось
+    после настоящего шага, — как это делает сам vLLM."""
     worker = _worker(fake_vllm)
-    assert worker.stage_cache_room() == 5 * 2 ** 30
+    worker.determine_available_memory = lambda: 3 * 2 ** 30
+    worker.model_runner.model_memory_usage = 17 * 2 ** 30
+    worker.peak_activation_memory, worker.non_torch_memory = 2 ** 30, 2 ** 29
+    assert worker.stage_cache_room() == 3 * 2 ** 30
     assert worker.stage_layers_built() == 12
+
+
+def test_шаг_не_влез_в_долю_это_отказ_на_подъёме(fake_vllm):
+    worker = _worker(fake_vllm)
+    worker.determine_available_memory = lambda: -(2 ** 30)
+    with pytest.raises(RunnerRefused, match="не остаётся места.*не хватает 1.0 ГБ"):
+        worker.stage_cache_room()
+
+
+def test_прогон_упал_по_памяти_это_отказ(fake_vllm):
+    """Пустой батч не влез — настоящий не влезет тем более."""
+    worker = _worker(fake_vllm)
+
+    def boom():
+        raise RuntimeError("Triton Error [CUDA]: out of memory")
+
+    worker.determine_available_memory = boom
+    with pytest.raises(RunnerRefused, match="прогревочный шаг не влез"):
+        worker.stage_cache_room()
+
+
+def test_прогон_не_удался_не_по_памяти_запасной_расчёт_вслух(fake_vllm, caplog):
+    """Замер разошёлся с нашей стадией — не повод не поднимать модель,
+    которая без него работала. Но в логе об этом сказано."""
+    worker = _worker(fake_vllm)
+
+    def boom():
+        raise AttributeError("no profile_run here")
+
+    worker.determine_available_memory = boom
+    with caplog.at_level("WARNING"):
+        assert worker.stage_cache_room() == 5 * 2 ** 30
+    assert "прогревочный шаг не удался" in caplog.text
 
 
 # ------------------------------------------------------------------ шаг

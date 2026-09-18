@@ -24,6 +24,7 @@ from looma.orchestrator.keys import KeyStore
 from looma.orchestrator.public_addr import resolve_public_address
 from looma.accounts.store import Accounts
 from looma.usage.deployments import Deployments
+from looma.usage.training import TrainingJobs
 from looma.usage.ledger import Ledger
 from looma.orchestrator.tls import CertPaths, server_credentials
 from looma.store.database import Database, DatabaseUnavailable, database_url
@@ -100,7 +101,7 @@ async def run() -> None:
     # База поднимается до всего остального: без неё нет учётных записей, а
     # значит и кабинета. Работать без неё можно — тогда остаётся аварийный
     # админский токен, — но узнать об этом надо на старте, а не на первом входе.
-    database, accounts, ledger, fleet = None, None, None, None
+    database, accounts, ledger, fleet, training = None, None, None, None, None
     if database_url():
         database = Database(database_url())
         try:
@@ -111,6 +112,7 @@ async def run() -> None:
             accounts = Accounts(database)
             ledger = Ledger(database)
             fleet = Deployments(database)
+            training = TrainingJobs(database)
             if await accounts.count() == 0:
                 logger.warning("в базе нет ни одной учётной записи — заведите "
                                "администратора: python -m looma.accounts.bootstrap <почта>")
@@ -118,7 +120,7 @@ async def run() -> None:
             # Не падаем: узлы и уже развёрнутые модели важнее кабинета, и
             # оркестратор без базы всё ещё умеет ими управлять.
             logger.error("%s; работаю без учётных записей", exc)
-            database, accounts, ledger, fleet = None, None, None, None
+            database, accounts, ledger, fleet, training = None, None, None, None, None
     else:
         logger.warning("LOOMA_DATABASE_URL не задан — учётных записей нет, "
                        "работает только аварийный админский токен")
@@ -170,7 +172,7 @@ async def run() -> None:
                                       name="usage-reconcile")
     app = create_app(agents=hub, releases=releases, keystore=keystore,
                      config=config, public_address=public, accounts=accounts,
-                     ledger=ledger, deployments=fleet)
+                     ledger=ledger, deployments=fleet, training=training)
     http = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=config.http_port,
                                          log_level="info", loop="asyncio"))
     logger.info("HTTP on :%d  (dashboard at /admin)", config.http_port)

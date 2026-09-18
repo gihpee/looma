@@ -28,6 +28,14 @@ _DTYPES = {"float32": "float32", "float16": "float16", "bfloat16": "bfloat16"}
 
 
 _LAYER_KEY = re.compile(r"^(?P<prefix>.*?)layers\.(?P<index>\d+)\.(?P<tail>.+)$")
+# Веса одного эксперта в чекпоинте: `…mlp.experts.7.gate_proj.weight`.
+# transformers 5 держит экспертов слоя одним тензором (`experts.gate_up_proj`
+# формы [E, 2I, H], `experts.down_proj` — [E, H, I]) и склеивает их при
+# `from_pretrained`; загрузчик, кладущий тензоры по именам, этого шага не
+# видит и оставил бы экспертов незаполненными.
+_EXPERT_KEY = re.compile(
+    r"^(?P<base>.+\.experts)\.(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
+)
 
 
 def detect_key_prefix(keys, num_layers: int) -> Optional[str]:
@@ -279,6 +287,9 @@ class ShardModel:
 
         self.spec = spec
         self.config = config
+        # Конфиг этого среза (число слоёв и их типы — только свои). Заполняется
+        # в build(); до неё — конфиг всей модели, чтобы было чем ответить.
+        self.shard_config = config
         self.torch = torch
         self.dtype = torch_dtype
         # Every card this process may use, in order. One entry for a single
@@ -320,6 +331,20 @@ class ShardModel:
         # device so nothing is allocated yet.
         shard_cfg = type(cfg).from_dict(cfg.to_dict())
         shard_cfg.num_hidden_layers = self.num_layers
+        # Гибридные модели (Qwen3-Next: 3 слоя DeltaNet на 1 attention, Gemma:
+        # скользящее и полное внимание вперемешку) описывают тип КАЖДОГО слоя
+        # списком `layer_types`, и слой берёт свой тип по номеру. Номера у
+        # стадии локальные, 0..N, а список — от всей модели: без среза
+        # стадия [43, 48) построила бы слои по типам 0..4 и не сошлась с
+        # весами. Голова этого не видит — у неё номера совпадают.
+        layer_types = getattr(cfg, "layer_types", None)
+        if layer_types:
+            shard_cfg.layer_types = list(layer_types)[
+                self.spec.start_layer : self.spec.end_layer
+            ]
+        # Конфиг среза нужен и исполнителю: кэш transformers заводит слои
+        # по нему, и для DeltaNet-слоя место должно быть заведено заранее.
+        self.shard_config = shard_cfg
         with torch.device("meta"):
             skeleton = AutoModelForCausalLM.from_config(shard_cfg)
 
@@ -481,6 +506,12 @@ class ShardModel:
 
         loaded, skipped = 0, 0
         seen_lm_head = False
+        # Что из параметров уже записано. Ключ без адресата раньше молча
+        # пропускался, и модуль оставался с тем, что лежало в памяти после
+        # to_empty(): конечные числа, которые проверка на мусор не ловит.
+        # Со стенда (Qwen3-Next на transformers 5): эксперты не грузились
+        # вовсе, стадия поднималась «здоровой» и считала шум.
+        filled: Dict[str, int] = {}
         for file in files:
             with safe_open(file, framework="pt", device="cpu") as f:
                 for key in f.keys():
@@ -490,11 +521,15 @@ class ShardModel:
                         continue
                     param = targets.get(target_name)
                     if param is None:
-                        skipped += 1
-                        continue
+                        slot = self._fused_expert_slot(target_name, targets)
+                        if slot is None:
+                            skipped += 1
+                            continue
+                        target_name, param = slot
                     tensor = f.get_tensor(key).to(dtype=self.dtype)
                     with self.torch.no_grad():
                         param.copy_(tensor.to(param.device))
+                    filled[target_name] = filled.get(target_name, 0) + 1
                     loaded += 1
                     if target_name == "lm_head.weight":
                         seen_lm_head = True
@@ -503,9 +538,11 @@ class ShardModel:
         if self.spec.is_last and self.lm_head is not None and not seen_lm_head:
             if getattr(self.config, "tie_word_embeddings", False):
                 self._load_tied_lm_head(targets)
+                filled["lm_head.weight"] = 1
             else:
                 raise RuntimeError("lm_head weights not found in checkpoint")
         logger.info("shard weights loaded: %d tensors (%d irrelevant keys skipped)", loaded, skipped)
+        self._assert_every_parameter_filled(mods, filled)
         if loaded == 0:
             # Refusing here rather than serving. A stage that loaded nothing
             # holds uninitialised memory: it starts, reports healthy, answers
@@ -518,6 +555,59 @@ class ShardModel:
                 f"checkpoint names its tensors "
                 f"'{self._key_prefix}layers.N....' — if that looks wrong, this "
                 f"model's layout is one shard_target_key() does not know"
+            )
+
+    def _fused_expert_slot(self, target_name: str, targets: Dict[str, object]):
+        """Куда класть веса одного эксперта, когда модуль держит их слитно.
+
+        `…experts.7.gate_proj.weight` и `…up_proj.weight` — две половины
+        строки 7 в `experts.gate_up_proj` (сначала gate, потом up, как их
+        склеивает transformers); `…down_proj.weight` — строка 7 в
+        `experts.down_proj`. Возвращает (имя слитного параметра, срез в нём)
+        или None, если это не эксперт или модель хранит их раздельно.
+        """
+        match = _EXPERT_KEY.match(target_name)
+        if match is None:
+            return None
+        base, expert, proj = match.group("base"), int(match.group("expert")), match.group("proj")
+        if proj == "down_proj":
+            name = f"{base}.down_proj"
+            fused = targets.get(name)
+            return None if fused is None else (name, fused[expert])
+        name = f"{base}.gate_up_proj"
+        fused = targets.get(name)
+        if fused is None:
+            return None
+        half = fused.shape[1] // 2
+        row = fused[expert]
+        return name, (row[:half] if proj == "gate_proj" else row[half:])
+
+    def _assert_every_parameter_filled(self, mods: Dict[str, object],
+                                       filled: Dict[str, int]) -> None:
+        """Каждый параметр среза должен прийти из чекпоинта — целиком.
+
+        Слитный тензор экспертов собирается из E (down) или 2E (gate+up)
+        записей; меньше — значит часть экспертов осталась мусором.
+        """
+        missing = []
+        for prefix, module in mods.items():
+            for name, param in module.named_parameters(recurse=True):
+                full = f"{prefix}.{name}"
+                writes = filled.get(full, 0)
+                expected = 1
+                if full.endswith(".experts.gate_up_proj"):
+                    expected = 2 * param.shape[0]
+                elif full.endswith(".experts.down_proj"):
+                    expected = param.shape[0]
+                if writes < expected:
+                    missing.append(f"{full} ({writes} of {expected})")
+        if missing:
+            shown = ", ".join(missing[:8]) + (" …" if len(missing) > 8 else "")
+            raise RuntimeError(
+                f"{len(missing)} parameter(s) of layers [{self.spec.start_layer}, "
+                f"{self.spec.end_layer}) never came from the checkpoint: {shown}. "
+                "The stage would serve noise; the checkpoint names these tensors "
+                "in a way shard_target_key()/_fused_expert_slot() do not know"
             )
 
     def _resolve_key_prefix(self, files: List[str]) -> str:

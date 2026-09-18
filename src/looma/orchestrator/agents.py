@@ -149,6 +149,36 @@ class TaskRecord:
         )
 
 
+def _settle(waiter: asyncio.Future, *, result=None, exception=None) -> None:
+    """Завершить ожидание — из ТОГО цикла, который ждёт.
+
+    Ответ узла приходит на потоке gRPC, а ждать его может другой цикл: в
+    тестах HTTP-клиент крутит приложение в своём потоке. `set_result` из
+    чужого потока не будит ждущего — он узнаёт об ответе, только когда
+    истечёт его же таймаут. Со стенда тестов: `collect` возвращал
+    правильный ответ ровно через 120 секунд. `call_soon_threadsafe`
+    будит цикл сразу; в одном цикле — то же самое, только через очередь.
+    """
+    loop = waiter.get_loop()
+
+    def apply() -> None:
+        if waiter.done():
+            return
+        if exception is not None:
+            waiter.set_exception(exception)
+        else:
+            waiter.set_result(result)
+
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        apply()
+    else:
+        loop.call_soon_threadsafe(apply)
+
+
 @dataclass
 class GroupRecord:
     """A job spread over several nodes: a pipeline, a training run.
@@ -1102,16 +1132,16 @@ class AgentHub:
         buffer, waiter = entry
         if chunk.data:
             buffer.extend(chunk.data)
-        if chunk.last and not waiter.done():
+        if chunk.last:
             if chunk.error:
-                waiter.set_exception(AgentError(chunk.error))
+                _settle(waiter, exception=AgentError(chunk.error))
             else:
-                waiter.set_result(bytes(buffer))
+                _settle(waiter, result=bytes(buffer))
 
     def on_logs(self, logs: agent_pb2.TaskLogs) -> None:
         waiter = self._pending_logs.get(logs.command_id)
-        if waiter is not None and not waiter.done():
-            waiter.set_result(logs.text)
+        if waiter is not None:
+            _settle(waiter, result=logs.text)
 
     def on_telemetry(self, report: agent_pb2.Telemetry) -> None:
         session = self.sessions.get(report.node_id)
