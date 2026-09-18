@@ -8,7 +8,7 @@ export interface Node {
   connected_at: number; seconds_since_seen: number;
   peer_id: string; symmetric_nat: boolean; reachable: boolean;
   in_network: boolean; visible_addrs: string[];
-  direct: number; relayed: number; direct_share: number; link_rtt_ms: number;
+  direct: number; relayed: number; direct_share: number; link_rtt_ms: number; relay_rtt_ms?: number;
   update_state: string; update_version: string; update_error: string;
 }
 

@@ -208,7 +208,10 @@ export function Nodes() {
                     </div>} />
               <Row k="прямых / через оркестратор"
                    v={`${current.direct} / ${current.relayed}`} />
-              {current.link_rtt_ms > 0 && <Row k="RTT" v={`${current.link_rtt_ms} ms`} />}
+              {current.link_rtt_ms > 0 && <Row k="RTT до соседа" v={`${current.link_rtt_ms} ms`} />}
+              {(current.relay_rtt_ms ?? 0) > 0 && (
+                <Row k="RTT до оркестратора" v={`${current.relay_rtt_ms} ms`} />
+              )}
             </div>
           </section>
 

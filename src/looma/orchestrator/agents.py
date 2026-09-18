@@ -256,6 +256,10 @@ class AgentNode:
     direct: int = 0
     relayed: int = 0
     link_rtt_ms: float = 0.0
+    #: Дорога узла до реле (оно на машине оркестратора) — вторая половина
+    #: ответа «прямой путь короче или нет»: сравнивать RTT до соседа не с
+    #: чем, пока рядом нет RTT до оркестратора с обеих сторон.
+    relay_rtt_ms: float = 0.0
     update_state: str = ""
     update_version: str = ""
     update_error: str = ""
@@ -294,6 +298,7 @@ class AgentNode:
             "relayed": self.relayed,
             "direct_share": round(self.direct_share, 3),
             "link_rtt_ms": round(self.link_rtt_ms, 1),
+            "relay_rtt_ms": round(self.relay_rtt_ms, 1),
             "update_state": self.update_state,
             "update_version": self.update_version,
             "update_error": self.update_error,
@@ -1190,6 +1195,7 @@ class AgentHub:
         node.relayed = peer.relayed
         node.direct_share = peer.direct_share
         node.link_rtt_ms = peer.link_rtt_ms
+        node.relay_rtt_ms = float(getattr(peer, "relay_rtt_ms", 0.0) or 0.0)
         node.update_state = report.update.state
         node.update_version = report.update.version
         node.update_error = report.update.error
