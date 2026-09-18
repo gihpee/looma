@@ -80,6 +80,35 @@ def test_код_стадии_уезжает_вместе_с_задачей():
     assert 0 < sum(len(v) for v in payload.values()) < 5 * 1024 * 1024
 
 
+def test_подпакеты_стадии_уезжают_тоже(tmp_path):
+    """Со стенда: `looma_stage/train/` не уезжал, и стадия обучения падала на
+    узле с `No module named 'looma_stage.train'`. Подпакет — каталог с
+    `__init__.py`; тесты, окружения и кэши остаются дома."""
+    from looma.orchestrator.payloads import collect
+
+    root = tmp_path / "looma_stage"
+    (root / "train").mkdir(parents=True)
+    (root / "server.py").write_text("")
+    (root / "train" / "__init__.py").write_text("")
+    (root / "train" / "run.py").write_text("")
+    (root / "tests").mkdir()
+    (root / "tests" / "test_x.py").write_text("")          # без __init__.py
+    (root / "__pycache__").mkdir()
+    (root / "__pycache__" / "server.cpython-312.py").write_text("")
+    (root / ".venv" / "lib").mkdir(parents=True)
+    (root / ".venv" / "__init__.py").write_text("")
+    (root / ".venv" / "lib" / "__init__.py").write_text("")
+    (root / ".venv" / "lib" / "x.py").write_text("")
+
+    got = collect("looma_stage", human="кода", dirs=[root])
+    assert set(got) == {"looma_stage/server.py", "looma_stage/train/__init__.py",
+                        "looma_stage/train/run.py"}
+
+    payload = stage_payload()
+    assert "looma_stage/train/run.py" in payload and "looma_stage/train/head.py" in payload
+    assert not any("/tests/" in name for name in payload)
+
+
 def test_пусковой_слой_в_нагрузку_не_попадает():
     """Он живёт в образе: сломанный запускатель нельзя починить, прислав ещё один."""
     assert not any("launcher" in name for name in stage_payload())

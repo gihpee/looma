@@ -49,8 +49,7 @@ def collect(name: str, *, human: str, marker: str = "server.py",
     for candidate in (payload_dirs(name) if dirs is None else dirs):
         tried.append(candidate)
         if (candidate / marker).is_file():
-            files = {f"{name}/{path.name}": path.read_bytes()
-                     for path in sorted(candidate.glob("*.py"))}
+            files = _package_files(candidate, name)
             if files:
                 return files
     raise PayloadMissing(
@@ -59,6 +58,25 @@ def collect(name: str, *, human: str, marker: str = "server.py",
         ". В образе он кладётся Dockerfile'ом; путь можно задать через "
         "LOOMA_PAYLOADS_DIR"
     )
+
+
+def _package_files(root: Path, name: str) -> Dict[str, bytes]:
+    """`*.py` пакета вместе с подпакетами — путями относительно `root`.
+
+    Подпакет — это каталог с `__init__.py`; всё прочее (`__pycache__`,
+    тесты, окружения) остаётся. Со стенда: `looma_stage/train/` не уезжал,
+    и стадия обучения падала на узле с `No module named 'looma_stage.train'`.
+    """
+    files: Dict[str, bytes] = {}
+    for path in sorted(root.rglob("*.py")):
+        relative = path.relative_to(root)
+        if any(part.startswith((".", "__pycache__")) for part in relative.parts[:-1]):
+            continue
+        if not all((root / Path(*relative.parts[:depth]) / "__init__.py").is_file()
+                   for depth in range(1, len(relative.parts))):
+            continue
+        files[f"{name}/{relative.as_posix()}"] = path.read_bytes()
+    return files
 
 
 def ray_payload() -> Dict[str, bytes]:
