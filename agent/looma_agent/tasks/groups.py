@@ -26,6 +26,9 @@ class Member:
     # или через оркестратор.
     addrs: Tuple[str, ...] = field(default_factory=tuple)
     reachable: bool = False
+    # Его собственная дорога до оркестратора: дальняя половина ответа «прямой
+    # путь короче двух прыжков или нет».
+    relay_rtt_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,7 @@ def group_from_proto(message) -> Optional[Group]:
         rank=message.rank,
         members={m.rank: Member(rank=m.rank, node_id=m.node_id, peer_id=m.peer_id,
                                 addrs=tuple(getattr(m, "addrs", ()) or ()),
-                                reachable=bool(getattr(m, "reachable", False)))
+                                reachable=bool(getattr(m, "reachable", False)),
+                                relay_rtt_ms=float(getattr(m, "relay_rtt_ms", 0.0) or 0.0))
                  for m in message.members},
     )

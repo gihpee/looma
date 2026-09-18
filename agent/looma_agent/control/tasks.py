@@ -148,7 +148,7 @@ class TaskCommands:
         self.links.set_neighbours(group.group_id, [
             Neighbour(stage_index=rank, node_id=member.node_id,
                       peer_id=member.peer_id, addrs=list(member.addrs),
-                      reachable=member.reachable)
+                      reachable=member.reachable, relay_rtt_ms=member.relay_rtt_ms)
             for rank, member in group.members.items()
             if rank != group.rank and member.peer_id
         ])
@@ -164,11 +164,11 @@ class TaskCommands:
     def _path_line(self, peer_id: str) -> str:
         info = getattr(self.peers, "describe", lambda _p: {})(peer_id) or {}
         direct = bool(info.get("direct_addr"))
+        rtt = info.get("rtt_ms")
         if self.links is not None and "direct_addr" in info:
-            self.links.observed_direct(peer_id, direct)
+            self.links.observed_direct(peer_id, direct, rtt_ms=rtt)
         way = ("прямой адрес есть" if direct
                 else "только через реле" if "direct_addr" in info else "адреса неизвестны")
-        rtt = info.get("rtt_ms")
         return (f"{peer_id[:12]} — {way}"
                 + (f", RTT {rtt:.0f} мс" if rtt else ""))
 

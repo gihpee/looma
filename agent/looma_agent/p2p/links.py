@@ -43,6 +43,11 @@ SEND_TIMEOUT_S = float(os.environ.get("LOOMA_P2P_SEND_TIMEOUT_S", "2"))
 # How many handed-over messages may be awaiting acknowledgement. A pipeline
 # decoding one sequence has exactly one in flight; the rest is slack.
 PENDING_ACKS = 64
+#: How much shorter (or longer) the direct path must measure before the
+#: route changes. 0.2 = the direct trip must beat two hops through the
+#: orchestrator by a fifth to be taken up, and exceed them by a fifth to be
+#: given up. Jitter on a home link is well within that.
+PATH_MARGIN = 0.2
 
 
 @dataclass
@@ -118,6 +123,8 @@ class LinkTable:
         # peer_id -> было ли соединение прямым, когда его последний раз
         # смотрели (см. observed_direct).
         self._seen_direct: Dict[str, bool] = {}
+        # peer_id -> what the stopwatch last decided, for hysteresis.
+        self._chosen: Dict[str, bool] = {}
         self._pending: "queue.Queue" = queue.Queue(maxsize=PENDING_ACKS)
         self._watcher: Optional[threading.Thread] = None
         self.stats = {"direct": 0, "relay": 0, "fallbacks": 0}
@@ -158,6 +165,7 @@ class LinkTable:
             # message with in hours. On a live stand that showed 109 ms beside
             # a transport time of 21 ms, and the two could not both be true.
             live = {peer.peer_id for peer in self._neighbours.values()}
+            self._chosen = {k: v for k, v in self._chosen.items() if k in live}
             self._worth = {
                 peer_id: value
                 for peer_id, value in self._worth.items()
@@ -190,7 +198,8 @@ class LinkTable:
                 if key[0] != pipeline_id
             }
 
-    def observed_direct(self, peer_id: str, direct: bool) -> None:
+    def observed_direct(self, peer_id: str, direct: bool,
+                        rtt_ms: Optional[float] = None) -> None:
         """Каким соединение к соседу получилось на самом деле.
 
         Правило `_worth_using` — по топологии: кто-то из двоих принимает
@@ -200,8 +209,13 @@ class LinkTable:
         оркестратор). Прогрев группы спрашивает у lattica, без круга ли
         соединение, и говорит сюда; это сильнее догадки по топологии.
         """
+        near = self._safe(self._relay_rtt) if (direct and rtt_ms and self._relay_rtt) else None
         with self._lock:
             self._seen_direct[peer_id] = bool(direct)
+            # The warm-up's measurement is the first one: the sampler's next
+            # pass is up to a cycle away, and the first tokens go now.
+            if direct and rtt_ms:
+                self._worth[peer_id] = (True, time.monotonic(), float(rtt_ms), near)
 
     def neighbour(self, pipeline_id: str, stage_index: int) -> Optional[Neighbour]:
         with self._lock:
@@ -266,30 +280,58 @@ class LinkTable:
                 self._worth[peer.peer_id] = (True, time.monotonic(), direct, near)
 
     def _worth_using(self, peer: Neighbour) -> bool:
-        """Is there a real connection to be had, or only a detour?
+        """Is there a real connection to be had — and is it the shorter one?
 
-        One question, answered from the topology rather than from a stopwatch:
-        can either end accept an incoming connection? If yes, libp2p opens ONE
-        hop between the two workers and it is unambiguously shorter than going
-        through the orchestrator. If neither can, the only thing libp2p can
-        build is a circuit through the relay — and Looma runs that relay on the
-        orchestrator's own machine, so the circuit is the same two hops as the
-        tunnel, minus the tunnel's advantages.
+        Two questions, in order.
 
-        This replaces a latency comparison that could not work. It measured
-        the round trip to the peer and weighed it against "my trip to the relay
-        plus the peer's" — but when the connection IS a circuit, those two
-        quantities are the same journey, so the rule was comparing a path
-        against a formula describing that same path. The winner was decided by
-        jitter, the route flapped every 30 s, and no arrangement of the
-        arithmetic could have fixed it.
+        First, topology: can either end accept an incoming connection? If
+        neither can, the only thing libp2p builds is a circuit through the
+        relay — the same two hops as the orchestrator's tunnel, minus the
+        tunnel's advantages — and a circuit is never worth using. The warm-up
+        may know better than the topology (`observed_direct`: two agents
+        behind one router are unreachable from outside and directly connected
+        to each other), and its word wins.
 
-        Latency is still measured, and still reported. It just does not decide
-        anything: what matters here is topology, and topology is known.
+        Second, the stopwatch — but only once the connection is known to be
+        real. A latency comparison was tried before and thrown out: when the
+        connection was a circuit it measured the relay path against a formula
+        describing that same path, and jitter decided. With a real connection
+        the comparison means what it says, and the stand made it necessary:
+        GTX ↔ nv3 direct is 46 ms, while nv3 → orchestrator → GTX is
+        8.3 + 4.9 ms. The internet is not a metric space; a home ISP and a
+        hosting provider may peer badly with each other and both peer well
+        with the orchestrator's exchange point. "One hop" was shorter in hops
+        and twice as long in time — tokens, not just activations, got slower.
+
+        With hysteresis, so a route is not re-decided by every sample: the
+        direct path has to be clearly shorter to be chosen and clearly longer
+        to be dropped. No measurement yet — topology decides, as before.
         """
-        if self._seen_direct.get(peer.peer_id):
+        seen = self._seen_direct.get(peer.peer_id)
+        if seen is False:
+            return False
+        if not (seen or peer.reachable or self._self_reachable):
+            return False
+        measured = self._worth.get(peer.peer_id)
+        direct = measured[2] if measured else None
+        near = measured[3] if measured else None
+        far = peer.relay_rtt_ms or 0.0
+        if not direct or not near or not far:
             return True
-        return bool(peer.reachable or self._self_reachable)
+        relayed = near + far
+        before = self._chosen.get(peer.peer_id, True)
+        # Keep the current choice unless the other path wins by the margin.
+        if before:
+            after = direct <= relayed * (1 + PATH_MARGIN)
+        else:
+            after = direct < relayed * (1 - PATH_MARGIN)
+        if after != before:
+            logger.info(
+                "route to %s: %s (direct %.0f ms, via orchestrator %.0f + %.0f ms)",
+                peer.node_id, "direct" if after else "through the orchestrator",
+                direct, near, far)
+        self._chosen[peer.peer_id] = after
+        return after
 
     @staticmethod
     def _safe(call):

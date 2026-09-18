@@ -758,6 +758,7 @@ class AgentHub:
                 peer_id=session.node.peer_id,
                 addrs=list(session.node.visible_addrs),
                 reachable=bool(session.node.reachable),
+                relay_rtt_ms=float(session.node.relay_rtt_ms or 0.0),
             ))
         self.groups[group_id] = record
 

@@ -134,6 +134,10 @@ message GroupMember {
   // is only reachable through the orchestrator, however close it is.
   repeated string addrs = 4;
   bool reachable = 5;
+  // That member's own round trip to the orchestrator's relay, as it last
+  // reported it. The far half of "is the direct link shorter than two hops
+  // through the orchestrator" — a neighbour cannot measure it itself.
+  double relay_rtt_ms = 6;
 }
 
 message TaskGroup {

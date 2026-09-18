@@ -792,3 +792,83 @@ def test_a_neighbour_that_left_stops_being_measured():
 
     rows = table.snapshot()["neighbours"]
     assert [(r["node_id"], r["rtt_ms"]) for r in rows] == [("new", 8.0)]
+
+
+# ------------------------------------------------ короче ли прямой путь
+def measured_link(*, direct_ms, near_ms, far_ms, peer_reachable=True):
+    """Одна связь с секундомером: RTT до соседа, моя и его дорога до реле."""
+    sent = []
+    links = LinkTable(
+        send_direct=lambda pid, msg: sent.append((pid, msg)),
+        dial=lambda pid, addrs: None,
+        rtt=lambda pid: direct_ms,
+        relay_rtt=lambda: near_ms,
+    )
+    links.set_self_reachable(True)
+    neighbour = peer(1, reachable=peer_reachable)
+    neighbour.relay_rtt_ms = far_ms
+    links.set_neighbours("p#0", [neighbour])
+    links.refresh()
+    return links, sent
+
+
+def test_прямой_путь_длиннее_двух_прыжков_не_берётся():
+    """Со стенда 2026-09-18: GTX ↔ nv3 напрямую 46 мс, а nv3 → оркестратор →
+    GTX = 8.3 + 4.9. Один прыжок — и вдвое дольше: домашний провайдер и
+    хостер плохо пирятся друг с другом и хорошо — с точкой обмена
+    оркестратора. Токены на прямом пути шли медленнее, чем через релей."""
+    links, sent = measured_link(direct_ms=46.0, near_ms=8.3, far_ms=4.9)
+    relayed = []
+    assert links.send("p#0", 1, {"s": 1}, relay=relayed.append) == "relay"
+    assert not sent and len(relayed) == 1
+
+
+def test_прямой_путь_короче_берётся():
+    """Два агента на одном ПК: 0–1 мс напрямую против двух дорог до ДЦ."""
+    links, sent = measured_link(direct_ms=1.0, near_ms=8.3, far_ms=8.1)
+    assert links.send("p#0", 1, {"s": 1}, relay=lambda m: None) == "direct"
+    assert len(sent) == 1
+
+
+def test_без_замера_решает_топология():
+    """Секундомер ещё не сработал (или сосед — старый оркестратор без
+    relay_rtt): как раньше, по достижимости."""
+    links, sent = measured_link(direct_ms=46.0, near_ms=8.3, far_ms=0.0)
+    assert links.send("p#0", 1, {"s": 1}, relay=lambda m: None) == "direct"
+
+
+def test_маршрут_не_дёргается_от_дрожания():
+    """Старое сравнение сняли за то, что путь менялся каждые 30 с по джиттеру.
+    Теперь смена только при явном перевесе в обе стороны."""
+    samples = iter([12.0, 14.0, 13.5, 20.0])   # против 8 + 5 = 13 через релей
+    links = LinkTable(send_direct=lambda pid, msg: None, dial=lambda pid, addrs: None,
+                      rtt=lambda pid: next(samples), relay_rtt=lambda: 8.0)
+    links.set_self_reachable(True)
+    neighbour = peer(1)
+    neighbour.relay_rtt_ms = 5.0
+    links.set_neighbours("p#0", [neighbour])
+    got = []
+    for _ in range(4):
+        links.refresh()
+        got.append(links.send("p#0", 1, {"s": 1}, relay=lambda m: None))
+    # 12 < 13·1.2 — прямой держится; 14 и 13.5 — внутри полосы, держится;
+    # 20 > 13·1.2 — сдаётся.
+    assert got == ["direct", "direct", "direct", "relay"]
+    # Обратно — только когда станет короче 13·0.8 = 10.4.
+    samples = iter([12.0, 10.0])
+    links._rtt = lambda pid: next(samples)
+    links.refresh(); assert links.send("p#0", 1, {"s": 1}, relay=lambda m: None) == "relay"
+    links.refresh(); assert links.send("p#0", 1, {"s": 1}, relay=lambda m: None) == "direct"
+
+
+def test_прогрев_даёт_первый_замер_сразу():
+    """До первого прохода семплера — до цикла ожидания; первые токены идут
+    сейчас, и решать им надо по тому, что прогрев уже измерил."""
+    links = LinkTable(send_direct=lambda pid, msg: None, dial=lambda pid, addrs: None,
+                      rtt=lambda pid: 46.0, relay_rtt=lambda: 8.3)
+    links.set_self_reachable(True)
+    neighbour = peer(1)
+    neighbour.relay_rtt_ms = 4.9
+    links.set_neighbours("p#0", [neighbour])
+    links.observed_direct(neighbour.peer_id, True, rtt_ms=46.0)
+    assert links.send("p#0", 1, {"s": 1}, relay=lambda m: None) == "relay"
