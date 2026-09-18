@@ -43,6 +43,12 @@ CHANNEL_OPTIONS = [
     # backoff grow into minutes of an idle node.
     ("grpc.initial_reconnect_backoff_ms", 500),
     ("grpc.max_reconnect_backoff_ms", 5000),
+    # То же, что у оркестратора (server.MAX_MESSAGE_BYTES). Без этого приём
+    # ограничен 4 МБ по умолчанию gRPC, и ретранслированное сообщение
+    # задачи крупнее — активации длинного префилла, кусок адаптера при
+    # обучении — обрывало стрим молча: отправитель ждал ответа до таймаута.
+    ("grpc.max_send_message_length", 64 * 1024 * 1024),
+    ("grpc.max_receive_message_length", 64 * 1024 * 1024),
 ]
 
 

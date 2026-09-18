@@ -622,14 +622,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             ready = STATE.get("ready", False)
+            # В режиме обучения движка нет: стадия готова, а запросов не
+            # обслуживает. Раньше здесь падал KeyError на каждую проверку
+            # агента — в лог, не в ответ, и никто не замечал.
+            engine = STATE.get("engine")
             self._json(
                 200 if ready else 503,
                 {
                     "status": "ok" if ready else "loading",
                     "stage": STATE.get("topology", {}).get("stage_index"),
                     "layers": STATE.get("layer_range"),
+                    "mode": "train" if STATE.get("train") is not None else "serve",
                     "active_requests": (
-                        STATE["engine"].active_requests() if ready else 0
+                        engine.active_requests() if ready and engine is not None else 0
                     ),
                     # Сколько ещё влезет. Клиент, получивший отказ, должен
                     # видеть отсюда, что узел действительно полон, а не молча
@@ -642,7 +647,7 @@ class Handler(BaseHTTPRequestHandler):
                     # одного конвейера числа разные — их считает каждая по
                     # своему срезу, — и наименьшее и есть ёмкость конвейера.
                     "capacity": (
-                        getattr(STATE["engine"], "capacity", None) if ready else None
+                        getattr(engine, "capacity", None) if ready else None
                     ),
                     # None until enough steps have been seen; the planner then
                     # keeps using its roofline estimate instead of a warm-up

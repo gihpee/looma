@@ -30,7 +30,7 @@ from looma_stage.train import data as data_mod
 from looma_stage.train import lora as lora_mod
 from looma_stage.train.head import Schedule, StepReport, Trainer
 from looma_stage.train.stage import OptimSettings, TrainStage, TrainRefused
-from looma_stage.train.transport import ChannelTransport, reply_for
+from looma_stage.train.transport import ChannelTransport, Parts, parted, reply_for
 
 logger = logging.getLogger("looma_stage.train.run")
 
@@ -171,7 +171,10 @@ class TrainingRun:
         self.config = config
         self.rank = rank
         self.size = size
-        self.send = send
+        # Большие сообщения (кусок адаптера, длинные микробатчи) — частями:
+        # см. transport.PART_BYTES.
+        self.send = parted(send)
+        self.parts = Parts()
         self.out_dir = Path(out_dir)
         self.work_dir = Path(work_dir)
         self.tokenizer = tokenizer
@@ -182,11 +185,14 @@ class TrainingRun:
         self.transport: Optional[ChannelTransport] = None
         self.thread: Optional[threading.Thread] = None
         if rank == 0:
-            self.transport = ChannelTransport(self.stage, size=size, send=send)
+            self.transport = ChannelTransport(self.stage, size=size, send=self.send)
 
     # ---------------------------------------------------------- сообщения
     def on_message(self, message: dict) -> None:
         """Сообщение `train_*` с потока приёма."""
+        message = self.parts.absorb(message)
+        if message is None:
+            return          # кусок; целое придёт, когда соберётся
         kind = message.get("kind")
         if kind == "train_reply":
             if self.transport is None:

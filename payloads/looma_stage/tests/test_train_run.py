@@ -62,6 +62,17 @@ def _dataset(tmp_path):
     (tmp_path / "train.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
 
 
+def _settled(codes, size=2, timeout_s=10.0):
+    """`train_finish` уезжает без ожидания, канал относит его на своём потоке:
+    исход хвоста появляется чуть позже, чем выходит голова."""
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while len(codes) < size and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return codes
+
+
 def _shard(checkpoint, start, end):
     spec = ShardSpec(model_path=checkpoint, start_layer=start, end_layer=end,
                      is_first=start == 0, is_last=end == LAYERS, device="cpu",
@@ -96,7 +107,7 @@ def test_две_задачи_через_канал_равны_одному_пр�
     head.start()
     head.thread.join(timeout=120)
     assert not head.thread.is_alive(), "голова не закончила"
-    assert codes == {0: 0, 1: 0}, codes
+    assert _settled(codes) == {0: 0, 1: 0}, codes
 
     progress = json.loads((out[0] / "progress.json").read_text())
     assert progress["state"] == "done" and progress["step"] == len(expected)
@@ -108,6 +119,77 @@ def test_две_задачи_через_канал_равны_одному_пр�
     merged, _config_json = lora_mod.read_adapter(out[0] / "adapter")
     for name, tensor in whole.adapter_piece().items():
         assert torch.allclose(merged[name], tensor, atol=1e-6), name
+
+
+def test_большие_сообщения_едут_кусками(checkpoint, tmp_path, monkeypatch):
+    """Со стенда: кусок адаптера стадии (20 МБ) не доезжал до головы —
+    `train_collect` ждал 600 с и падал. Канал здесь роняет всё крупнее
+    порога, как gRPC-путь агента; порог занижен, чтобы даже адаптер
+    крошечной модели пришлось резать. Обучение обязано дойти до адаптера,
+    а на провод не должно попасть ни одного цельного большого сообщения."""
+    from looma_stage.train import transport as transport_mod
+
+    _dataset(tmp_path)
+    config = _config(tmp_path)
+    monkeypatch.setattr(transport_mod, "PART_BYTES", 4096)
+    limit = 4096 * 2      # часть + обёртка влезают, цельный адаптер — нет
+
+    class _Strict(_Channel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.parts = 0
+            self.largest = 0
+
+        def send(self, message: dict) -> None:
+            size = len(json.dumps(message))
+            self.largest = max(self.largest, size)
+            if size > limit:
+                return                       # молча, как настоящий провод
+            if message.get("kind") != "train_part":
+                super().send(message)
+                return
+            self.parts += 1
+            # Куски приходят не по порядку — как при откате с прямого пути
+            # на ретранслятор: чётный придерживаем, отдаём после следующего.
+            last = message["index"] == message["total"] - 1
+            if message["index"] % 2 == 0 and not last:
+                self.held = message
+                return
+            super().send(message)
+            if getattr(self, "held", None) is not None:
+                super().send(self.held)
+                self.held = None
+
+    channel = _Strict()
+    codes = {}
+    out = {rank: tmp_path / f"out-{rank}" for rank in (0, 1)}
+    head = TrainingRun(shard=_shard(checkpoint, 0, 2), config=config, rank=0, size=2,
+                       send=channel.send, out_dir=str(out[0]), work_dir=str(tmp_path),
+                       tokenizer=_Tokenizer(), on_done=lambda c: codes.__setitem__(0, c))
+    tail = TrainingRun(shard=_shard(checkpoint, 2, LAYERS), config=config, rank=1, size=2,
+                       send=channel.send, out_dir=str(out[1]), work_dir=str(tmp_path),
+                       on_done=lambda c: codes.__setitem__(1, c))
+    channel.runs = {0: head, 1: tail}
+    head.start()
+    head.thread.join(timeout=120)
+    assert _settled(codes) == {0: 0, 1: 0}, codes
+    assert channel.parts > 1 and channel.largest <= limit, (channel.parts, channel.largest)
+    merged, _ = lora_mod.read_adapter(out[0] / "adapter")
+    assert any(".layers.3." in name for name in merged)   # кусок хвоста доехал
+
+
+def test_куски_собираются_в_любом_порядке():
+    from looma_stage.train.transport import Parts, parted
+
+    sent = []
+    parted(sent.append)({"kind": "train_reply", "target_stage": 0, "answer": {"x": "y" * 3_000_000}})
+    assert len(sent) > 2 and all(m["kind"] == "train_part" for m in sent)
+    parts = Parts()
+    whole = None
+    for message in reversed(sent):
+        whole = parts.absorb(message)
+    assert whole == {"kind": "train_reply", "target_stage": 0, "answer": {"x": "y" * 3_000_000}}
+    assert parts.absorb({"kind": "train_ping"}) == {"kind": "train_ping"}
 
 
 def test_чекпоинты_каждой_стадии_в_свой_каталог(checkpoint, tmp_path):

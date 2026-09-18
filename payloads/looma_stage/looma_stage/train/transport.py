@@ -22,6 +22,8 @@
     train_step      lr, grad_scale
     train_save      dir
     train_collect   → кусок адаптера стадии (тензоры под глобальными именами)
+    train_part      part_of, index, total, data — кусок большого сообщения
+                    любого из видов выше (см. `parted` / `Parts`)
 """
 
 from __future__ import annotations
@@ -272,6 +274,75 @@ class ChannelTransport(Transport):
                 self.send({"kind": "train_finish", "target_stage": i})
             except Exception:
                 logger.warning("стадии %d не сказали про конец", i, exc_info=True)
+
+
+# ------------------------------------------------------------ по частям
+#: Больше этого одно сообщение по каналу агента не отправляется.
+#:
+#: Со стенда (2026-09-18, Qwen3-0.6B на двух узлах): 40 шагов прошли, а
+#: `train_collect` не вернулся за 600 с. Кусок адаптера стадии — 14 слоёв,
+#: r=16, float32 — это 20 МБ тензоров, 27 МБ в base64, и такое сообщение
+#: по пути стадия → агент → агент → стадия не доезжает: у gRPC-канала агента
+#: приём по умолчанию 4 МБ, и ретранслированное оркестратором сообщение
+#: отбрасывается молча. Активации длинных микробатчей больших моделей
+#: (2 × 2048 токенов × 4096 × bf16 = 32 МБ) упёрлись бы туда же.
+#:
+#: Поэтому режем здесь, на своей стороне: любое сообщение больше порога
+#: уезжает кусками `train_part`, получатель складывает. Агента это не
+#: касается — для него это просто много маленьких сообщений. Порог — с
+#: запасом под base64 и обёртки по дороге.
+PART_BYTES = 1 << 20
+
+
+def parted(send):
+    """Обернуть `send` так, чтобы большие сообщения ехали кусками."""
+    import json
+    import uuid
+
+    def send_parted(message: dict) -> None:
+        text = json.dumps(message)
+        if len(text) <= PART_BYTES:
+            send(message)
+            return
+        total = -(-len(text) // PART_BYTES)
+        part_of = uuid.uuid4().hex[:16]
+        logger.info("сообщение %s на стадию %s: %.1f МБ, %d частей",
+                    message.get("kind"), message.get("target_stage"),
+                    len(text) / 2**20, total)
+        for index in range(total):
+            send({"kind": "train_part", "target_stage": message.get("target_stage"),
+                  "part_of": part_of, "index": index, "total": total,
+                  "data": text[index * PART_BYTES:(index + 1) * PART_BYTES]})
+
+    return send_parted
+
+
+class Parts:
+    """Сборка сообщений, приехавших кусками. Порядок прихода — любой."""
+
+    def __init__(self) -> None:
+        self._open: Dict[str, Dict[int, str]] = {}
+        self._total: Dict[str, int] = {}
+
+    def absorb(self, message: dict) -> Optional[dict]:
+        """Целое сообщение — как есть; кусок — None, пока не соберётся."""
+        if message.get("kind") != "train_part":
+            return message
+        import json
+
+        key = str(message.get("part_of") or "")
+        total = int(message.get("total") or 0)
+        if not key or total <= 0:
+            logger.warning("кусок сообщения без метки или размера — отброшен")
+            return None
+        parts = self._open.setdefault(key, {})
+        self._total[key] = total
+        parts[int(message.get("index") or 0)] = str(message.get("data") or "")
+        if len(parts) < total:
+            return None
+        text = "".join(parts[i] for i in range(total))
+        del self._open[key], self._total[key]
+        return json.loads(text)
 
 
 def reply_for(stage, message: dict) -> dict:
