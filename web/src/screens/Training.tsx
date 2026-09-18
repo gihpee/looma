@@ -252,21 +252,32 @@ export function Training() {
   const usable = useMemo(() => (nodes.data?.nodes ?? []).filter((n) => n.accepts_tasks), [nodes.data]);
 
   return (
-    <div>
-      <div className="page-head">
+    <div className="page">
+      <header>
         <div>
-          <h2>Обучение</h2>
-          <div className="sub">LoRA-дообучение по конвейеру: модель режется по слоям между узлами, адаптер — результат</div>
+          <h1>Обучение</h1>
+          <p>{list.length
+            ? `${list.filter((j) => j.state === "running").length} идёт, ${list.length} всего`
+            : "LoRA-дообучение по конвейеру: модель режется по слоям между узлами, адаптер — результат"}</p>
         </div>
-        <Button kind="primary" onClick={() => setTraining(true)}>дообучить модель</Button>
-      </div>
+        <div className="actions">
+          <Button kind="primary" onClick={() => setTraining(true)}>дообучить модель</Button>
+        </div>
+      </header>
+
       <ErrorLine error={jobs.error} />
-      {!list.length && !jobs.loading && (
-        <Empty title="Обучений ещё не было">Загрузите JSONL с диалогами и выберите базовую модель.</Empty>
+
+      {!list.length && !jobs.loading ? (
+        <div className="card">
+          <Empty title="Обучений ещё не было">
+            Загрузите JSONL с диалогами и выберите базовую модель.
+          </Empty>
+        </div>
+      ) : (
+        <div style={{ display: "grid", gap: 12 }}>
+          {list.map((job) => <JobCard key={job.group_id} job={job} onStop={setStopping} />)}
+        </div>
       )}
-      <div style={{ display: "grid", gap: 12 }}>
-        {list.map((job) => <JobCard key={job.group_id} job={job} onStop={setStopping} />)}
-      </div>
       {training && <Train nodes={usable} onClose={() => setTraining(false)} onDone={jobs.refresh} />}
       {stopping && (
         <Confirm title="Остановить обучение?" action="остановить"
