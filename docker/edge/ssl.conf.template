@@ -1,0 +1,14 @@
+# TLS для всех server-блоков разом. Уровень http: ssl_certificate здесь
+# допустим и наследуется каждым `listen 443 ssl`, так что четыре имени не
+# повторяют четыре раза один и тот же путь.
+#
+# Сертификат один на все имена (SAN): выпускается scripts/issue_cert.sh с
+# --cert-name ${LOOMA_DOMAIN}, поэтому каталог в live/ называется по апексу и
+# не меняется при добавлении поддоменов. Тот же файл читает оркестратор для
+# gRPC-канала агентов.
+ssl_certificate     /etc/letsencrypt/live/${LOOMA_DOMAIN}/fullchain.pem;
+ssl_certificate_key /etc/letsencrypt/live/${LOOMA_DOMAIN}/privkey.pem;
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_prefer_server_ciphers off;
+ssl_session_cache shared:SSL:10m;
+ssl_session_timeout 1d;

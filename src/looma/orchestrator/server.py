@@ -85,7 +85,12 @@ async def _reconcile_forever(ledger, hub) -> None:
     while True:
         await asyncio.sleep(RECONCILE_EVERY_S)
         try:
-            await ledger.reconcile(list(hub.groups.keys()))
+            # Живая — та, у которой ещё есть незаконченные задачи. Запись о
+            # группе переживает её саму (она нужна экранам), и если считать
+            # живыми все записи, аренда законченного обучения тикала бы, пока
+            # кто-нибудь не удалит группу руками.
+            live = [gid for gid, rec in hub.groups.items() if not hub.group_finished(rec)]
+            await ledger.reconcile(live)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -106,6 +111,22 @@ async def _sweep_training_forever(app) -> None:
             raise
         except Exception:
             logger.exception("сводка обучений не удалась")
+
+
+#: Как часто пробовать очередь ожидания аренды. Чаще бессмысленно: узлы
+#: освобождаются по секундам, а не по миллисекундам.
+WAITING_SWEEP_S = 10.0
+
+
+async def _serve_waiting_forever(app) -> None:
+    while True:
+        await asyncio.sleep(WAITING_SWEEP_S)
+        try:
+            await app.state.serve_waiting()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("проход очереди ожидания не удался")
 
 
 async def run() -> None:
@@ -189,14 +210,22 @@ async def run() -> None:
     app = create_app(agents=hub, releases=releases, keystore=keystore,
                      config=config, public_address=public, accounts=accounts,
                      ledger=ledger, deployments=fleet, training=training)
+    # Перед оркестратором два nginx (edge и web) на этой же машине: схему
+    # запроса и адрес клиента берём из X-Forwarded-*, но только когда
+    # соединение пришло с 127.0.0.1 — с любого другого адреса заголовкам не
+    # верим. От схемы зависит флаг Secure у сессионной cookie.
     http = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=config.http_port,
-                                         log_level="info", loop="asyncio"))
+                                         log_level="info", loop="asyncio",
+                                         proxy_headers=True,
+                                         forwarded_allow_ips="127.0.0.1"))
     logger.info("HTTP on :%d  (dashboard at /admin)", config.http_port)
     flusher = asyncio.create_task(hub.flush_loop())
     sweeper = asyncio.create_task(_sweep_training_forever(app), name="training-sweep")
+    usher = asyncio.create_task(_serve_waiting_forever(app), name="rent-waiting")
     try:
         await http.serve()
     finally:
+        usher.cancel()
         sweeper.cancel()
         flusher.cancel()
         try:

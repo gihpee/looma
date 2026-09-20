@@ -3,10 +3,13 @@
 FROM nginx:1.27-alpine
 
 COPY docker/edge/default.conf.template /etc/nginx/templates/default.conf.template
+# Общий TLS-блок — тоже шаблон: в нём путь к сертификату с именем домена.
+COPY docker/edge/ssl.conf.template /etc/nginx/templates/ssl.conf.template
 # В conf.d, а не в templates: подставлять тут нечего, а nginx подхватит сам.
 COPY docker/edge/upgrade.conf /etc/nginx/conf.d/upgrade.conf
 
-ENV LOOMA_WEB_PORT=8080
+ENV LOOMA_WEB_PORT=8080 \
+    LOOMA_HTTP_PORT=8000
 
 # Перезагрузка по расписанию — сценарием, который образ выполняет сам перед
 # стартом. Команда остаётся нетронутой: подмена её на `sh -c` отключает

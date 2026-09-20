@@ -29,10 +29,14 @@ from typing import Dict, Iterable, List, Optional
 
 logger = logging.getLogger("looma.usage")
 
-#: Два ресурса, которые платформа продаёт.
+#: Ресурсы, которые платформа продаёт. Обучение — отдельной строкой: у него
+#: своя ставка (или ставка кластера, если своя не задана) и свой смысл в
+#: отчёте; смешивать его с арендой кластера значило бы показывать клиенту
+#: чужое обучение как его «кластер».
 INFERENCE = "looma-inference"
 COMPUTE = "looma-compute"
-RESOURCES = (INFERENCE, COMPUTE)
+TRAINING = "looma-training"
+RESOURCES = (INFERENCE, COMPUTE, TRAINING)
 
 #: Почему аренда закрылась.
 RELEASED = "released"    # сняли намеренно — время точное
@@ -50,6 +54,22 @@ class Rate:
     def as_dict(self) -> dict:
         return {"resource": self.resource, "per_hour": self.per_hour,
                 "currency": self.currency}
+
+
+MILLION = 1_000_000
+
+
+def token_cost(*, prompt_tokens: int, completion_tokens: int,
+               price_in: int, price_out: int) -> int:
+    """Стоимость ответа в копейках. Цены — за миллион токенов.
+
+    Вверх, как и у часов: доли копейки на коротких ответах складываются в
+    сумму, которую иначе платформа систематически раздаёт бесплатно.
+    """
+    import math
+    raw = (max(0, prompt_tokens) * max(0, price_in)
+           + max(0, completion_tokens) * max(0, price_out))
+    return math.ceil(raw / MILLION) if raw > 0 else 0
 
 
 def cost(*, per_hour: int, gpus: int, seconds: float) -> int:
@@ -92,10 +112,16 @@ class Ledger:
             row = await connection.fetchrow(
                 "SELECT resource, per_hour, currency FROM rates WHERE resource = $1",
                 resource)
+        if row:
+            return Rate(**dict(row))
+        # Обучение без своей ставки идёт по ставке кластера: это та же карта
+        # на те же часы, и второе число оператору заводить необязательно.
+        if resource == TRAINING:
+            return Rate(TRAINING, (await self.rate(COMPUTE)).per_hour)
         # Ноль, а не отказ: узел должен работать и до того, как оператор назначил
         # цену. Потребление при этом считается, счёт выходит нулевым, и цену
         # можно назначить потом — записи уже собраны.
-        return Rate(**dict(row)) if row else Rate(resource, 0)
+        return Rate(resource, 0)
 
     async def rates(self) -> List[Rate]:
         async with self.db.acquire() as connection:
@@ -187,26 +213,78 @@ class Ledger:
 
     # -------------------------------------------------------------- токены
     async def record_tokens(self, *, account_id: int, model: str,
-                            prompt_tokens: int, completion_tokens: int) -> None:
+                            prompt_tokens: int, completion_tokens: int,
+                            price_in: int = 0, price_out: int = 0) -> int:
         """Токены одного ответа. Другая единица — поэтому другая таблица:
         складывать часы и токены в один столбец означало бы столбец, смысл
-        которого зависит от соседнего."""
+        которого зависит от соседнего.
+
+        `price_in`/`price_out` — копейки за миллион токенов по прайсу на
+        момент ответа; стоимость считается здесь и запоминается в записи.
+        Возвращает, сколько стоил ответ.
+        """
         if prompt_tokens <= 0 and completion_tokens <= 0:
-            return
+            return 0
+        price = token_cost(prompt_tokens=prompt_tokens,
+                           completion_tokens=completion_tokens,
+                           price_in=price_in, price_out=price_out)
         async with self.db.acquire() as connection:
             await connection.execute(
                 "INSERT INTO token_usage (account_id, model, prompt_tokens,"
-                " completion_tokens) VALUES ($1, $2, $3, $4)",
-                account_id, model, max(0, prompt_tokens), max(0, completion_tokens))
+                " completion_tokens, cost) VALUES ($1, $2, $3, $4, $5)",
+                account_id, model, max(0, prompt_tokens), max(0, completion_tokens),
+                price)
+        return price
+
+    # -------------------------------------------------------------- кредиты
+    async def grant(self, *, account_id: int, kopecks: int, note: str = "",
+                    granted_by: Optional[int] = None) -> dict:
+        """Начислить (или, с минусом, скорректировать). Ноль — не запись."""
+        if kopecks == 0:
+            raise ValueError("начислять ноль бессмысленно")
+        async with self.db.acquire() as connection:
+            row = await connection.fetchrow(
+                "INSERT INTO credits (account_id, kopecks, note, granted_by)"
+                " VALUES ($1, $2, $3, $4) RETURNING id, at",
+                account_id, kopecks, note or "", granted_by)
+        return {"id": int(row["id"]), "account_id": account_id, "kopecks": kopecks,
+                "note": note or "", "granted_by": granted_by, "at": row["at"]}
+
+    async def grants(self, account_id: int, limit: int = 100) -> List[dict]:
+        """Журнал начислений одного клиента, свежие первыми."""
+        async with self.db.acquire() as connection:
+            rows = await connection.fetch(
+                "SELECT id, account_id, kopecks, note, granted_by, at FROM credits"
+                " WHERE account_id = $1 ORDER BY at DESC LIMIT $2", account_id, limit)
+        return [dict(row) for row in rows]
+
+    async def balance(self, account_id: int) -> dict:
+        """Сколько осталось: начислено минус израсходовано за всё время.
+
+        Расход считается из журнала, а не хранится: идущая аренда тикает, и
+        число, которое видит клиент посреди аренды, должно уменьшаться само.
+        """
+        spent = await self.report(account_id=account_id)
+        async with self.db.acquire() as connection:
+            credited = await connection.fetchval(
+                "SELECT COALESCE(sum(kopecks), 0) FROM credits WHERE account_id = $1",
+                account_id)
+        credited = int(credited or 0)
+        return {"kopecks": credited - spent["total"], "credited": credited,
+                "spent": spent["total"], "currency": "RUB"}
 
     # --------------------------------------------------------------- отчёт
     async def report(self, *, account_id: Optional[int] = None,
                      since: Optional[datetime] = None,
-                     until: Optional[datetime] = None) -> dict:
+                     until: Optional[datetime] = None,
+                     resource: Optional[str] = None) -> dict:
         """Что израсходовано за период. Без account_id — по всем.
 
         Незакрытые аренды считаются по «сейчас»: клиент, глядя на свой счёт
         посреди аренды, должен видеть то, что уже натикало, а не ноль.
+
+        `resource` сужает отчёт до одного продукта; `looma-inference` при
+        этом означает и аренды инференса, и токены.
         """
         where, args = ["TRUE"], []
         if account_id is not None:
@@ -219,17 +297,24 @@ class Ledger:
             args.append(until)
             where.append(f"opened_at < ${len(args)}")
         condition = " AND ".join(where)
+        lease_condition = condition
+        if resource is not None:
+            args.append(resource)
+            lease_condition = f"{condition} AND resource = ${len(args)}"
+        lease_args = list(args)
+        token_args = lease_args[:-1] if resource is not None else lease_args
+        want_tokens = resource in (None, INFERENCE)
 
         async with self.db.acquire() as connection:
             leases = await connection.fetch(
                 "SELECT resource, gpus, per_hour, currency, opened_at,"
                 " COALESCE(closed_at, now()) AS ended_at, closed_at IS NULL AS running"
-                f" FROM leases WHERE {condition}", *args)
+                f" FROM leases WHERE {lease_condition}", *lease_args)
             tokens = await connection.fetch(
                 "SELECT model, sum(prompt_tokens) AS prompt,"
-                " sum(completion_tokens) AS completion"
+                " sum(completion_tokens) AS completion, sum(cost) AS cost"
                 f" FROM token_usage WHERE {condition.replace('opened_at', 'at')}"
-                " GROUP BY model ORDER BY model", *args)
+                " GROUP BY model ORDER BY model", *token_args) if want_tokens else []
 
         by_resource: Dict[str, dict] = {}
         for row in leases:
@@ -245,15 +330,44 @@ class Ledger:
             piece["cost"] += cost(per_hour=row["per_hour"], gpus=row["gpus"],
                                   seconds=seconds)
 
+        token_lines = [
+            {"model": row["model"], "prompt": int(row["prompt"] or 0),
+             "completion": int(row["completion"] or 0), "cost": int(row["cost"] or 0)}
+            for row in tokens
+        ]
+        lease_lines = [
+            {**piece, "gpu_hours": round(piece["gpu_seconds"] / SECONDS_PER_HOUR, 3)}
+            for piece in sorted(by_resource.values(), key=lambda p: p["resource"])
+        ]
         return {
-            "leases": [
-                {**piece,
-                 "gpu_hours": round(piece["gpu_seconds"] / SECONDS_PER_HOUR, 3)}
-                for piece in sorted(by_resource.values(), key=lambda p: p["resource"])
-            ],
-            "tokens": [
-                {"model": row["model"], "prompt": int(row["prompt"] or 0),
-                 "completion": int(row["completion"] or 0)}
-                for row in tokens
-            ],
+            "leases": lease_lines,
+            "tokens": token_lines,
+            "total": (sum(p["cost"] for p in lease_lines)
+                      + sum(t["cost"] for t in token_lines)),
+            "currency": "RUB",
         }
+
+
+def report_csv(report: dict) -> str:
+    """Отчёт строками для таблицы: по одной на ресурс и на модель.
+
+    Суммы — в рублях с копейками, а не в копейках: файл открывают в таблице
+    люди, а не программы, и «120.50» им понятнее, чем «12050».
+    """
+    import csv
+    import io
+
+    out = io.StringIO()
+    writer = csv.writer(out, delimiter=";", lineterminator="\n")
+    writer.writerow(["вид", "ресурс/модель", "аренд", "GPU-часов",
+                     "токенов на вход", "токенов на выход", "стоимость, ₽"])
+    for line in report.get("leases", []):
+        writer.writerow(["аренда", line["resource"], line["leases"],
+                         f"{line['gpu_hours']:.3f}", "", "",
+                         f"{line['cost'] / 100:.2f}"])
+    for line in report.get("tokens", []):
+        writer.writerow(["токены", line["model"], "", "", line["prompt"],
+                         line["completion"], f"{line.get('cost', 0) / 100:.2f}"])
+    writer.writerow(["итого", "", "", "", "", "",
+                     f"{report.get('total', 0) / 100:.2f}"])
+    return out.getvalue()

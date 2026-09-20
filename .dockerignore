@@ -1,0 +1,12 @@
+# Сборка web идёт внутри образа: локальные node_modules и dist в контекст не
+# нужны и только раздувают его.
+web/node_modules
+web/apps/*/node_modules
+web/apps/*/dist
+web/packages/*/node_modules
+desktop
+.venv
+payloads/*/.venv
+**/__pycache__
+web/test-results
+web/playwright-report

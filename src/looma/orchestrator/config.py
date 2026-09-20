@@ -39,6 +39,11 @@ class OrchestratorConfig:
     admin_token: str = ""
     # How long a node may be silent before it is treated as gone.
     heartbeat_timeout_s: float = 30.0
+    # Домен сессионной cookie. Консоль и админка живут на разных поддоменах
+    # одного домена, и один вход должен работать на обоих: cookie ставится на
+    # `.loomafloat.ru`, а не на хост запроса. Пусто — cookie только для хоста,
+    # так работает локальный запуск на localhost.
+    cookie_domain: str = ""
 
     @property
     def keystore_path(self) -> str:
@@ -63,4 +68,5 @@ class OrchestratorConfig:
             data_dir=os.environ.get("LOOMA_DATA_DIR", "/data"),
             admin_token=os.environ.get("LOOMA_ADMIN_TOKEN", "").strip(),
             heartbeat_timeout_s=_float("LOOMA_HEARTBEAT_TIMEOUT_S", 30.0),
+            cookie_domain=os.environ.get("LOOMA_COOKIE_DOMAIN", "").strip().lstrip("."),
         )

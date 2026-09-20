@@ -46,9 +46,10 @@ services:
       # for us. All of it must outlive the container.
       - looma-data:/data
 
-  # Панель оператора. Отдельный образ, потому что это отдельная сборка: node
-  # нужен ей и больше никому. Host-сеть, чтобы проксировать в оркестратор по
-  # 127.0.0.1 без имён и без второй сети.
+  # Три сборки в одном контейнере — лендинг, консоль, админка — и nginx,
+  # который по Host решает, какую отдать. Отдельный образ, потому что это
+  # отдельная сборка: node нужен ей и больше никому. Host-сеть, чтобы
+  # проксировать в оркестратор по 127.0.0.1 без имён и без второй сети.
   web:
     build:
       context: .
@@ -59,11 +60,15 @@ services:
       LOOMA_WEB_PORT: ${LOOMA_WEB_PORT:-8080}
       LOOMA_HTTP_PORT: ${LOOMA_HTTP_PORT:-8000}
       LOOMA_API_HOST: 127.0.0.1
+      # По этому имени nginx различает лендинг, console. и admin.
+      LOOMA_DOMAIN: ${LOOMA_DOMAIN:-localhost}
     depends_on:
       - orchestrator
 
-  # Единственное, что смотрит в интернет. Панель и API остаются на локальных
-  # портах и в интернет не выставляются — их закрывает межсетевой экран узла.
+  # Единственное, что смотрит в интернет. Четыре имени — лендинг, console.,
+  # admin., api. — на одном сертификате; первые три уходят в web, api. — в
+  # оркестратор. Сами web и API остаются на локальных портах и в интернет не
+  # выставляются — их закрывает межсетевой экран узла.
   edge:
     build:
       context: .
@@ -73,6 +78,8 @@ services:
     environment:
       LOOMA_DOMAIN: ${LOOMA_DOMAIN:?нужен домен, например loomafloat.ru}
       LOOMA_WEB_PORT: ${LOOMA_WEB_PORT:-8080}
+      # api.<домен> идёт в оркестратор напрямую, минуя web.
+      LOOMA_HTTP_PORT: ${LOOMA_HTTP_PORT:-8000}
     volumes:
       - letsencrypt:/etc/letsencrypt:ro
       - acme:/var/www/acme:ro

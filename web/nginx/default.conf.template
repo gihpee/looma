@@ -1,19 +1,37 @@
-# Панель оператора и единственный вход для браузера.
+# Три сборки за одним портом. По Host выбирается сборка и набор путей,
+# которые проксируются в оркестратор:
 #
-# Приложение отдаётся по корню, а /admin и /v1 проксируются в оркестратор.
-# Так у API и у SPA не спорят пути, а браузер ходит на один origin — без CORS
-# и без адреса оркестратора, зашитого в сборку.
-server {
-    listen ${LOOMA_WEB_PORT};
-    server_name _;
+#   ${LOOMA_DOMAIN}          лендинг      + /api/demo, /api/public
+#   console.${LOOMA_DOMAIN}  консоль      + /api, /v1
+#   admin.${LOOMA_DOMAIN}    админка      + /api, /admin, /v1, /connect
+#
+# Браузер всегда ходит на свой origin — без CORS и без адреса оркестратора,
+# зашитого в сборку. Программный API живёт на api.<домен> и сюда не заходит:
+# edge отправляет его в оркестратор напрямую.
+#
+# Локальный запуск без домена (LOOMA_DOMAIN=localhost): первый блок объявлен
+# default_server и отвечает на любой Host, консоль и админка доступны как
+# console.localhost и admin.localhost — браузеры резолвят *.localhost сами.
 
-    root /usr/share/nginx/html;
+# ------------------------------------------------------------------ лендинг
+server {
+    listen ${LOOMA_WEB_PORT} default_server;
+    server_name ${LOOMA_DOMAIN};
+
+    root /usr/share/nginx/html/landing;
     index index.html;
 
-    # Single-page app: любой путь, которого нет на диске, отдаёт index.html.
     location / {
         try_files $uri $uri/ /index.html;
     }
+
+    # Старые адреса кабинета и панели на апексе: закладки и письма живут
+    # дольше, чем маршруты. Ведут на новые поверхности, а не в 404.
+    location = /app      { return 301 https://console.${LOOMA_DOMAIN}/; }
+    location ^~ /app/    { return 301 https://console.${LOOMA_DOMAIN}/; }
+    location = /console  { return 301 https://admin.${LOOMA_DOMAIN}/; }
+    location ^~ /console/ { return 301 https://admin.${LOOMA_DOMAIN}/; }
+    location = /signin   { return 301 https://console.${LOOMA_DOMAIN}/; }
 
     # Хеши в именах файлов — можно кэшировать надолго; index.html нельзя,
     # иначе после обновления браузер будет грузить старые скрипты.
@@ -22,10 +40,10 @@ server {
         add_header Cache-Control "public, immutable";
     }
 
-    # Демо на лендинге. Отдельно от /api/ ради одной строчки: без выключенной
-    # буферизации nginx копит ответ целиком, и обещанная скорость превращается
-    # в паузу на всю генерацию, а потом текст разом. Заодно сюда доезжает адрес
-    # обратившегося — по нему считается предел на демо.
+    # Демо на лендинге: без выключенной буферизации nginx копит ответ целиком,
+    # и обещанная скорость превращается в паузу на всю генерацию, а потом
+    # текст разом. Заодно сюда доезжает адрес обратившегося — по нему
+    # считается предел на демо.
     location /api/demo {
         proxy_pass http://${LOOMA_API_HOST}:${LOOMA_HTTP_PORT};
         proxy_set_header Host $host;
@@ -36,13 +54,77 @@ server {
         proxy_read_timeout 300s;
     }
 
-    # Кабинет клиента. Отдельным префиксом от /admin: правило доступа читается
-    # по адресу, а не по догадке о том, кто зашёл.
+    # Публичный прайс — без сессии, кэшируется на минуту, чтобы лендинг не
+    # ходил в оркестратор на каждый заход.
+    location /api/public/ {
+        proxy_pass http://${LOOMA_API_HOST}:${LOOMA_HTTP_PORT};
+        proxy_set_header Host $host;
+        proxy_read_timeout 30s;
+    }
+}
+
+# ------------------------------------------------------------------ консоль
+server {
+    listen ${LOOMA_WEB_PORT};
+    server_name console.${LOOMA_DOMAIN};
+
+    root /usr/share/nginx/html/console;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Кабинет клиента. Сессия ездит в cookie, и без этого заголовка вход
+    # работал бы только до первой перезагрузки страницы.
     location /api/ {
         proxy_pass http://${LOOMA_API_HOST}:${LOOMA_HTTP_PORT};
         proxy_set_header Host $host;
-        # Сессия ездит в cookie, и без этого заголовка вход работал бы только
-        # до первой перезагрузки страницы.
+        proxy_set_header Cookie $http_cookie;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # Загрузка датасета для обучения и весов адаптера.
+        client_max_body_size 512m;
+        proxy_read_timeout 300s;
+    }
+
+    # Чат консоли: тот же /v1, что и у программного API, но под cookie.
+    location /v1/ {
+        proxy_pass http://${LOOMA_API_HOST}:${LOOMA_HTTP_PORT};
+        proxy_set_header Host $host;
+        proxy_set_header Cookie $http_cookie;
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+        proxy_read_timeout 900s;
+    }
+}
+
+# ------------------------------------------------------------------ админка
+server {
+    listen ${LOOMA_WEB_PORT};
+    server_name admin.${LOOMA_DOMAIN};
+
+    root /usr/share/nginx/html/admin;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Кто вошёл, выход: те же ручки, что у консоли.
+    location /api/ {
+        proxy_pass http://${LOOMA_API_HOST}:${LOOMA_HTTP_PORT};
+        proxy_set_header Host $host;
         proxy_set_header Cookie $http_cookie;
         proxy_read_timeout 120s;
     }
@@ -50,9 +132,20 @@ server {
     location /admin/ {
         proxy_pass http://${LOOMA_API_HOST}:${LOOMA_HTTP_PORT};
         proxy_set_header Host $host;
+        proxy_set_header Cookie $http_cookie;
         proxy_set_header X-Looma-Admin-Token $http_x_looma_admin_token;
         # Результат задачи может быть большим, а установка окружения — долгой.
         client_max_body_size 512m;
+        proxy_read_timeout 900s;
+    }
+
+    location /v1/ {
+        proxy_pass http://${LOOMA_API_HOST}:${LOOMA_HTTP_PORT};
+        proxy_set_header Host $host;
+        proxy_set_header Cookie $http_cookie;
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
         proxy_read_timeout 900s;
     }
 
@@ -66,21 +159,8 @@ server {
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
         proxy_set_header X-Looma-Admin-Token $http_x_looma_admin_token;
-        # Ray Client держит соединение открытым и подолгу молчит: между двумя
-        # вызовами из ноутбука может пройти час, и рвать его нельзя.
         proxy_read_timeout 86400s;
         proxy_send_timeout 86400s;
         proxy_buffering off;
-    }
-
-    location /v1/ {
-        proxy_pass http://${LOOMA_API_HOST}:${LOOMA_HTTP_PORT};
-        proxy_set_header Host $host;
-        # Без этого nginx копит ответ целиком и стрим превращается в паузу на
-        # всю генерацию, а потом разом весь текст.
-        proxy_buffering off;
-        proxy_cache off;
-        chunked_transfer_encoding on;
-        proxy_read_timeout 900s;
     }
 }

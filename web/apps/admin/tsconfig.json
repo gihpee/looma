@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "tsBuildInfoFile": "node_modules/.tsbuildinfo"
+  },
+  "include": [
+    "src",
+    "../../packages/ui/src",
+    "../../packages/api/src"
+  ],
+  "exclude": [
+    "../../packages/**/__tests__/**",
+    "../../packages/**/*.test.*"
+  ]
+}

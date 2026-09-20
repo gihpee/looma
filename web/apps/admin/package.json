@@ -1,0 +1,17 @@
+{
+  "name": "@looma/admin",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5175",
+    "build": "tsc -b && vite build"
+  },
+  "dependencies": {
+    "@looma/api": "*",
+    "@looma/ui": "*",
+    "@tanstack/react-query": "^5.62.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.1.1"
+  }
+}

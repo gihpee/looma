@@ -19,6 +19,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -31,7 +32,7 @@ from looma.api.auth import (
     refuse,
 )
 from looma.logging_config import get_logger
-from looma.usage.ledger import COMPUTE, INFERENCE
+from looma.usage.ledger import COMPUTE, INFERENCE, RESOURCES, TRAINING, report_csv
 from looma.orchestrator.agents import AgentError
 from looma.orchestrator.models import (
     ModelError,
@@ -48,6 +49,9 @@ from looma.usage.training import DONE, FAILED, RUNNING, STOPPED, MemoryTrainingJ
 from looma.orchestrator.adapters import ADAPTER_FILES, AdapterStore, adapter_root
 from looma.orchestrator.connectivity import prefer_meshy, verdict
 from looma.orchestrator.payloads import PayloadMissing, ray_payload
+from looma.orchestrator.pricing import PricingStore
+from looma.orchestrator import logos
+from looma.orchestrator.waiting import WaitingRoom
 from looma.orchestrator.rendezvous import relay_addrs
 from looma.orchestrator.releases import ReleaseError
 
@@ -139,12 +143,15 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
                public_address=None, accounts=None, ledger=None,
                deployments=None, training=None) -> FastAPI:
     app = FastAPI(title="Looma", version="0.2.0")
+    cookie_domain = getattr(config, "cookie_domain", "") or ""
     # Задания на дообучение: без базы — в памяти, чтобы форма работала и на
     # оркестраторе без учётных записей.
     training = training if training is not None else MemoryTrainingJobs()
     # Адаптеры после обучения — на диске оркестратора: результат задачи на
     # узле живёт час, а развернуть адаптер захотят и через месяц.
     adapters = AdapterStore(adapter_root(config))
+    # Публичный прайс — рядом с ключами и адаптерами, в каталоге данных.
+    pricing = PricingStore(str(adapter_root(config).parent / "pricing.json"))
     auth = Authenticator(accounts=accounts,
                          emergency_token=getattr(config, "admin_token", "") or "")
 
@@ -159,7 +166,8 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
     # принципе, и обнаруживается это не раньше первой попытки.
     # Демо на лендинге отвечает без представления — в том и смысл: человек
     # должен убедиться в скорости до того, как заводить учётную запись.
-    OPEN = {"/api/session", "/api/demo"}
+    # Прайс тоже открыт: лендинг показывает цены до входа — в том его смысл.
+    OPEN = {"/api/session", "/api/demo", "/api/public/pricing"}
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
@@ -205,27 +213,55 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
             logger.exception("не удалось открыть аренду для %s", record.group_id)
             return 0
 
+    def _model_price(model: str):
+        """Цена модели из прайса — копейки за миллион токенов. Нет в прайсе —
+        ноль: платформенная модель без цены отвечает бесплатно, как и узел
+        без ставки; своя модель клиента считается по аренде, не по токенам."""
+        found = next((m for m in pricing.read().models if m.id == model), None)
+        return (found.price_in, found.price_out) if found else (0, 0)
+
+    async def _record_usage(request: Request, model: str, usage: dict) -> None:
+        who = whoami(request)
+        if ledger is None or who.account_id is None:
+            return
+        price_in, price_out = _model_price(model)
+        try:
+            await ledger.record_tokens(
+                account_id=who.account_id, model=model,
+                prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                completion_tokens=int(usage.get("completion_tokens") or 0),
+                price_in=price_in, price_out=price_out)
+        except Exception:
+            logger.exception("не удалось записать токены ответа")
+
     async def _count_tokens(request: Request, model: str, answer: bytes) -> None:
         """Записать токены ответа.
 
         Считаются те, что назвала сама стадия: пересчитывать их здесь значило
         бы держать второй токенизатор и расходиться с первым на краях.
-
-        Потоковый ответ пока не учитывается — счётчики приходят в последнем
-        куске, а он уезжает клиенту, минуя это место. Молчать об этом хуже, чем
-        сказать: см. docs/BILLING.md.
         """
-        who = whoami(request)
-        if ledger is None or who.account_id is None:
-            return
         try:
             usage = (json.loads(answer or b"{}") or {}).get("usage") or {}
-            await ledger.record_tokens(
-                account_id=who.account_id, model=model,
-                prompt_tokens=int(usage.get("prompt_tokens") or 0),
-                completion_tokens=int(usage.get("completion_tokens") or 0))
-        except Exception:
-            logger.exception("не удалось записать токены ответа")
+        except ValueError:
+            return
+        await _record_usage(request, model, usage)
+
+    def _usage_in(event: bytes) -> Optional[dict]:
+        """Счётчики из события потока, если оно их несёт. Стадия кладёт их в
+        последний кусок перед [DONE]; всё остальное — дельты без usage."""
+        for line in event.split(b"\n"):
+            if not line.startswith(b"data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == b"[DONE]":
+                continue
+            try:
+                usage = (json.loads(payload) or {}).get("usage")
+            except ValueError:
+                continue
+            if isinstance(usage, dict) and usage:
+                return usage
+        return None
 
     async def _plan_preemption(size: int, free: list):
         """Кого подвинуть. Считается целиком, ничего не трогая."""
@@ -327,7 +363,11 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
             SESSION_COOKIE, token,
             httponly=True,      # чужой скрипт на странице не прочитает
             samesite="lax",     # и не отправит её с чужого сайта
+            # Схема — из X-Forwarded-Proto, который ставит edge: uvicorn
+            # доверяет заголовку с 127.0.0.1 (proxy_headers в server.py).
             secure=request.url.scheme == "https",
+            # Один вход на console. и admin.: cookie на родительский домен.
+            domain=cookie_domain or None,
             max_age=int(SESSION_TTL.total_seconds()),
             path="/")
         return answer
@@ -337,7 +377,9 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         if accounts is not None:
             await accounts.end_session(request.cookies.get(SESSION_COOKIE) or "")
         answer = JSONResponse(content={"signed_out": True})
-        answer.delete_cookie(SESSION_COOKIE, path="/")
+        # Удалять — с тем же domain, с которым ставили, иначе браузер сочтёт
+        # это другой cookie и оставит старую.
+        answer.delete_cookie(SESSION_COOKIE, path="/", domain=cookie_domain or None)
         return answer
 
     @app.get("/api/me")
@@ -386,14 +428,59 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
 
         return when("since"), when("until")
 
+    def _resource_filter(request: Request):
+        raw = (request.query_params.get("resource") or "").strip()
+        if not raw:
+            return None, None
+        if raw not in RESOURCES:
+            return None, _error(400, f"ресурса {raw!r} не бывает: {', '.join(RESOURCES)}")
+        return raw, None
+
     @app.get("/api/usage")
     async def my_usage(request: Request):
-        """Что израсходовал я. Идущие аренды считаются по «сейчас»."""
+        """Что израсходовал я. Идущие аренды считаются по «сейчас».
+        `since`, `until` — ISO-даты; `resource` — один продукт."""
         if ledger is None:
             return _error(503, "оркестратор поднят без базы: журнала нет")
         since, until = _period(request)
+        resource, bad = _resource_filter(request)
+        if bad is not None:
+            return bad
         return await ledger.report(account_id=whoami(request).account_id,
-                                   since=since, until=until)
+                                   since=since, until=until, resource=resource)
+
+    @app.get("/api/usage/export.csv")
+    async def my_usage_csv(request: Request):
+        """Тот же отчёт строками для таблицы."""
+        if ledger is None:
+            return _error(503, "оркестратор поднят без базы: журнала нет")
+        since, until = _period(request)
+        resource, bad = _resource_filter(request)
+        if bad is not None:
+            return bad
+        report = await ledger.report(account_id=whoami(request).account_id,
+                                     since=since, until=until, resource=resource)
+        return Response(content="\ufeff" + report_csv(report),
+                        media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition":
+                                 'attachment; filename="looma-usage.csv"'})
+
+    @app.get("/api/balance")
+    async def my_balance(request: Request):
+        """Сколько кредитов осталось: начислено минус израсходовано.
+        1 кредит = 1 ₽, в копейках. Аварийный вход баланса не имеет."""
+        if ledger is None:
+            return _error(503, "оркестратор поднят без базы: баланса нет")
+        who = whoami(request)
+        if who.account_id is None:
+            return {"kopecks": 0, "credited": 0, "spent": 0, "currency": "RUB",
+                    "grants": []}
+        balance = await ledger.balance(who.account_id)
+        grants = await ledger.grants(who.account_id, limit=20)
+        return {**balance, "grants": [_grant_row(g) for g in grants]}
+
+    def _grant_row(row: dict) -> dict:
+        return {**row, "at": row["at"].isoformat() if row.get("at") else None}
 
     @app.get("/admin/usage")
     async def all_usage(request: Request):
@@ -401,9 +488,151 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         if ledger is None:
             return _error(503, "оркестратор поднят без базы: журнала нет")
         since, until = _period(request)
+        resource, bad = _resource_filter(request)
+        if bad is not None:
+            return bad
         who = request.query_params.get("account_id")
         return await ledger.report(account_id=int(who) if who else None,
-                                   since=since, until=until)
+                                   since=since, until=until, resource=resource)
+
+    @app.get("/admin/usage/export.csv")
+    async def all_usage_csv(request: Request):
+        if ledger is None:
+            return _error(503, "оркестратор поднят без базы: журнала нет")
+        since, until = _period(request)
+        who = request.query_params.get("account_id")
+        report = await ledger.report(account_id=int(who) if who else None,
+                                     since=since, until=until)
+        return Response(content="\ufeff" + report_csv(report),
+                        media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition":
+                                 'attachment; filename="looma-usage-all.csv"'})
+
+    # ------------------------------------------------------------- кредиты
+    @app.get("/admin/accounts/{account_id}/credits")
+    async def account_credits(account_id: int):
+        """Баланс и журнал начислений одного клиента."""
+        if ledger is None:
+            return _error(503, "оркестратор поднят без базы: кредитов нет")
+        balance = await ledger.balance(account_id)
+        grants = await ledger.grants(account_id)
+        return {**balance, "account_id": account_id,
+                "grants": [_grant_row(g) for g in grants]}
+
+    @app.post("/admin/accounts/{account_id}/credits")
+    async def grant_credits(account_id: int, request: Request):
+        """Начислить кредиты. `kopecks` — целое, может быть отрицательным
+        (корректировка); `note` — за что. Платёжного модуля нет: кредиты
+        появляются только отсюда."""
+        if ledger is None:
+            return _error(503, "оркестратор поднят без базы: кредитов нет")
+        if accounts is not None and await accounts.by_id(account_id) is None:
+            return _error(404, "такой учётной записи нет")
+        body = await _body(request)
+        try:
+            kopecks = int(body.get("kopecks") or 0)
+        except (TypeError, ValueError):
+            return _error(400, "'kopecks' — целое число копеек")
+        if kopecks == 0:
+            return _error(400, "начислять ноль бессмысленно")
+        try:
+            made = await ledger.grant(account_id=account_id, kopecks=kopecks,
+                                      note=str(body.get("note") or ""),
+                                      granted_by=whoami(request).account_id)
+        except ValueError as exc:
+            return _error(400, str(exc))
+        balance = await ledger.balance(account_id)
+        return {"grant": _grant_row(made), **balance}
+
+    # ------------------------------------------------------------ аренды (админ)
+    @app.get("/admin/leases")
+    async def admin_leases():
+        """Все идущие аренды по всем клиентам — с признаком, жива ли ещё
+        группа. Зависшая аренда (группа кончилась, а лиза открыта) — то, что
+        здесь ищут."""
+        if ledger is None:
+            return _error(503, "оркестратор поднят без базы: журнала нет")
+        rows = await ledger.open_leases()
+        out = []
+        for row in rows:
+            rec = agents.groups.get(row["group_id"]) if agents is not None else None
+            out.append({**row, "opened_at": row["opened_at"].isoformat() if hasattr(row["opened_at"], "isoformat") else row["opened_at"],
+                        "alive": rec is not None and not agents.group_finished(rec),
+                        "known": rec is not None})
+        return {"leases": out}
+
+    @app.post("/admin/leases/{group_id}/close")
+    async def admin_close_lease(group_id: str):
+        """Закрыть аренду руками — по наблюдению, а не по факту снятия."""
+        if ledger is None:
+            return _error(503, "оркестратор поднят без базы: журнала нет")
+        await _stop_billing(group_id)
+        return {"group_id": group_id, "closed": True}
+
+    @app.get("/admin/groups/health")
+    async def admin_groups_health():
+        """Здоровье всех групп одним запросом — вместо N опросов по одной."""
+        if agents is None:
+            return need_agents()
+        out = []
+        for group_id, record in list(agents.groups.items()):
+            if agents.group_finished(record):
+                continue
+            out.append(await _group_health(group_id, record))
+        return {"groups": out}
+
+    # ------------------------------------------------------------ прайс
+    @app.get("/api/public/pricing")
+    async def public_pricing():
+        """Классы карт с ценами конкурентов и модели с ценой за токен. Без
+        представления: лендинг обязан показывать цены до регистрации."""
+        return pricing.read().public()
+
+    @app.get("/admin/pricing")
+    async def admin_pricing():
+        return pricing.read().as_dict()
+
+    @app.put("/admin/pricing")
+    async def write_pricing(request: Request):
+        """Документ целиком: черновик живёт в админке, сюда приходит
+        «опубликовать». Копейки, целыми.
+
+        Модели без логотипа получают аватар владельца с HuggingFace, если
+        `repo` указан (или имя модели похоже на `владелец/название`).
+        Ссылка администратора важнее найденной: её не трогаем.
+        """
+        body = dict(await _body(request))
+        for model in body.get("models") or []:
+            if not isinstance(model, dict) or model.get("logo_url"):
+                continue
+            repo = str(model.get("repo") or model.get("id") or "")
+            found = await logos.avatar(repo)
+            if found:
+                model["logo_url"] = found
+        try:
+            return pricing.write(body).as_dict()
+        except (ValueError, TypeError) as exc:
+            return _error(400, f"прайс не разобран: {exc}")
+
+    @app.get("/admin/logos/lookup")
+    async def logo_lookup(request: Request):
+        """Аватар владельца репозитория на HuggingFace — для кнопки «найти
+        логотип» в прайсе. Пусто — не нашлось; администратор вставит свой."""
+        repo = (request.query_params.get("repo") or "").strip()
+        if not repo:
+            return _error(400, "нужен ?repo=владелец/название")
+        return {"repo": repo, "logo_url": await logos.avatar(repo)}
+
+    @app.get("/api/rates")
+    async def client_rates():
+        """Ставки для расчёта стоимости в визардах: по ресурсам (из журнала) и
+        по классам карт (из прайса). Клиент видит цену до действия."""
+        rates = [r.as_dict() for r in await ledger.rates()] if ledger is not None else []
+        doc = pricing.read()
+        return {"rates": rates,
+                "gpu_classes": [c.__dict__ for c in doc.gpu_classes],
+                "training_rate_kopecks": doc.training_rate_kopecks,
+                "currency": doc.currency}
 
     @app.get("/admin/rates")
     async def read_rates():
@@ -493,16 +722,37 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
 
     # ------------------------------------------------------------- clients
     @app.get("/v1/models")
-    async def list_models():
+    async def list_models(request: Request):
         """What is up and answering, by the name a client would ask for."""
         if agents is None:
             return {"object": "list", "data": []}
+        # Цена за токен и логотип — из прайса, свои модели клиента — по
+        # записям развёртываний. OpenAI-совместимая форма с полями сверх неё:
+        # SDK лишнего не замечает, а консоли есть что показать.
+        price = {m.id: m for m in pricing.read().models}
+        owned: dict = {}
+        repos: dict = {}
+        if deployments is not None:
+            for dep in await deployments.list():
+                owned[dep.label] = dep.account_id
+                repos[dep.label] = str((dep.request or {}).get("repo") or "")
         served = []
         for label in sorted({g.label for g in agents.groups.values() if g.label}):
             # Именно «отвечает», а не «процесс запущен»: список моделей — это
             # обещание клиенту, и оно не должно опережать загрузку весов.
             if await agents.serving(label) is not None:
-                served.append({"id": label, "object": "model"})
+                tag = price.get(label)
+                served.append({"id": label, "object": "model",
+                               "owned_by": "client" if owned.get(label) is not None else "looma",
+                               "context": tag.context if tag else None,
+                               "price_in": tag.price_in if tag else None,
+                               "price_out": tag.price_out if tag else None,
+                               # Логотип: из прайса, иначе аватар владельца
+                               # репозитория на HF (если уже известен).
+                               "logo_url": (tag.logo_url if tag and tag.logo_url
+                                            else logos.peek(repos.get(label, ""))),
+                               "mine": owned.get(label) == whoami(request).account_id
+                                       and owned.get(label) is not None})
         return {"object": "list", "data": served}
 
     @app.post("/v1/chat/completions")
@@ -550,15 +800,30 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
             который её проигнорирует, увидит оборванный ответ, а тот, кто
             читает, узнает причину.
             """
+            # Счётчики едут в последнем событии потока. Куски приходят как
+            # угодно нарезанными, поэтому события собираются по пустой
+            # строке — а наружу уходят как пришли, без задержки.
+            tail = b""
+            usage: Optional[dict] = None
             try:
                 async for piece in agents.request_stream(
                         head, method="POST", path="/v1/chat/completions",
                         body=raw, headers={"Content-Type": "application/json"}):
-                    if not isinstance(piece, tuple):
-                        yield piece
+                    if isinstance(piece, tuple):
+                        continue
+                    yield piece
+                    if usage is None:
+                        tail += piece
+                        *events, tail = tail.split(b"\n\n")
+                        for event in events:
+                            usage = _usage_in(event) or usage
             except AgentError as exc:
                 yield f"data: {json.dumps({'error': {'message': str(exc)}})}\n\n".encode()
                 yield b"data: [DONE]\n\n"
+            if usage is None and tail:
+                usage = _usage_in(tail)
+            if usage:
+                await _record_usage(request, model, usage)
 
         return StreamingResponse(pieces(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
@@ -951,6 +1216,9 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         record = agents.groups.get(group_id)
         if record is None:
             return _error(404, f"нет группы {group_id!r}")
+        return await _group_health(group_id, record)
+
+    async def _group_health(group_id: str, record) -> dict:
         stages = []
         for rank in sorted(record.tasks):
             task_id = record.tasks[rank]
@@ -1065,7 +1333,7 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
                              for name, data in adapters.files(adapter_id).items()}
 
         available = [n for n in agents.node_list() if n["accepts_tasks"]]
-        if not available:
+        if not available and raw.get("policy") != WAIT:
             return _error(409, "ни один подключённый узел не берёт задачи")
         named = list(raw.get("node_ids") or [])
         if named:
@@ -1165,6 +1433,75 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
                       for i, (s, e) in enumerate(ranges)],
         }
 
+    # ----------------------------------------------- модели клиента (/api)
+    # Клиент разворачивает свои модели сам: без выбора узлов по именам (чья
+    # машина — не его решение) и только свои же снимает. Владение — по записи
+    # в базе, а не по тому, что прислали в адресе.
+    CLIENT_MAX_STAGES = int(os.environ.get("LOOMA_CLIENT_MAX_STAGES", "4"))
+
+    async def _client_deployment_view(dep) -> dict:
+        record = agents.groups.get(dep.group_id) if agents is not None else None
+        view = dep.as_dict()
+        req = dict(view.get("request") or {})
+        view["repo"] = req.get("repo", "")
+        view["engine"] = req.get("engine", "torch")
+        view["precision"] = req.get("dtype", "bfloat16")
+        view["adapter"] = req.get("adapter") or None
+        view.pop("request", None)
+        if record is not None:
+            health = await _group_health(dep.group_id, record)
+            view["alive"] = True
+            view["ready"] = health["ready"]
+            view["stages"] = health["stages"]
+            view["submitted_at"] = getattr(record, "submitted_at", None)
+        else:
+            view["alive"] = False
+            view["ready"] = False
+            view["stages"] = []
+        return view
+
+    @app.get("/api/deployments")
+    async def my_deployments(request: Request):
+        """Мои развёрнутые модели со стадиями."""
+        if deployments is None:
+            return _error(503, "оркестратор поднят без базы: развёртывания не хранятся")
+        mine = [d for d in await deployments.list()
+                if d.account_id == whoami(request).account_id]
+        return {"deployments": [await _client_deployment_view(d) for d in mine]}
+
+    @app.post("/api/models/describe")
+    async def client_describe_model(request: Request):
+        """Слои и размер модели — чтобы визард показал, на сколько узлов её
+        резать и во что это встанет, до нажатия «развернуть»."""
+        raw = await _body(request)
+        try:
+            return describe((raw.get("repo") or "").strip()).as_dict()
+        except ModelError as exc:
+            return _error(400, str(exc))
+
+    @app.post("/api/deployments")
+    async def client_deploy(request: Request):
+        raw = dict(await _body(request))
+        if raw.get("node_ids"):
+            return _error(403, "выбирать узлы по именам может только администратор")
+        raw["stages"] = min(max(1, int(raw.get("stages") or 1)), CLIENT_MAX_STAGES)
+        raw.pop("timeout_s", None)
+        return await _deploy_model(raw, account_id=whoami(request).account_id)
+
+    @app.delete("/api/deployments/{group_id}")
+    async def client_undeploy(group_id: str, request: Request):
+        if deployments is None or agents is None:
+            return need_agents() if agents is None else _error(503, "оркестратор поднят без базы")
+        dep = next((d for d in await deployments.list() if d.group_id == group_id), None)
+        if dep is None or dep.account_id != whoami(request).account_id:
+            return _error(404, "такой модели за вами не числится")
+        await _stop_billing(group_id)
+        await deployments.forget(group_id)
+        try:
+            return agents.stop_group(group_id, reason="снято владельцем").as_dict()
+        except AgentError as exc:
+            return _error(409, str(exc))
+
     # ------------------------------------------------------------ training
     TRAIN_MAX_DATASET = 64 * 1024 * 1024
 
@@ -1203,7 +1540,7 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
             return _error(400, "датасет пуст")
 
         available = [n for n in agents.node_list() if n["accepts_tasks"]]
-        if not available:
+        if not available and raw.get("policy") != WAIT:
             return _error(409, "ни один подключённый узел не берёт задачи")
         named = list(raw.get("node_ids") or [])
         if named:
@@ -1284,7 +1621,7 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
             )
         except AgentError as exc:
             return _error(409, str(exc))
-        await _start_billing(account_id, record, COMPUTE, nodes=len(chosen),
+        await _start_billing(account_id, record, TRAINING, nodes=len(chosen),
                              label=label, gpus=sum(int(n.get("gpus_total") or 1) for n in chosen))
         remembered = {k: v for k, v in raw.items() if k != "dataset"}
         remembered["dataset_bytes"] = len(dataset)
@@ -1422,6 +1759,57 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         await training.finish(group_id, state=STOPPED, error="остановлено")
         return {**(await _training_view(await training.get(group_id))), "group": record.as_dict()}
 
+    # ------------------------------------------------ обучение клиента (/api)
+    async def _my_job(group_id: str, request: Request):
+        job = await training.get(group_id)
+        if job is None or job.account_id != whoami(request).account_id:
+            return None
+        return job
+
+    @app.get("/api/train")
+    async def my_train_list(request: Request):
+        jobs = await training.list(account_id=whoami(request).account_id)
+        return {"jobs": [await _training_view(job) for job in jobs]}
+
+    @app.post("/api/train")
+    async def my_train(request: Request):
+        raw = dict(await _body(request))
+        if raw.get("node_ids"):
+            return _error(403, "выбирать узлы по именам может только администратор")
+        raw["stages"] = min(max(1, int(raw.get("stages") or 1)), CLIENT_MAX_STAGES)
+        return await _start_training(raw, account_id=whoami(request).account_id)
+
+    @app.get("/api/train/{group_id}")
+    async def my_train_one(group_id: str, request: Request):
+        job = await _my_job(group_id, request)
+        if job is None:
+            return _error(404, "такого обучения за вами не числится")
+        return await _training_view(job)
+
+    @app.post("/api/train/{group_id}/stop")
+    async def my_train_stop(group_id: str, request: Request):
+        job = await _my_job(group_id, request)
+        if job is None:
+            return _error(404, "такого обучения за вами не числится")
+        if agents is None:
+            return need_agents()
+        try:
+            await _stop_billing(group_id)
+            agents.stop_group(group_id, reason="остановлено владельцем")
+        except AgentError as exc:
+            return _error(409, str(exc))
+        await training.finish(group_id, state=STOPPED, error="остановлено")
+        return await _training_view(await training.get(group_id))
+
+    @app.get("/api/train/{group_id}/adapter/{name}")
+    async def my_train_adapter(group_id: str, name: str, request: Request):
+        job = await _my_job(group_id, request)
+        if job is None or name not in ADAPTER_FILES or not adapters.has(group_id):
+            return _error(404, "такого файла адаптера нет")
+        return Response(content=adapters.files(group_id)[name],
+                        media_type="application/octet-stream",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
     @app.post("/admin/deploy")
     async def admin_deploy(request: Request,
                            x_looma_admin_token: str | None = Header(default=None)):
@@ -1429,6 +1817,41 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         снятого, а звать обработчик из обработчика нельзя."""
         return await _deploy_model(await _body(request),
                                    account_id=whoami(request).account_id)
+
+    # ------------------------------------------------- политики нехватки
+    #: Что делать, когда свободных узлов меньше, чем просят.
+    DISPLACE = "displace"   # подвинуть платформенные модели (по умолчанию)
+    PARTIAL = "partial"     # взять сколько есть
+    WAIT = "wait"           # встать в очередь и ждать освобождения
+    STRICT = "strict"       # служебная: только свободные, иначе отказ
+    POLICIES = (DISPLACE, PARTIAL, WAIT)
+
+    waiting = WaitingRoom(hours=float(os.environ.get("LOOMA_WAIT_HOURS", "6")))
+
+    async def serve_waiting() -> int:
+        """Пройти очередь: кому уже хватает свободных — тем поднять.
+
+        По одному за проход, старшему первому: два ожидающих, взявшие одни и те
+        же узлы, — худшее из того, что здесь может случиться.
+        """
+        served = 0
+        for ticket in waiting.due():
+            answer = await _start_cluster({**ticket.raw, "policy": STRICT},
+                                          account_id=ticket.account_id,
+                                          by_admin=False)
+            if isinstance(answer, JSONResponse):
+                # 409 — всё ещё не хватает; ждём дальше. Другое — запрос
+                # испорчен, и ждать бессмысленно: клиент увидит причину.
+                if answer.status_code != 409:
+                    why = (json.loads(answer.body) or {}).get("error") or {}
+                    waiting.fail(ticket.id, str(why.get("message") or why))
+                continue
+            waiting.done(ticket.id, answer)
+            served += 1
+            break
+        return served
+
+    app.state.serve_waiting = serve_waiting
 
     async def _start_cluster(raw: dict, *, account_id=None, by_admin: bool):
         """Собрать Ray-кластер на нескольких узлах.
@@ -1443,7 +1866,7 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         if agents is None:
             return need_agents()
         available = [n for n in agents.node_list() if n["accepts_tasks"]]
-        if not available:
+        if not available and raw.get("policy") != WAIT:
             return _error(409, "ни один подключённый узел не берёт задачи")
         named = list(raw.get("node_ids") or [])
         by_id = {n["node_id"]: n for n in available}
@@ -1457,7 +1880,11 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
             picked = [by_id[n] for n in named]
         else:
             size = int(raw.get("size") or 1)
-            if size > len(available):
+            policy = str(raw.get("policy") or DISPLACE)
+            if policy not in POLICIES and policy != STRICT:
+                return _error(400, f"policy — одно из: {', '.join(POLICIES)}")
+            # Ждать можно и узлов, которых сейчас нет вовсе: они подключаются.
+            if size > len(available) and policy != WAIT:
                 return _error(409,
                               f"просят {size} узлов, а работу берут {len(available)}")
             # Сначала те, кто легче сходится с соседями: Ray гоняет через этот
@@ -1466,6 +1893,24 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
                     if not int(n.get("tasks_running") or 0)]
             if len(free) >= size:
                 picked = free[:size]
+            elif policy == PARTIAL:
+                # Взять сколько есть: клиент согласился на меньший кластер,
+                # лишь бы сейчас. Ноль свободных — нечего брать.
+                if not free:
+                    return _error(409, "свободных узлов нет; выберите «подождать» "
+                                       "или «подвинуть модели»")
+                picked = free
+                logger.info("аренда: просили %d, взяли %d свободных", size, len(free))
+            elif policy == WAIT:
+                # Подождать: ничего не трогаем, ставим в очередь. Ожидание
+                # пробует снова, когда узлы освободятся.
+                if account_id is None:
+                    return _error(400, "ждать может только клиент с учётной записью")
+                ticket = waiting.add(account_id=account_id, raw=raw,
+                                     want=size, free=len(free))
+                return JSONResponse(status_code=202, content=ticket.as_dict())
+            elif policy == STRICT:
+                return _error(409, f"свободных {len(free)} из нужных {size}")
             else:
                 # Свободных не хватает — прямой клиент вытесняет базовую
                 # загрузку. Сначала план целиком, и только если он сходится,
@@ -1572,6 +2017,10 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         if deployments is not None and lease_id and evicted_ids:
             await deployments.mark_evicted(evicted_ids, lease_id)
         return {**record.as_dict(), "entry": entry, "nodes": chosen,
+                # Сколько просили и сколько дали: при «взять сколько есть»
+                # числа расходятся, и клиент должен это увидеть в ответе.
+                "requested": int(raw.get("size") or len(chosen)) if not named else len(chosen),
+                "granted": len(chosen),
                 # Каким путём соберётся кластер. Медленный кластер должен быть
                 # объяснимым, а не загадочным.
                 "path": path["path"], "relayed_pairs": path["relayed_pairs"],
@@ -1638,21 +2087,48 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
                 if busy.get(node_id) != "mine":
                     busy[node_id] = state
 
-        rows = [{"state": busy.get(node["node_id"], "free"),
-                 "gpus": int(node.get("gpus_total") or 0)}
-                for node in agents.node_list() if node.get("accepts_tasks")]
+        # Класс карты — из прайса, а не имя узла: клиенту нужно знать, какие
+        # карты в сети и почём, а не на чьей машине они стоят.
+        price = pricing.read()
+        rows = []
+        for node in agents.node_list():
+            if not node.get("accepts_tasks"):
+                continue
+            klass = price.class_of(node.get("gpu_name") or "")
+            rows.append({"state": busy.get(node["node_id"], "free"),
+                         "gpus": int(node.get("gpus_total") or 0),
+                         "gpu_class": klass.id if klass else None,
+                         "gpu_name": klass.name if klass else (node.get("gpu_name") or ""),
+                         "vram_gb": klass.vram_gb if klass else
+                                    round((node.get("vram_free_bytes") or 0) / 1024 ** 3),
+                         "rtt_ms": node.get("link_rtt_ms")})
         return {"nodes": rows}
 
     @app.get("/api/compute")
     async def my_clusters(request: Request):
-        """Мои идущие аренды. Только свои: чужие сюда не попадают."""
+        """Мои идущие аренды и мои ожидания. Только свои: чужие сюда не
+        попадают."""
         if ledger is None:
             return _error(503, "оркестратор поднят без базы: журнала нет")
-        mine = await ledger.open_leases(account_id=whoami(request).account_id,
-                                        resource=COMPUTE)
+        who = whoami(request).account_id
+        mine = await ledger.open_leases(account_id=who, resource=COMPUTE)
         live = agents.groups if agents is not None else {}
         return {"clusters": [
-            {**row, "alive": row["group_id"] in live} for row in mine]}
+            {**row, "alive": row["group_id"] in live} for row in mine],
+            "pending": [t.as_dict() for t in waiting.of(who)]}
+
+    @app.get("/api/compute/pending")
+    async def my_pending(request: Request):
+        """Очередь ожидания: мои заявки, в том числе уже поднятые или
+        отклонённые (их видно ещё час, чтобы клиент узнал, чем кончилось)."""
+        return {"pending": [t.as_dict() for t in waiting.of(whoami(request).account_id)]}
+
+    @app.delete("/api/compute/pending/{ticket_id}")
+    async def drop_pending(ticket_id: str, request: Request):
+        """Передумать ждать. Только свою заявку."""
+        if not waiting.cancel(ticket_id, whoami(request).account_id):
+            return _error(404, "такой заявки за вами не числится")
+        return {"cancelled": ticket_id}
 
     @app.delete("/api/compute/{group_id}")
     async def drop_cluster(group_id: str, request: Request):

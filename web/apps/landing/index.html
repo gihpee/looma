@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ru" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Looma Float — GPU-сеть: инференс, обучение и кластеры</title>
+    <meta name="description" content="Распределённая сеть GPU на домашних машинах. Ray-кластер под ваш код, OpenAI-совместимый инференс и обучение LoRA — платите только за использованное. В разы дешевле облаков." />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Looma Float — мощность, когда она нужна" />
+    <meta property="og:description" content="Кластер под свой код или инференс готовых и своих моделей на распределённой сети GPU. Без минимума и договора." />
+    <meta property="og:url" content="https://loomafloat.ru/" />
+    <meta property="og:locale" content="ru_RU" />
+    <meta name="twitter:card" content="summary" />
+    <link rel="canonical" href="https://loomafloat.ru/" />
+    <meta name="theme-color" content="#f7f9fa" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%230b7f91'/%3E%3Cg fill='%23ffffff' transform='translate(10 10) scale(.8)'%3E%3Crect x='8' y='6' width='20' height='45'/%3E%3Cpath d='M8 77 H28 V94 H25 A17 17 0 0 1 8 77 Z'/%3E%3Crect x='34' y='6' width='20' height='19'/%3E%3Crect x='34' y='51' width='20' height='43'/%3E%3Crect x='31' y='28' width='61' height='20'/%3E%3Crect x='8' y='54' width='23' height='20'/%3E%3Crect x='57' y='54' width='35' height='20'/%3E%3C/g%3E%3C/svg%3E" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" />
+    <script>
+      // Тема — до первой отрисовки, чтобы страница не мигала светлым перед
+      // тёмным. Сохранённый выбор важнее системного; системный — только для
+      // первого визита.
+      try {
+        var t = localStorage.getItem("looma_theme");
+        if (!t && matchMedia("(prefers-color-scheme: dark)").matches) t = "dark";
+        if (t === "dark") document.documentElement.dataset.theme = "dark";
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
