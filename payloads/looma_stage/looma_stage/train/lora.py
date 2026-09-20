@@ -217,6 +217,55 @@ def load_adapter_state(shard, state: Dict[str, object]) -> int:
     return placed
 
 
+def merge_into(shard, directory) -> int:
+    """Вплавить адаптер в веса среза: `W += α/r · B·A` для каждого модуля.
+
+    Для инференса на собственном исполнителе: после этого срез считает ровно
+    как база с адаптером, но без лишнего умножения на каждом токене и без
+    модулей LoRA в графе. Адаптер — обычный PEFT-каталог, имена глобальные;
+    чужие слои пропускаются, так что один файл читает каждая стадия.
+    Возвращает, сколько модулей получили добавку; ноль — отказ: адаптер не
+    от этой модели или не от этих слоёв, и молча считать базу нельзя.
+    """
+    import torch
+    from torch import nn
+
+    state, config = read_adapter(directory)
+    r = int(config.get("r") or 0)
+    alpha = float(config.get("lora_alpha") or r)
+    if r <= 0:
+        raise ValueError(f"в adapter_config.json нет r: {config}")
+    scale = alpha / r
+    prefix = getattr(shard, "_key_prefix", "model.")
+    merged = 0
+    for local, layer in enumerate(shard.layers):
+        global_index = shard.spec.start_layer + local
+        for path, module in layer.named_modules():
+            if not isinstance(module, nn.Linear):
+                continue
+            a = state.get(peft_key(prefix, global_index, path, "A"))
+            b = state.get(peft_key(prefix, global_index, path, "B"))
+            if a is None or b is None:
+                continue
+            weight = module.weight
+            with torch.no_grad():
+                delta = (b.to(weight.device, torch.float32)
+                         @ a.to(weight.device, torch.float32)) * scale
+                if delta.shape != weight.shape:
+                    raise ValueError(
+                        f"адаптер не от этой модели: у {path} слоя {global_index} "
+                        f"веса {tuple(weight.shape)}, а добавка {tuple(delta.shape)}")
+                weight.add_(delta.to(weight.dtype))
+            merged += 1
+    if not merged:
+        raise ValueError(
+            f"в адаптере {directory} нет ни одного тензора для слоёв "
+            f"[{shard.spec.start_layer}, {shard.spec.end_layer}) с префиксом {prefix!r}")
+    logger.info("адаптер вплавлен: %d модулей, r=%d, α=%g, база %s",
+                merged, r, alpha, config.get("base_model_name_or_path", "?"))
+    return merged
+
+
 def merge_pieces(pieces: Iterable[Dict[str, object]]) -> Dict[str, object]:
     """Куски адаптера от стадий — в один. Пересечение имён — отказ: два
     куска для одного слоя означают, что срезы стадий перекрылись."""

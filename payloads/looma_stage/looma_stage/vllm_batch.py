@@ -72,7 +72,7 @@ def _request_for(sequence: Sequence, runner, *, with_outputs: bool):
         eos_token_id=None,
         arrival_time=0.0,
         block_hasher=getattr(runner, "request_block_hasher", None),
-        lora_request=None,
+        lora_request=getattr(runner, "lora_request", None),
     )
     if with_outputs and sequence.output_ids:
         made.append_output_token_ids(list(sequence.output_ids))
@@ -125,7 +125,8 @@ def prefill(sequences: List[Sequence], runner):
                 prompt_token_ids=list(sequence.prompt_ids),
                 mm_features=[], sampling_params=sampling_for(sequence),
                 pooling_params=None, block_ids=all_blocks.get_block_ids(),
-                num_computed_tokens=computed, lora_request=None,
+                num_computed_tokens=computed,
+                lora_request=getattr(runner, "lora_request", None),
                 prompt_embeds=None))
             scheduled[sequence.request_id] = len(sequence.prompt_ids)
             total += len(sequence.prompt_ids)

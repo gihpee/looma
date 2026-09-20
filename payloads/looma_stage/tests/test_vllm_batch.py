@@ -225,3 +225,24 @@ def test_освобождение_убирает_и_состояние(vllm):
     release(runner, "r1")
     assert manager.freed == ["r1"]
     assert "r1" not in runner.requests
+
+
+def test_адаптер_стадии_кладётся_в_каждый_запрос(vllm):
+    """Стадия с адаптером: `lora_request` драйвера уезжает и в `Request`
+    (для менеджера кэша), и в `NewRequestData` (для воркера) — vLLM
+    подмешивает адаптер только запросам, у которых он указан."""
+    from looma_stage.vllm_batch import prefill
+
+    runner = runner_with(Manager(blocks_cls=vllm["Blocks"]))
+    runner.lora_request = object()
+    out = prefill([sequence(prompt=[1, 2, 3])], runner)
+    assert out.scheduled_new_reqs[0].lora_request is runner.lora_request
+    assert runner.requests["r1"].lora_request is runner.lora_request
+
+
+def test_без_адаптера_запросы_без_lora(vllm):
+    from looma_stage.vllm_batch import prefill
+
+    runner = runner_with(Manager(blocks_cls=vllm["Blocks"]))
+    out = prefill([sequence(prompt=[1, 2, 3])], runner)
+    assert out.scheduled_new_reqs[0].lora_request is None

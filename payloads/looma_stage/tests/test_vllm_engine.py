@@ -745,3 +745,19 @@ def test_нет_токена_для_кого_то_из_батча_отказ(seq
     engine = vllm_engine.VllmEngine.__new__(vllm_engine.VllmEngine)
     with pytest.raises(RunnerRefused, match="не выбрал токен для b"):
         engine.sample_batch({"a": 1}, [Sequence("a", [0]), Sequence("b", [0])])
+
+
+def test_ранг_адаптера_округляется_до_допустимого(tmp_path):
+    """У vLLM ядра под фиксированный набор рангов; r=12 из чужого адаптера
+    просит буферы под 16, а не падает внутри воркера."""
+    import json
+
+    from looma_stage.vllm_engine import RunnerRefused, adapter_rank, lora_rank_allowed
+
+    assert [lora_rank_allowed(r) for r in (1, 8, 12, 16, 17, 64)] == [1, 8, 16, 16, 32, 64]
+    with pytest.raises(RunnerRefused):
+        lora_rank_allowed(1024)
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 12, "lora_alpha": 24}))
+    assert adapter_rank(str(tmp_path)) == 12
+    with pytest.raises(RunnerRefused, match="adapter_config"):
+        adapter_rank(str(tmp_path / "nope"))

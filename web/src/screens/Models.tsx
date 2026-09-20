@@ -92,13 +92,21 @@ function canVllm(version: string): boolean {
   return major > 12 || (major === 12 && minor >= 6);
 }
 
-function Deploy({ nodes, onClose, onDone }: {
+/** Дообученный адаптер, который можно развернуть вместе с базой. */
+export interface AdapterChoice { id: string; label: string; repo: string; precision?: string }
+
+export function Deploy({ nodes, onClose, onDone, adapters = [], preset }: {
   nodes: Node[]; onClose: () => void; onDone: () => void;
+  adapters?: AdapterChoice[]; preset?: AdapterChoice;
 }) {
   const action = useAction(onDone);
   const toast = useToast();
-  const [repo, setRepo] = useState("");
+  const [repo, setRepo] = useState(preset?.repo ?? "");
   const [label, setLabel] = useState("");
+  // Адаптер привязан к своей базе: выбор адаптера подставляет её repo.
+  const [adapter, setAdapter] = useState(preset?.id ?? "");
+  const choices = preset && !adapters.some((a) => a.id === preset.id) ? [preset, ...adapters] : adapters;
+  const chosenAdapter = choices.find((a) => a.id === adapter);
   const [dtype, setDtype] = useState("bfloat16");
   // "auto" по умолчанию: на смешанном конвейере — Mac рядом с машиной
   // NVIDIA — любое жёсткое значение неверно для половины стадий.
@@ -119,6 +127,7 @@ function Deploy({ nodes, onClose, onDone }: {
   const deploy = () => action.run(async () => {
     const body: Record<string, unknown> = { repo, dtype, device, engine, by_vram: byVram };
     if (label) body.label = label;
+    if (adapter) body.adapter = adapter;
     if (picked.length) body.node_ids = picked;
     else body.stages = Number(stages) || 1;
     const created = await send<{
@@ -166,9 +175,26 @@ function Deploy({ nodes, onClose, onDone }: {
                  placeholder="Qwen/Qwen3-8B"
                  onChange={(e) => { setRepo(e.target.value); setLayers(null); }} />
         </Field>
-        <Field label="Имя для клиентов" hint="по умолчанию — хвост repo">
+        <Field label="Имя для клиентов" hint={adapter ? "по умолчанию — база+адаптер" : "по умолчанию — хвост repo"}>
           <input type="text" value={label} onChange={(e) => setLabel(e.target.value)} />
         </Field>
+        {choices.length > 0 && (
+          <Field label="Адаптер LoRA"
+                 hint={chosenAdapter
+                   ? `обучен на ${chosenAdapter.repo}; torch вплавит его в веса, vLLM подмешает штатно`
+                   : "результат дообучения; база подставится сама"}>
+            <select value={adapter} onChange={(e) => {
+              const next = choices.find((a) => a.id === e.target.value);
+              setAdapter(e.target.value);
+              if (next) { setRepo(next.repo); setLayers(null); }
+            }}>
+              <option value="">без адаптера</option>
+              {choices.map((a) => (
+                <option key={a.id} value={a.id}>{a.label} · {a.repo}</option>
+              ))}
+            </select>
+          </Field>
+        )}
         <Field label="Точность">
           <select value={dtype} onChange={(e) => setDtype(e.target.value)}>
             <option>bfloat16</option><option>float16</option><option>float32</option>
@@ -458,6 +484,14 @@ function Chat({ model }: { model: string }) {
 
 export function Models() {
   const groups = usePoll<{ groups: Group[] }>("/admin/groups", 5000);
+  // Готовые адаптеры — в форму развёртывания. Опрос редкий: они появляются
+  // раз в обучение.
+  const trainings = usePoll<{ jobs: { group_id: string; label: string; state: string;
+    adapter_kept?: boolean; request: { repo?: string; precision?: string } }[] }>("/admin/train", 30000);
+  const adapters: AdapterChoice[] = (trainings.data?.jobs ?? [])
+    .filter((j) => j.state === "done" && j.adapter_kept)
+    .map((j) => ({ id: j.group_id, label: j.label, repo: j.request.repo ?? "",
+                   precision: j.request.precision }));
   const nodes = usePoll<{ nodes: Node[] }>("/admin/agents", 5000);
   const serving = usePoll<{ data: { id: string }[] }>("/v1/models", 5000);
   const action = useAction(groups.refresh);
@@ -522,8 +556,8 @@ export function Models() {
       )}
 
       {deploying && (
-        <Deploy nodes={nodes.data?.nodes ?? []} onClose={() => setDeploying(false)}
-                onDone={groups.refresh} />
+        <Deploy nodes={nodes.data?.nodes ?? []} adapters={adapters}
+                onClose={() => setDeploying(false)} onDone={groups.refresh} />
       )}
 
       {dropping && (

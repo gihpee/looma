@@ -142,11 +142,14 @@ def test_обучение_запускается_и_доходит_до_резу
         time.sleep(0.5)
     assert view and view["state"] == "done", json.dumps(view, ensure_ascii=False)[:3000]
     assert view["result"]["rows"] == 1
-    assert view["files"]["adapter_model.safetensors"].endswith("/results/adapter/adapter_model.safetensors")
+    # Скачивание — у оркестратора: он забрал адаптер к себе, как только
+    # обучение закончилось (результат на узле живёт час).
+    assert view["adapter_kept"] is True
+    assert view["files"]["adapter_model.safetensors"] == \
+        f"/admin/train/{group_id}/adapter/adapter_model.safetensors"
     listed = client.get("/admin/train").json()["jobs"]
     assert [j["group_id"] for j in listed] == [group_id]
 
-    # Адаптер скачивается тем же путём, что любой результат задачи.
     got = client.get(view["files"]["adapter_model.safetensors"])
     assert got.status_code == 200 and got.content == b"x"
 
@@ -168,3 +171,96 @@ def test_остановка_закрывает_запись(stand, monkeypatch):
     stopped = client.post(f"/admin/train/{group_id}/stop").json()
     assert stopped["state"] == "stopped"
     assert client.get(f"/admin/train/{group_id}").json()["state"] == "stopped"
+
+
+# ------------------------------------------------------ адаптер в инференс
+def _finish_training(client, orchestrator, monkeypatch, *, label="my-lora"):
+    """Обучение, которое «закончилось»: скрипт вместо стадии кладёт адаптер."""
+    original = orchestrator.hub.submit_group
+
+    def fake_stage(**kwargs):
+        script = (
+            "import json, os, pathlib;"
+            "out = pathlib.Path(os.environ['LOOMA_TASK_OUT']);"
+            "(out / 'adapter').mkdir();"
+            "(out / 'adapter' / 'adapter_config.json').write_text(json.dumps({'r': 8, 'lora_alpha': 16}));"
+            "(out / 'adapter' / 'adapter_model.safetensors').write_bytes(b'tensors');"
+            "result = {'adapter': 'adapter', 'steps': 3, 'final_loss': 0.2, 'lora': {'r': 8}};"
+            "(out / 'result.json').write_text(json.dumps(result));"
+            "(out / 'progress.json').write_text(json.dumps({'state': 'done', 'step': 3, 'total_steps': 3, 'history': [], 'result': result}))"
+        )
+        kwargs["per_rank"] = [{"command": [sys.executable, "-c", script]}]
+        kwargs["command"] = kwargs["per_rank"][0]["command"]
+        kwargs["environment"] = None
+        return original(**kwargs)
+
+    monkeypatch.setattr(orchestrator.hub, "submit_group", fake_stage)
+    group_id = client.post("/admin/train", json=body(force=True, label=label)).json()["group_id"]
+    monkeypatch.setattr(orchestrator.hub, "submit_group", original)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        view = client.get(f"/admin/train/{group_id}").json()
+        if view["state"] != "running":
+            return group_id, view
+        time.sleep(0.5)
+    raise AssertionError("обучение не закончилось")
+
+
+def test_адаптер_остаётся_у_оркестратора(stand, monkeypatch):
+    """Результат задачи на узле живёт час; адаптер нужен потом. Как только
+    обучение закончилось, оркестратор забирает файлы к себе, и скачивание
+    идёт уже отсюда."""
+    orchestrator, _agent = stand
+    monkeypatch.setattr("looma.api.app.describe", lambda repo, **kw: qwen_like())
+    client = api(orchestrator)
+    group_id, view = _finish_training(client, orchestrator, monkeypatch)
+    assert view["state"] == "done" and view["adapter_kept"] is True
+    assert view["files"]["adapter_model.safetensors"] == \
+        f"/admin/train/{group_id}/adapter/adapter_model.safetensors"
+    got = client.get(view["files"]["adapter_model.safetensors"])
+    assert got.status_code == 200 and got.content == b"tensors"
+    # Узел свою копию убрал — у оркестратора она есть.
+    orchestrator.hub.groups.pop(group_id, None)
+    assert client.get(f"/admin/train/{group_id}").json()["adapter_kept"] is True
+    assert client.get(f"/admin/train/{group_id}/adapter/adapter_config.json").status_code == 200
+    assert client.get(f"/admin/train/{group_id}/adapter/evil.py").status_code == 404
+
+
+def test_адаптер_разворачивается_в_инференс(stand, monkeypatch):
+    """`/admin/deploy` с `adapter` = id обучения: файлы адаптера едут стадиям
+    во входах, команда получает `--adapter`, имя модели — база+адаптер."""
+    orchestrator, _agent = stand
+    monkeypatch.setattr("looma.api.app.describe", lambda repo, **kw: qwen_like())
+    client = api(orchestrator)
+    group_id, _view = _finish_training(client, orchestrator, monkeypatch)
+
+    seen = {}
+    original = orchestrator.hub.submit_group
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        kwargs["per_rank"] = [{"command": [sys.executable, "-c", "import time; time.sleep(5)"]}]
+        kwargs["command"] = kwargs["per_rank"][0]["command"]
+        kwargs["environment"] = None
+        return original(**kwargs)
+
+    monkeypatch.setattr(orchestrator.hub, "submit_group", spy)
+    answer = client.post("/admin/deploy", json={"repo": "Qwen/Qwen3-8B", "adapter": group_id,
+                                               "engine": "torch"})
+    assert answer.status_code == 200, answer.text
+    assert seen["label"] == "Qwen3-8B+my-lora"
+    command = seen["per_rank"][0]["command"]
+    assert command[command.index("--adapter") + 1] == "adapter"
+    assert seen["inputs"]["adapter/adapter_model.safetensors"] == b"tensors"
+    assert "adapter/adapter_config.json" in seen["inputs"]
+    assert "looma_stage/server.py" in seen["inputs"]
+
+    # Не на ту базу — отказ до узлов.
+    import dataclasses
+
+    monkeypatch.setattr("looma.api.app.describe",
+                        lambda repo, **kw: dataclasses.replace(qwen_like(), repo=repo))
+    wrong = client.post("/admin/deploy", json={"repo": "Qwen/Qwen3-4B", "adapter": group_id})
+    assert wrong.status_code == 400 and "обучен на Qwen/Qwen3-8B" in wrong.json()["error"]["message"]
+    missing = client.post("/admin/deploy", json={"repo": "Qwen/Qwen3-8B", "adapter": "group-nope"})
+    assert missing.status_code == 404

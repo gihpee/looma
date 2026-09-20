@@ -45,6 +45,7 @@ from looma.orchestrator.models import (
     vllm_refusal,
 )
 from looma.usage.training import DONE, FAILED, RUNNING, STOPPED, MemoryTrainingJobs
+from looma.orchestrator.adapters import ADAPTER_FILES, AdapterStore, adapter_root
 from looma.orchestrator.connectivity import prefer_meshy, verdict
 from looma.orchestrator.payloads import PayloadMissing, ray_payload
 from looma.orchestrator.rendezvous import relay_addrs
@@ -141,6 +142,9 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
     # Задания на дообучение: без базы — в памяти, чтобы форма работала и на
     # оркестраторе без учётных записей.
     training = training if training is not None else MemoryTrainingJobs()
+    # Адаптеры после обучения — на диске оркестратора: результат задачи на
+    # узле живёт час, а развернуть адаптер захотят и через месяц.
+    adapters = AdapterStore(adapter_root(config))
     auth = Authenticator(accounts=accounts,
                          emergency_token=getattr(config, "admin_token", "") or "")
 
@@ -1037,6 +1041,29 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         except ModelError as exc:
             return _error(400, str(exc))
 
+        # Адаптер — по идентификатору обучения. Он привязан к своей базе:
+        # тензоры LoRA считаны под её размеры и имена, и на другой модели
+        # стадия либо откажет, либо, что хуже, посчитает не то.
+        adapter_id = str(raw.get("adapter") or "").strip()
+        adapter_files: dict = {}
+        adapter_meta: dict = {}
+        if adapter_id:
+            job = await training.get(adapter_id)
+            if job is None:
+                return _error(404, f"обучения {adapter_id} нет")
+            if not adapters.has(adapter_id):
+                kept = await _keep_adapter(job)
+                if not kept:
+                    return _error(409, f"адаптер обучения {adapter_id} ещё не готов "
+                                       f"или уже потерян (состояние {job.state})")
+            adapter_meta = adapters.meta(adapter_id) or {}
+            trained_on = str(adapter_meta.get("base_model") or job.request.get("repo") or "")
+            if trained_on and trained_on != model.repo:
+                return _error(400, f"адаптер {job.label} обучен на {trained_on}, "
+                                   f"а разворачивают {model.repo}")
+            adapter_files = {f"adapter/{name}": data
+                             for name, data in adapters.files(adapter_id).items()}
+
         available = [n for n in agents.node_list() if n["accepts_tasks"]]
         if not available:
             return _error(409, "ни один подключённый узел не берёт задачи")
@@ -1078,7 +1105,10 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
             return _error(400, str(exc))
 
         dtype = (raw.get("dtype") or "bfloat16").strip()
-        label = (raw.get("label") or model.repo.split("/")[-1]).strip()
+        default_label = model.repo.split("/")[-1]
+        if adapter_id:
+            default_label += "+" + str(adapter_meta.get("label") or adapter_id)
+        label = (raw.get("label") or default_label).strip()
         per_rank = [{
             "command": [
                 "python", "-m", "looma_stage.server",
@@ -1091,6 +1121,8 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
                 # кончается модель: иначе он не определит, что эта стадия
                 # последняя, и не соберёт lm_head.
                 "--num-model-layers", str(model.num_layers),
+                # Адаптер едет во входах задачи рядом с кодом стадии.
+                *(["--adapter", "adapter"] if adapter_id else []),
             ],
         } for start, end in ranges]
 
@@ -1102,8 +1134,8 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
                 node_ids=[r["node_id"] for r in ranks],
                 label=label,
                 serve_port=1,
-                # Веса модели качает сама стадия — сюда едет только её код.
-                inputs=payload,
+                # Веса модели качает сама стадия — сюда едет её код и адаптер.
+                inputs={**payload, **adapter_files},
                 environment={"kind": "python",
                              "requirements": stage_requirements(engine)},
                 # Ноль карт значит «не ограничивать»: стадия видит всё, что
@@ -1261,6 +1293,46 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
         return {**job.as_dict(), "group": record.as_dict(), "model": model.as_dict(),
                 "plan": plan, "warning": "; ".join(short)}
 
+    async def _keep_adapter(job, *, record=None) -> bool:
+        """Забрать адаптер законченного обучения с узла к себе. Ложь — не
+        вышло (задача уже убрана, узел отвалился): позже попробуем снова."""
+        if agents is None or job.state != DONE:
+            return False
+        record = record or agents.groups.get(job.group_id)
+        head_task = record.tasks.get(0) if record else None
+        if not head_task:
+            return False
+        files = {}
+        for name in ADAPTER_FILES:
+            try:
+                files[name] = await agents.collect(head_task, f"adapter/{name}")
+            except AgentError as exc:
+                logger.warning("адаптер %s не забрать с узла: %s", job.group_id, exc)
+                return False
+        result = job.result or {}
+        adapters.save(job.group_id, files, meta={
+            "label": job.label, "base_model": job.request.get("repo"),
+            "precision": job.request.get("precision"),
+            "lora": result.get("lora") or job.request.get("lora"),
+            "steps": result.get("steps"), "final_loss": result.get("final_loss"),
+        })
+        logger.info("адаптер %s (%s) сохранён: %d байт", job.group_id, job.label,
+                    sum(len(d) for d in files.values()))
+        return True
+
+    async def sweep_training() -> None:
+        """Свести незакрытые обучения и забрать их адаптеры — без того, чтобы
+        кто-то держал открытой вкладку. Зовётся сервером по расписанию."""
+        for job in await training.list():
+            if job.state == RUNNING or (job.state == DONE and not adapters.has(job.group_id)):
+                try:
+                    await _training_view(job)
+                except Exception:
+                    logger.exception("сводка обучения %s не удалась", job.group_id)
+
+    app.state.sweep_training = sweep_training
+    app.state.adapters = adapters
+
     async def _training_progress(record) -> dict:
         """progress.json головы, если голова ещё жива или результат лежит."""
         head_task = record.tasks.get(0)
@@ -1286,16 +1358,34 @@ def create_app(*, agents=None, releases=None, keystore=None, config=None,
             await training.finish(job.group_id, state=state,
                                   result=progress.get("result"), error=progress.get("error", ""))
             view.update(state=state, result=progress.get("result"), error=progress.get("error", ""))
+            job = await training.get(job.group_id) or job
         elif job.state == RUNNING and record and view["finished"] and not progress:
             await training.finish(job.group_id, state=FAILED,
                                   error="задачи кончились, а результата нет — смотрите лог головы")
             view.update(state=FAILED, error="задачи кончились, а результата нет — смотрите лог головы")
+        if view.get("state") == DONE and not adapters.has(job.group_id):
+            # Результат задачи на узле живёт час: забрать, пока есть.
+            await _keep_adapter(job, record=record)
+        view["adapter_kept"] = adapters.has(job.group_id)
         head_task = record.tasks.get(0) if record else None
-        if head_task and view.get("result"):
+        if view.get("adapter_kept"):
+            # Скачивать — отсюда: у оркестратора адаптер лежит, пока его не
+            # удалят, а у узла — час.
+            base = f"/admin/train/{job.group_id}/adapter"
+            view["files"] = {name: f"{base}/{name}" for name in ADAPTER_FILES}
+        elif head_task and view.get("result"):
             base = f"/admin/tasks/{head_task}/results/adapter"
-            view["files"] = {"adapter_config.json": f"{base}/adapter_config.json",
-                             "adapter_model.safetensors": f"{base}/adapter_model.safetensors"}
+            view["files"] = {name: f"{base}/{name}" for name in ADAPTER_FILES}
         return view
+
+    @app.get("/admin/train/{group_id}/adapter/{name}")
+    async def admin_train_adapter(group_id: str, name: str,
+                                  x_looma_admin_token: str | None = Header(default=None)):
+        if name not in ADAPTER_FILES or not adapters.has(group_id):
+            return _error(404, "такого файла адаптера нет")
+        return Response(content=adapters.files(group_id)[name],
+                        media_type="application/octet-stream",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
     @app.post("/admin/train")
     async def admin_train(request: Request,

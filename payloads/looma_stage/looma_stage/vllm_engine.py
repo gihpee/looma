@@ -272,6 +272,9 @@ class LoadedShard:
     max_sequences: int = 0
     #: На скольких картах, то есть сколько воркеров режут каждый слой.
     cards: int = 1
+    #: `LoRARequest` адаптера, если стадия поднята с ним: кладётся в каждый
+    #: запрос (`vllm_batch`), и vLLM сам подмешивает адаптер в проекции.
+    lora_request: object = None
 
     def as_dict(self) -> dict:
         return {
@@ -371,7 +374,8 @@ def prepare_weights(weights: str, *, start_layer: int, end_layer: int,
 
 def _build_config(model_path: str, *, dtype: str, max_model_len: int,
                   utilisation: float, block_size: int, max_sequences: int,
-                  max_batched_tokens: int, cards: int, stage: dict):
+                  max_batched_tokens: int, cards: int, stage: dict,
+                  lora_rank: int = 0):
     """Конфиги vLLM. Всё, чего мы не используем, названо явно нулём или None —
     молчаливое умолчание тут означало бы «как получится».
 
@@ -381,6 +385,16 @@ def _build_config(model_path: str, *, dtype: str, max_model_len: int,
     """
     from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, ModelConfig,
                              ParallelConfig, SchedulerConfig, VllmConfig)
+
+    lora_config = None
+    if lora_rank:
+        # Штатная поддержка LoRA vLLM: адаптер грузится воркером с диска при
+        # первом запросе с `lora_request`; ранг — из adapter_config.json,
+        # округлённый вверх до допустимого. Один адаптер на стадию.
+        from vllm.config import LoRAConfig
+
+        lora_config = LoRAConfig(max_lora_rank=lora_rank_allowed(lora_rank),
+                                 max_loras=1, max_cpu_loras=1)
 
     from looma_stage import vllm_worker
 
@@ -428,10 +442,36 @@ def _build_config(model_path: str, *, dtype: str, max_model_len: int,
         # Без номера: каждый воркер берёт карту по своему рангу.
         device_config=DeviceConfig(device="cuda"),
         load_config=LoadConfig(load_format="auto"),
-        lora_config=None, speculative_config=None, quant_config=None,
+        lora_config=lora_config, speculative_config=None, quant_config=None,
         kv_transfer_config=None, kv_events_config=None,
         additional_config={vllm_worker.SETTINGS_KEY: dict(stage)},
     )
+
+
+#: Ранги LoRA, под которые у vLLM есть ядра (config/lora.py: MaxLoRARanks).
+LORA_RANKS = (1, 8, 16, 32, 64, 128, 256, 320, 512)
+
+
+def lora_rank_allowed(rank: int) -> int:
+    """Ближайший допустимый ранг не меньше запрошенного."""
+    for allowed in LORA_RANKS:
+        if allowed >= rank:
+            return allowed
+    raise RunnerRefused(f"ранг адаптера {rank} больше, чем умеет vLLM ({LORA_RANKS[-1]})")
+
+
+def adapter_rank(directory: str) -> int:
+    """`r` из adapter_config.json — то, под что vLLM выделяет буферы."""
+    import json
+    from pathlib import Path
+
+    config_path = Path(directory) / "adapter_config.json"
+    if not config_path.is_file():
+        raise RunnerRefused(f"в {directory} нет adapter_config.json — это не адаптер PEFT")
+    rank = int(json.loads(config_path.read_text()).get("r") or 0)
+    if rank <= 0:
+        raise RunnerRefused(f"в {config_path} нет r")
+    return rank
 
 
 #: Куда кладётся обёртка компилятора. Каталог с коротким путём есть у каждой
@@ -655,7 +695,7 @@ def load_shard(model_path: str, *, start_layer: int, end_layer: int,
                num_model_layers: int, dtype: str = "bfloat16",
                vram_quota_bytes: int = 0, max_model_len: int = 4096,
                block_size: int = 16, max_sequences: int = 64,
-               max_batched_tokens: int = 16384) -> LoadedShard:
+               max_batched_tokens: int = 16384, adapter: str = "") -> LoadedShard:
     """Собрать модель из одних только наших слоёв — на всех картах узла.
 
     Порядок шагов не переставляется, и каждый стоит там, где стоит:
@@ -690,13 +730,23 @@ def load_shard(model_path: str, *, start_layer: int, end_layer: int,
     logger.info("память: %s; беру %.2f каждой карты", plan.why, plan.utilisation)
     max_sequences = plan.max_sequences
 
+    lora_request = None
+    if adapter:
+        import os
+
+        from vllm.lora.request import LoRARequest
+
+        adapter = os.path.abspath(adapter)
+        lora_request = LoRARequest("adapter", 1, adapter)
+        logger.info("адаптер LoRA: %s, r=%d", adapter, adapter_rank(adapter))
     config = _build_config(model_path, dtype=dtype, max_model_len=max_model_len,
                            utilisation=plan.utilisation, block_size=block_size,
                            max_sequences=max_sequences,
                            max_batched_tokens=max_batched_tokens, cards=cards,
                            stage={"start_layer": start_layer,
                                   "end_layer": end_layer,
-                                  "num_model_layers": num_model_layers})
+                                  "num_model_layers": num_model_layers},
+                           lora_rank=adapter_rank(adapter) if adapter else 0)
     _hold_config(config)
     warn_if_shm_tight(cards)
     provide_compiler()
@@ -719,10 +769,13 @@ def load_shard(model_path: str, *, start_layer: int, end_layer: int,
         # тех пор, пока их не убьёт агент.
         driver.close()
         raise
+    # Запросы собирает `vllm_batch`, и он видит только драйвер.
+    driver.lora_request = lora_request
     return LoadedShard(start_layer=start_layer, end_layer=end_layer,
                        num_layers=num_model_layers, is_first=is_first,
                        is_last=is_last, dtype=dtype, runner=driver,
-                       max_sequences=max_sequences, cards=cards)
+                       max_sequences=max_sequences, cards=cards,
+                       lora_request=lora_request)
 
 
 def step(shard: LoadedShard, sequences, *, incoming=None, first_step: bool):
@@ -851,7 +904,7 @@ class VllmEngine:
     def __init__(self, model_path: str, *, start_layer: int, end_layer: int,
                  num_model_layers: int, dtype: str = "bfloat16",
                  vram_quota_bytes: int = 0, max_requests: int = 64,
-                 max_model_len: int = 4096, **_options) -> None:
+                 max_model_len: int = 4096, adapter: str = "", **_options) -> None:
         import torch
 
         self.torch = torch
@@ -860,7 +913,7 @@ class VllmEngine:
                                 num_model_layers=num_model_layers, dtype=dtype,
                                 vram_quota_bytes=vram_quota_bytes,
                                 max_model_len=max_model_len,
-                                max_sequences=max_requests)
+                                max_sequences=max_requests, adapter=adapter)
         self.is_first = self.shard.is_first
         self.is_last = self.shard.is_last
         self.cards = self.shard.cards

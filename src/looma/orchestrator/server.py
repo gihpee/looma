@@ -92,6 +92,22 @@ async def _reconcile_forever(ledger, hub) -> None:
             logger.exception("сверка журнала потребления не удалась")
 
 
+#: Как часто сводить обучения без открытой вкладки: результат задачи на узле
+#: живёт час, а адаптер надо забрать до того.
+TRAINING_SWEEP_S = 30.0
+
+
+async def _sweep_training_forever(app) -> None:
+    while True:
+        await asyncio.sleep(TRAINING_SWEEP_S)
+        try:
+            await app.state.sweep_training()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("сводка обучений не удалась")
+
+
 async def run() -> None:
     config = OrchestratorConfig.from_env()
     Path(config.data_dir).mkdir(parents=True, exist_ok=True)
@@ -177,9 +193,11 @@ async def run() -> None:
                                          log_level="info", loop="asyncio"))
     logger.info("HTTP on :%d  (dashboard at /admin)", config.http_port)
     flusher = asyncio.create_task(hub.flush_loop())
+    sweeper = asyncio.create_task(_sweep_training_forever(app), name="training-sweep")
     try:
         await http.serve()
     finally:
+        sweeper.cancel()
         flusher.cancel()
         try:
             await flusher

@@ -883,6 +883,7 @@ def _build_engine(args, spec: ShardSpec):
 
     from looma_stage import engine as engines
 
+    adapter = _adapter_dir(args.adapter)
     if args.engine == "vllm":
         num_layers = args.num_model_layers or getattr(
             AutoConfig.from_pretrained(spec.model_path), "num_hidden_layers", 0)
@@ -890,11 +891,30 @@ def _build_engine(args, spec: ShardSpec):
             "vllm", model_path=spec.model_path, start_layer=args.start_layer,
             end_layer=args.end_layer, num_model_layers=num_layers,
             dtype=args.dtype, vram_quota_bytes=args.vram_quota_bytes,
-            max_requests=args.max_sequences)
+            max_requests=args.max_sequences, adapter=adapter)
         return built, AutoConfig.from_pretrained(spec.model_path)
 
     shard, config = build_shard(spec)
+    if adapter:
+        # На собственном исполнителе адаптер вплавляется в веса: считать
+        # так же, как база с адаптером, но без лишнего умножения на токен.
+        from looma_stage.train import lora as lora_mod
+
+        lora_mod.merge_into(shard, adapter)
     return engines.build("torch", shard, max_requests=args.max_sequences), config
+
+
+def _adapter_dir(given: str) -> str:
+    """Каталог адаптера, если просили, — проверенный до подъёма чего-либо:
+    отсутствующий файл должен звучать как «нет адаптера», а не как ошибка
+    загрузки посреди vLLM."""
+    if not given:
+        return ""
+    where = os.path.abspath(given)
+    for name in ("adapter_config.json", "adapter_model.safetensors"):
+        if not os.path.isfile(os.path.join(where, name)):
+            raise SystemExit(f"адаптера нет: в {where} не хватает {name}")
+    return where
 
 
 def _serve_training(args, spec: ShardSpec) -> None:
@@ -985,6 +1005,12 @@ def main(argv=None) -> None:
         "--train-config",
         default=os.environ.get("LOOMA_TRAIN_CONFIG", "train.json"),
         help="для --engine train: JSON с настройками обучения (во входах задачи)")
+    parser.add_argument(
+        "--adapter",
+        default=os.environ.get("LOOMA_ADAPTER", ""),
+        help="каталог адаптера LoRA (PEFT: adapter_config.json + "
+             "adapter_model.safetensors) — результат дообучения; torch вплавляет "
+             "его в веса среза, vLLM подмешивает штатно через lora_request")
     parser.add_argument(
         "--num-model-layers",
         type=int,

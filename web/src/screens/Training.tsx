@@ -6,6 +6,7 @@ import {
   Badge, Button, Confirm, Empty, ErrorLine, Field, FilePick, Modal, StateBadge,
   useAction, usePoll,
 } from "../components";
+import { Deploy } from "./Models";
 
 /** Дообучение LoRA по конвейеру: форма, список, ход и результат.
  *
@@ -25,7 +26,7 @@ interface Job {
   request: { repo?: string; precision?: string; stages?: number; node_ids?: string[];
              lora?: { r?: number }; schedule?: { epochs?: number } };
   result: { adapter?: string; steps?: number; final_loss?: number } | null;
-  progress: Progress; files?: Record<string, string>;
+  progress: Progress; files?: Record<string, string>; adapter_kept?: boolean;
   group: { ranks: { rank: number; task_id: string; node_id: string }[] } | null;
 }
 
@@ -193,7 +194,9 @@ function LossChart({ history }: { history: Step[] }) {
   );
 }
 
-function JobCard({ job, onStop }: { job: Job; onStop: (j: Job) => void }) {
+function JobCard({ job, onStop, onDeploy }: {
+  job: Job; onStop: (j: Job) => void; onDeploy: (j: Job) => void;
+}) {
   const p = job.progress ?? {};
   const running = job.state === "running";
   const done = p.step ?? 0, total = p.total_steps ?? 0;
@@ -231,6 +234,9 @@ function JobCard({ job, onStop }: { job: Job; onStop: (j: Job) => void }) {
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <Badge tone="ok">адаптер готов</Badge>
           <span className="sub">{job.result.steps} шагов, loss {job.result.final_loss?.toFixed(4)}</span>
+          {job.adapter_kept && (
+            <Button size="sm" kind="primary" onClick={() => onDeploy(job)}>развернуть</Button>
+          )}
           {job.files && Object.entries(job.files).map(([name, url]) => (
             // Не ссылкой: файл отдаётся по токену в заголовке (см. api.grab).
             <Button key={name} size="sm" onClick={() => void grab(url, name)}>{name}</Button>
@@ -246,6 +252,7 @@ export function Training() {
   const nodes = usePoll<{ nodes: Node[] }>("/admin/agents", 10000);
   const [training, setTraining] = useState(false);
   const [stopping, setStopping] = useState<Job | null>(null);
+  const [deploying, setDeploying] = useState<Job | null>(null);
   const action = useAction(jobs.refresh);
 
   const list = jobs.data?.jobs ?? [];
@@ -275,10 +282,19 @@ export function Training() {
         </div>
       ) : (
         <div style={{ display: "grid", gap: 12 }}>
-          {list.map((job) => <JobCard key={job.group_id} job={job} onStop={setStopping} />)}
+          {list.map((job) => (
+            <JobCard key={job.group_id} job={job} onStop={setStopping} onDeploy={setDeploying} />
+          ))}
         </div>
       )}
       {training && <Train nodes={usable} onClose={() => setTraining(false)} onDone={jobs.refresh} />}
+      {deploying && (
+        // Та же форма, что на «Моделях», с подставленным адаптером и его базой.
+        <Deploy nodes={nodes.data?.nodes ?? []} onClose={() => setDeploying(null)}
+                onDone={() => setDeploying(null)}
+                preset={{ id: deploying.group_id, label: deploying.label,
+                          repo: deploying.request.repo ?? "", precision: deploying.request.precision }} />
+      )}
       {stopping && (
         <Confirm title="Остановить обучение?" action="остановить"
                  body={<>Стадии {stopping.label} будут сняты; последний чекпоинт останется в результатах головы.</>}

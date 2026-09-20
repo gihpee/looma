@@ -232,6 +232,58 @@ def test_адаптер_читается_peft(checkpoint, tmp_path):
     assert torch.allclose(ours, theirs, atol=1e-4), (ours - theirs).abs().max()
 
 
+def test_адаптер_вплавляется_в_срез_для_инференса(checkpoint, tmp_path):
+    """Инференс на собственном исполнителе: `merge_into` кладёт α/r·B·A в веса,
+    и чистый срез без модулей LoRA считает то же, что база с адаптером
+    через `peft`. Порезанный на две стадии — каждая берёт из одного файла
+    свои слои."""
+    peft = pytest.importorskip("peft")
+    from transformers import AutoModelForCausalLM
+
+    from looma_stage.train.forward import run_layers
+
+    stage = stage_for(checkpoint, 0, LAYERS, seed=0)
+    with torch.no_grad():
+        for parameter in stage.params:
+            parameter.add_(torch.randn_like(parameter) * 0.1)
+    lora_mod.write_adapter(tmp_path / "adapter", stage.adapter_piece(),
+                           lora_mod.adapter_config(stage.lora, base_model=checkpoint))
+
+    base = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=torch.float32)
+    loaded = peft.PeftModel.from_pretrained(base, str(tmp_path / "adapter"))
+    ids = torch.tensor([[3, 5, 7, 9, 11, 2]])
+    with torch.no_grad():
+        theirs = loaded(input_ids=ids).logits
+
+    def shard(start, end):
+        spec = ShardSpec(model_path=checkpoint, start_layer=start, end_layer=end,
+                         is_first=start == 0, is_last=end == LAYERS,
+                         device="cpu", dtype="float32")
+        return build_shard(spec)[0]
+
+    head, tail = shard(0, 2), shard(2, LAYERS)
+    assert lora_mod.merge_into(head, tmp_path / "adapter") == 2 * 7
+    assert lora_mod.merge_into(tail, tmp_path / "adapter") == (LAYERS - 2) * 7
+    collated = data_mod.collate([data_mod.Example(ids[0].tolist(), ids[0].tolist())], pad_id=0)
+    mask = torch.tensor(collated["attention_mask"])
+    positions = torch.tensor(collated["position_ids"])
+    with torch.no_grad():
+        hidden = run_layers(head, head.embed(ids), attention_mask=mask,
+                            position_ids=positions, checkpointing=False)
+        hidden = run_layers(tail, hidden, attention_mask=mask,
+                            position_ids=positions, checkpointing=False)
+        ours = tail.lm_head(tail.norm(hidden))
+    assert torch.allclose(ours, theirs, atol=1e-4), (ours - theirs).abs().max()
+
+    # Чужой адаптер (другая форма) — отказ, а не тихая база.
+    wrong = {k: torch.zeros(v.shape[0] + 1, v.shape[1]) if k.endswith("lora_B.weight") else v
+             for k, v in stage.adapter_piece().items()}
+    lora_mod.write_adapter(tmp_path / "wrong", wrong,
+                           lora_mod.adapter_config(stage.lora, base_model=checkpoint))
+    with pytest.raises(ValueError, match="не от этой модели"):
+        lora_mod.merge_into(shard(0, 2), tmp_path / "wrong")
+
+
 # ------------------------------------------------------- чекпоинт стадии
 def test_стадия_продолжает_с_чекпоинта(checkpoint, tmp_path):
     stage = stage_for(checkpoint, 0, LAYERS, seed=0)
