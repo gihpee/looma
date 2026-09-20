@@ -168,7 +168,7 @@ export function Pricing() {
       {tab === "gpu" && (
         <div className="lu-stack" style={{ gap: 16 }}>
           <Card>
-            <div className="lu-table--wrap"><table className="lu-table lu-table--cards">
+            <div className="lu-table--wrap"><table className="lu-table lu-table--cards lu-table--form">
               <thead><tr><th>Лого</th><th>Класс</th><th>VRAM</th><th>Ставка ₽/ч</th>{rivals.map((r) => <th key={r}>{draft.competitors[r]} ₽/ч</th>)}<th>Ниже на</th><th>В сети</th><th /></tr></thead>
               <tbody>{draft.gpu_classes.map((c, i) => { const best = cheapest(c); const save = best && c.rate_kopecks ? Math.round((1 - c.rate_kopecks / best) * 100) : null; return (
                 <tr key={i} style={{ background: c.featured ? "var(--accent-soft)" : undefined }}>
@@ -200,7 +200,7 @@ export function Pricing() {
       {tab === "models" && (
         <Card>
           <CardHead><b>Модели — ₽ за 1M токенов</b><span className="lu-muted" style={{ fontSize: 12 }}>имя должно совпадать с именем модели в /v1/models; логотип — url (с HuggingFace или свой)</span></CardHead>
-          <div className="lu-table--wrap"><table className="lu-table lu-table--cards">
+          <div className="lu-table--wrap"><table className="lu-table lu-table--cards lu-table--form">
             <thead><tr><th>Лого</th><th>Модель · репозиторий</th><th>Контекст</th><th>Вход</th><th>Выход</th><th>В прайсе</th><th /></tr></thead>
             <tbody>{draft.models.map((m, i) => <tr key={i}>
               <td data-label="Лого"><LogoField value={m.logo_url ?? ""} name={m.id} onChange={(v) => setModel(i, { logo_url: v || null })} /></td>

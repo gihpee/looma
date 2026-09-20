@@ -25,15 +25,12 @@
 
 ## 0. Код на сервере
 
-Ветка `replatform` должна оказаться на сервере тем же способом, каким туда
-попадала предыдущая версия (обычно — `git pull` в каталоге репозитория).
-Перед этим её нужно закоммитить и запушить с рабочей машины.
+Новая версия — в `main` (коммит `feat(client:web+edge): full replatform`).
+На сервер она попадает так же, как предыдущие:
 
 ```bash
 cd /opt/looma            # каталог, где лежит docker-compose.yml
-git fetch origin
-git checkout replatform
-git pull
+git pull origin main
 ```
 
 Имя каталога важно: `scripts/issue_cert.sh` ищет тома compose по нему
@@ -209,7 +206,7 @@ done
 DNS-записи можно оставить. Откат — вернуть прежнюю ревизию и пересобрать:
 
 ```bash
-git checkout main          # или конкретный коммит старой версии
+git checkout 6b09887       # последний коммит до переезда
 docker compose up -d --build
 ```
 

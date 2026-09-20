@@ -17,19 +17,17 @@
 .lp-head__brand svg { color: var(--accent); }
 .lp-head__nav { display: none; }
 .lp-head__cta { display: flex; align-items: center; gap: 8px; }
-.lp-head__cta .lp-login { display: none; }
 @media (min-width: 1024px) {
   .lp-head { height: 72px; }
   .lp-head__brand { font-size: 18px; }
   .lp-head__nav { display: flex; align-items: center; gap: 4px; font-size: 14px; }
   .lp-head__nav > a, .lp-head__nav > button { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 12px; border-radius: 8px; border: 0; background: transparent; color: var(--text-2); font: 500 14px var(--font-sans); cursor: pointer; }
   .lp-head__nav > a:hover, .lp-head__nav > button:hover, .lp-head__nav > button[aria-expanded="true"] { background: var(--surface-2); color: var(--text); }
-  .lp-head__cta .lp-login { display: inline-flex; }
   .lp-head__burger { display: none; }
 }
 
 /* мега-меню */
-.lp-mega { position: absolute; top: calc(100% + 8px); left: var(--lp-x); right: var(--lp-x); background: var(--overlay); border: 1px solid var(--border); border-radius: var(--r3); box-shadow: var(--shadow-lg); padding: 28px 32px 24px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 32px; }
+.lp-mega { animation: lp-drop .16s ease-out both; position: absolute; top: calc(100% + 8px); left: var(--lp-x); right: var(--lp-x); background: var(--overlay); border: 1px solid var(--border); border-radius: var(--r3); box-shadow: var(--shadow-lg); padding: 28px 32px 24px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 32px; }
 .lp-mega__col { display: flex; flex-direction: column; gap: 12px; }
 .lp-mega__col + .lp-mega__col { padding-left: 32px; border-left: 1px solid var(--border); }
 .lp-mega__title { display: flex; align-items: center; gap: 10px; }
@@ -41,6 +39,8 @@
 .lp-mega__item b { font-weight: 600; font-size: 14px; }
 .lp-mega__item span { font-size: 13px; color: var(--text-2); }
 .lp-mega__docs { margin-top: auto; padding: 14px; border-radius: 10px; background: var(--bg); border: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--text-2); }
+
+@keyframes lp-drop { from { opacity: 0; transform: translateY(-6px); } }
 
 /* мобильное меню (Drawer) */
 .lp-menu { display: flex; flex-direction: column; gap: 2px; }
@@ -83,20 +83,29 @@
 @media (min-width: 768px) { .lp-compare__price { font-size: 28px; } .lp-compare__them s { font-size: 22px; } }
 
 /* ---------------------------------------------------------------- секции */
-.lp-section { padding: 48px 0; }
+.lp-section { padding: 40px 0; }
 .lp-section--bg { background: var(--bg); }
 .lp-section__head { display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px; }
-.lp-section__kicker { font: 500 12px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--accent); }
+.lp-section__text { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; }
+.lp-section__kicker { display: block; font: 500 12px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--accent); }
+.lp-kicker--alone { margin-bottom: 12px; }
 .lp-section__head h2 { margin: 0; font: 700 30px/1.08 var(--font-display); letter-spacing: -.025em; }
 .lp-section__head p { margin: 0; color: var(--text-2); font-size: 15px; max-width: 640px; }
 @media (min-width: 768px) {
-  .lp-section { padding: 96px 0; }
-  .lp-section__head { margin-bottom: 40px; flex-direction: row; align-items: flex-end; justify-content: space-between; gap: 32px; }
+  .lp-section { padding: 64px 0; }
+  .lp-section__head { margin-bottom: 32px; flex-direction: row; align-items: flex-end; justify-content: space-between; gap: 32px; }
+  .lp-section__text { gap: 14px; }
   .lp-section__head h2 { font-size: 44px; line-height: 1.05; }
   .lp-section__head p { font-size: 17px; }
 }
 .lp-section__aside { display: flex; flex-direction: column; gap: 10px; }
-@media (min-width: 768px) { .lp-section__aside { align-items: flex-end; } }
+.lp-section__aside .lu-segment { display: flex; width: 100%; }
+.lp-section__aside .lu-segment > button { flex: 1; padding: 0 8px; }
+@media (min-width: 768px) {
+  .lp-section__aside { align-items: flex-end; }
+  .lp-section__aside .lu-segment { display: inline-flex; width: auto; }
+  .lp-section__aside .lu-segment > button { flex: none; padding: 0 14px; }
+}
 
 /* продукты */
 .lp-products { display: grid; grid-template-columns: 1fr; gap: 12px; }
@@ -116,8 +125,6 @@
 .lp-fact__icon { width: 36px; height: 36px; border-radius: 9px; display: inline-flex; align-items: center; justify-content: center; background: var(--accent-soft); color: var(--accent); }
 .lp-fact h3 { margin: 0; font: 600 18px/1.25 var(--font-display); }
 .lp-fact p { margin: 0; font-size: 14px; color: var(--text-2); line-height: 1.5; }
-.lp-diagram { margin-top: 24px; padding: 20px; }
-.lp-diagram svg { width: 100%; height: auto; display: block; }
 
 /* цены */
 .lp-gpu { display: grid; grid-template-columns: 1fr; gap: 10px; }
@@ -150,6 +157,7 @@
 
 /* демо */
 .lp-demo { display: grid; grid-template-columns: 1fr; gap: 16px; }
+.lp-demo .lp-section__head h2 { line-height: 1.05; }
 @media (min-width: 1024px) { .lp-demo { grid-template-columns: 1fr 1fr; gap: 32px; align-items: start; } }
 .lp-demo__box { display: flex; flex-direction: column; gap: 12px; }
 .lp-demo__form { display: flex; gap: 8px; padding: 6px 6px 6px 14px; border-radius: 12px; border: 1px solid var(--border-2); background: var(--surface); box-shadow: var(--shadow); }
@@ -166,13 +174,9 @@
 
 /* владельцы машин */
 .lp-owners { display: grid; grid-template-columns: 1fr; gap: 16px; }
-@media (min-width: 1024px) { .lp-owners { grid-template-columns: 1fr 1fr; gap: 32px; align-items: center; } }
+@media (min-width: 1024px) { .lp-owners { grid-template-columns: 1fr 1fr; gap: 32px; align-items: start; } }
 
 /* финал и футер */
-.lp-final { text-align: center; display: flex; flex-direction: column; align-items: center; gap: 16px; }
-.lp-final h2 { margin: 0; font: 700 32px/1.08 var(--font-display); letter-spacing: -.025em; }
-.lp-final p { margin: 0; color: var(--text-2); max-width: 540px; }
-@media (min-width: 768px) { .lp-final h2 { font-size: 44px; } }
 .lp-foot { border-top: 1px solid var(--border); padding: 32px 0; font-size: 13px; color: var(--text-3); }
 .lp-foot__grid { display: grid; grid-template-columns: 1fr; gap: 24px; }
 @media (min-width: 768px) { .lp-foot__grid { grid-template-columns: 1.4fr 1fr 1fr 1fr; } }

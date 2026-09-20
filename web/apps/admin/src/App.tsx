@@ -1,8 +1,8 @@
 /** Админка. Тот же каркас и вход, что у консоли; пускает только role=admin. */
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Route, Routes } from "react-router-dom";
 import { Home, Server, KeyRound, Package, Boxes, Sparkles, ListTodo, Network, Users, Receipt, Tags } from "lucide-react";
 import { useWho, useSignOut } from "@looma/api";
-import { AppShell, Avatar, Badge, Brand, Button, ThemeToggle, type NavGroup } from "@looma/ui";
+import { AppShell, Avatar, Badge, Brand, Button, NotFound, ThemeToggle, type NavGroup } from "@looma/ui";
 import { SignIn } from "./screens/SignIn";
 import { Overview } from "./screens/Overview";
 import { Nodes } from "./screens/Nodes";
@@ -72,7 +72,7 @@ export function App() {
         <Route path="/accounts" element={<Accounts />} />
         <Route path="/leases" element={<Leases />} />
         <Route path="/pricing" element={<Pricing />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
+        <Route path="*" element={<NotFound home="/" />} />
       </Routes>
     </AppShell>
   );

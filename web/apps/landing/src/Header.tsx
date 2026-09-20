@@ -13,14 +13,13 @@ export const DOCS = "/docs";
 const MENU = {
   compute: [
     { href: "#compute", title: "Ray-кластер", text: "Поднимите кластер на N узлов на несколько часов. Платите за GPU-час, пока он держит ресурс." },
-    { href: "#fit", title: "Что здесь поедет, а что нет", text: "Честная таблица: независимые куски и конвейер по слоям — да, тензорный параллелизм — нет." },
     { href: "#prices", title: "Цены на кластер", text: "По классам карт, рядом с ценами AWS и Selectel." },
   ],
   intelligence: [
     { href: "#inference", title: "Инференс", text: "OpenAI-совместимый API и чат. Цена за токен, метрики каждого ответа." },
     { href: "#models", title: "Модели", text: "Каталог платформенных моделей — и любая своя с HuggingFace, без заявок." },
     { href: "#training", title: "Обучение", text: "LoRA на ваших данных: датасет, база, точность — и адаптер сразу в деплой." },
-    { href: "#keys", title: "Ключи API", text: "base_url, curl и python — рядом с ключом." },
+    { href: `${CONSOLE}/intelligence/keys`, title: "Ключи API", text: "base_url, curl и python — рядом с ключом." },
   ],
   network: [
     { href: "#owners", title: "Подключить машину", text: "Одна команда с ключом. Без входящих портов и настройки роутера." },
@@ -52,6 +51,11 @@ export function Header() {
   const [mega, setMega] = useState(false);
   const [menu, setMenu] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  // Наведение открывает сразу, а закрывает с задержкой: курсор по дороге от
+  // кнопки к панели на миг покидает обе, и без паузы меню бы захлопывалось.
+  const leave = useRef<number>();
+  const hoverIn = () => { clearTimeout(leave.current); if (desktop) setMega(true); };
+  const hoverOut = () => { clearTimeout(leave.current); leave.current = window.setTimeout(() => setMega(false), 160); };
 
   useEffect(() => {
     if (!mega) return;
@@ -65,20 +69,19 @@ export function Header() {
     <header className="lp-head" ref={ref}>
       <a href="/" className="lp-head__brand"><Mark size={26} />Looma Float</a>
       <nav className="lp-head__nav" aria-label="Разделы">
-        <button type="button" aria-expanded={mega} aria-controls="lp-mega" onClick={() => setMega((v) => !v)}>Продукты <ChevronDown size={14} /></button>
+        <button type="button" aria-expanded={mega} aria-controls="lp-mega" onClick={() => setMega((v) => !v)} onMouseEnter={hoverIn} onMouseLeave={hoverOut}>Продукты <ChevronDown size={14} /></button>
         <a href="#how">Как устроено</a>
         <a href="#prices">Цены</a>
         <a href={DOCS}>Документация <ExternalLink size={13} /></a>
       </nav>
       <div className="lp-head__cta">
         <ThemeToggle />
-        <a className="lu-btn lu-btn--ghost lp-login" href={CONSOLE}>Войти</a>
         <LinkButton kind="primary" href={CONSOLE}>Начать</LinkButton>
         <IconButton label="Меню" kind="ghost" className="lp-head__burger" onClick={() => setMenu(true)}><Menu size={22} /></IconButton>
       </div>
 
       {desktop && mega && (
-        <div className="lp-mega" id="lp-mega" role="region" aria-label="Продукты">
+        <div className="lp-mega" id="lp-mega" role="region" aria-label="Продукты" onMouseEnter={hoverIn} onMouseLeave={hoverOut}>
           <div className="lp-mega__col">
             <div className="lp-mega__title"><span className="lu-logo">c</span><div><b>looma-compute</b><small>свой код на распределённых картах</small></div></div>
             {MENU.compute.map((m) => <a key={m.href} className="lp-mega__item" href={m.href} onClick={() => setMega(false)}><b>{m.title}</b><span>{m.text}</span></a>)}
@@ -101,10 +104,7 @@ export function Header() {
 
       {menu && (
         <Drawer title="Меню" onClose={() => setMenu(false)} footer={
-          <div className="lu-stack" style={{ width: "100%" }}>
-            <a className="lu-btn lu-btn--secondary lu-btn--block lu-btn--lg" href={CONSOLE}>Войти</a>
-            <a className="lu-btn lu-btn--primary lu-btn--block lu-btn--lg" href={CONSOLE}>Начать</a>
-          </div>}>
+          <a className="lu-btn lu-btn--primary lu-btn--block lu-btn--lg" href={CONSOLE} style={{ width: "100%" }}>Начать</a>}>
           <nav className="lp-menu" onClick={() => setMenu(false)}>
             <div className="lp-menu__group">looma-compute</div>
             {MENU.compute.map((m) => <a key={m.href} href={m.href}>{m.title}<small>{m.text}</small></a>)}

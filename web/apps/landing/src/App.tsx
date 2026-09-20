@@ -8,13 +8,22 @@
 import { useState } from "react";
 import { ArrowRight, Check, Cpu, Layers, Lock, Radio, Shuffle, Terminal } from "lucide-react";
 import { usePublicPricing, type GpuClass } from "@looma/api";
-import { Badge, Card, CardBody, CardFoot, CardHead, Chip, KeyValue, LinkButton, Logo, Mark, Segmented, rubles } from "@looma/ui";
+import { Badge, Card, CardBody, CardFoot, CardHead, Chip, KeyValue, LinkButton, Logo, Mark, NotFound, Segmented, rubles } from "@looma/ui";
 import "./landing.css";
 import { Announcement, CONSOLE, DOCS, Header } from "./Header";
 import { Demo } from "./Demo";
 import { cheapestRival, fmtTimes, heroClass, kop, savePercent, savingsRange, timesCheaper } from "./pricing";
 
 export function App() {
+  // Документации и других страниц пока нет: любой путь кроме корня — честная
+  // 404, а не лендинг под чужим адресом.
+  if (location.pathname !== "/" && location.pathname !== "/index.html") {
+    return <NotFound home="/" console={CONSOLE} />;
+  }
+  return <Landing />;
+}
+
+function Landing() {
   const pricing = usePublicPricing();
   const p = pricing.data ?? null;
   const rivals = p?.competitors ?? { selectel: "Selectel", aws: "AWS" };
@@ -30,24 +39,18 @@ export function App() {
         <How />
         <Prices p={p} rivals={rivals} range={range} />
         <section className="lp-section" id="demo">
-          <div className="lp-wrap lp-demo">
-            <div className="lp-section__head" style={{ marginBottom: 0, flexDirection: "column", alignItems: "flex-start" }}>
-              <span className="lp-section__kicker">Попробуйте сами</span>
-              <h2>Модель разрезана по домашним машинам. Оцените скорость.</h2>
-              <p>Ответ приходит с той модели, которая сейчас отвечает в сети: несколько узлов держат по части слоёв. Скорость и время первого токена считаются здесь, в вашем браузере.</p>
+          <div className="lp-wrap">
+            <span className="lp-section__kicker lp-kicker--alone">Попробуйте сами</span>
+            <div className="lp-demo">
+              <div className="lp-section__head" style={{ marginBottom: 0, flexDirection: "column", alignItems: "flex-start" }}>
+                <h2>Модель разрезана по домашним машинам. Оцените скорость.</h2>
+                <p>Ответ приходит с той модели, которая сейчас отвечает в сети: несколько узлов держат по части слоёв. Скорость и время первого токена считаются здесь, в вашем браузере.</p>
+              </div>
+              <Demo />
             </div>
-            <Demo />
           </div>
         </section>
         <Owners />
-        <section className="lp-section">
-          <div className="lp-wrap lp-final">
-            <Mark size={40} className="lu-muted" />
-            <h2>Полотно уже соткано</h2>
-            <p>Сеть работает, счёт считается, модели отвечают. Осталось выдать вам ключ.</p>
-            <LinkButton kind="primary" size="lg" glow href={CONSOLE}>Войти в консоль</LinkButton>
-          </div>
-        </section>
       </main>
       <Footer />
     </div>
@@ -62,7 +65,6 @@ function Hero({ p, rivals, range }: { p: ReturnType<typeof usePublicPricing>["da
       <Loom />
       <div className="lp-wrap lp-hero__grid">
         <div className="lp-hero__copy">
-          <Badge tone="info" dot={false} className="lp-hero__tag"><i className="lu-badge__dot" style={{ color: "var(--accent)" }} />looma-compute · looma-intelligence</Badge>
           <h1 className="lu-display-1" style={{ margin: 0 }}>Мощность,<br />когда она нужна</h1>
           <p>Считаем на распределённой сети GPU. Берите кластер под свой код или инференс готовых и своих моделей — платите только за использованное.</p>
           <div className="lp-hero__cta">
@@ -143,7 +145,7 @@ function Products() {
     <section className="lp-section lp-section--bg" id="compute">
       <div className="lp-wrap">
         <div className="lp-section__head">
-          <div><span className="lp-section__kicker">Продукты</span><h2>Разворачивайте что хотите и когда хотите</h2></div>
+          <div className="lp-section__text"><span className="lp-section__kicker">Продукты</span><h2>Разворачивайте что хотите и когда хотите</h2></div>
         </div>
         <div className="lp-products">
           <Card panel className="lp-product">
@@ -152,7 +154,7 @@ function Products() {
             <p>Выбираете карты и часы — кластер поднимается на домашних машинах сети. Если свободных узлов не хватает, платформа подвинет свои модели и вернёт их, когда аренда закончится.</p>
             <div className="lp-product__cta">
               <LinkButton kind="ink" href={`${CONSOLE}/compute/clusters`}>Арендовать кластер</LinkButton>
-              <a className="lu-btn lu-btn--ghost" href="#fit" style={{ color: "var(--accent)" }}>Что здесь поедет →</a>
+              <a className="lu-btn lu-btn--ghost" href="#prices" style={{ color: "var(--accent)" }}>Цены на кластер →</a>
             </div>
           </Card>
           <Card panel className="lp-product" id="inference">
@@ -176,38 +178,15 @@ function How() {
     <section className="lp-section" id="how">
       <div className="lp-wrap">
         <div className="lp-section__head">
-          <div><span className="lp-section__kicker">Как устроено</span><h2>Три факта вместо обещаний</h2><p>Сеть собрана из домашних машин. Вот что из этого следует — и что мы сделали, чтобы это работало.</p></div>
+          <div className="lp-section__text"><span className="lp-section__kicker">Как устроено</span><h2>Три факта вместо обещаний</h2><p>Сеть собрана из домашних машин. Вот что из этого следует — и что мы сделали, чтобы это работало.</p></div>
         </div>
         <div className="lp-facts">
-          <Card className="lp-fact"><span className="lp-fact__icon"><Radio size={18} /></span><h3>Одно исходящее соединение</h3><p>У машины-поставщика нет и не будет входящих портов: это домашний компьютер за роутером, который никто не настраивает. Узел сам открывает канал наружу, и всё идёт обратно по нему же — команды, активации модели, порт до кластера.</p></Card>
-          <Card className="lp-fact"><span className="lp-fact__icon"><Shuffle size={18} /></span><h3>Платформа — первый клиент своей сети</h3><p>Пока прямого арендатора нет, карты занимает инференс. Приходит клиент за кластером — модели уступают ему узлы и возвращаются, когда аренда кончилась.</p></Card>
-          <Card className="lp-fact"><span className="lp-fact__icon"><Lock size={18} /></span><h3>Чужой код в песочнице</h3><p>Задача идёт под отдельным пользователем, в своём каталоге, с ограничениями по памяти и процессам. Владелец машины сдаёт мощность, а не доступ к себе.</p></Card>
+          <Card className="lp-fact"><span className="lp-fact__icon"><Radio size={18} /></span><h3>Одно исходящее соединение</h3><p>Узел за домашним роутером сам открывает канал наружу. Входящих портов нет.</p></Card>
+          <Card className="lp-fact"><span className="lp-fact__icon"><Shuffle size={18} /></span><h3>Платформа — первый клиент</h3><p>Пока нет арендатора, карты занимает инференс. Пришёл клиент — модели уступают узлы и вернутся после.</p></Card>
+          <Card className="lp-fact"><span className="lp-fact__icon"><Lock size={18} /></span><h3>Чужой код в песочнице</h3><p>Отдельный пользователь, свой каталог, лимиты по памяти и процессам.</p></Card>
         </div>
-        <Card className="lp-diagram" id="fit">
-          <Diagram />
-        </Card>
       </div>
     </section>
-  );
-}
-
-function Diagram() {
-  const nodes = [80, 240, 400, 560, 720];
-  return (
-    <svg viewBox="0 0 800 200" role="img" aria-label="Пять узлов, от каждого одна нить к оркестратору; нити продолжаются полотном">
-      <text x="400" y="22" textAnchor="middle" fontSize="12" fill="var(--text-3)" fontFamily="var(--font-mono)">оркестратор · loomafloat.ru:9000</text>
-      <rect x="330" y="32" width="140" height="28" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" />
-      <text x="400" y="51" textAnchor="middle" fontSize="12" fill="var(--accent)" fontWeight="600" fontFamily="var(--font-sans)">одна точка входа</text>
-      {nodes.map((x, i) => (
-        <g key={x}>
-          <path d={`M${x} 160 C ${x} 110, 400 110, 400 60`} stroke="var(--accent)" strokeOpacity=".55" strokeWidth="1.5" fill="none" />
-          <rect x={x - 46} y="160" width="92" height="28" rx="6" fill="var(--surface)" stroke="var(--border-2)" />
-          <text x={x} y="178" textAnchor="middle" fontSize="11" fill="var(--text-2)" fontFamily="var(--font-mono)">узел {i + 1} · NAT</text>
-          <circle cx={x} cy="160" r="3" fill="var(--accent)" />
-        </g>
-      ))}
-      <text x="400" y="118" textAnchor="middle" fontSize="11" fill="var(--text-3)" fontFamily="var(--font-sans)">← команды · активации слоёв · порт кластера →</text>
-    </svg>
   );
 }
 
@@ -221,7 +200,7 @@ function Prices({ p, rivals, range }: { p: ReturnType<typeof usePublicPricing>["
     <section className="lp-section lp-section--bg" id="prices">
       <div className="lp-wrap">
         <div className="lp-section__head">
-          <div>
+          <div className="lp-section__text">
             <span className="lp-section__kicker">Цены</span>
             <h2>{range ? `В ${fmtTimes(range[0])}–${fmtTimes(range[1])} раза дешевле ${rivalNames}.` : "Одна ставка за GPU-час, цена за токен для инференса."}<br />Без минимума и договора.</h2>
             <p>Одна ставка за GPU-час для кластера и обучения, цена за токен для инференса. Считаем по факту: кластер — пока держит ресурс, модель — за выданные токены.</p>

@@ -1,10 +1,10 @@
 /** Консоль клиента. Роутер: вход → каркас с экранами. URL на каждый экран —
  *  deep-link и «назад» работают, а закладку на «Кластеры» можно дать коллеге. */
 import { lazy, Suspense } from "react";
-import { Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { Route, Routes, useLocation } from "react-router-dom";
 import { Home as HomeIcon, Server, MessageSquare, Boxes, Sparkles, KeyRound, CreditCard, Settings as SettingsIcon, ExternalLink } from "lucide-react";
 import { useWho, useSignOut, useBalance } from "@looma/api";
-import { AppShell, Avatar, Button, ThemeToggle, money, type NavGroup } from "@looma/ui";
+import { AppShell, Avatar, Button, NotFound, ThemeToggle, money, type NavGroup } from "@looma/ui";
 import { SignIn } from "./screens/SignIn";
 import { Home } from "./screens/Home";
 import { Clusters } from "./screens/Clusters";
@@ -86,7 +86,7 @@ export function App() {
           <Route path="/intelligence/keys" element={<Keys />} />
           <Route path="/billing" element={<Billing />} />
           <Route path="/settings" element={<Settings who={who.data} />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
+          <Route path="*" element={<NotFound home="/" />} />
         </Routes>
       </Suspense>
     </AppShell>

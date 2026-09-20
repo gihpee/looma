@@ -4,6 +4,7 @@
 import {
   createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { Button, IconButton, cx } from "./primitives";
 
@@ -20,6 +21,12 @@ function useLockScroll() {
     document.body.style.overflow = "hidden";
     return () => { document.body.style.overflow = prev; };
   }, []);
+}
+/** Слой — в body, а не в месте вызова. Иначе sticky-шапка с backdrop-filter
+ *  становится для position: fixed «окном», и дровер открывается внутри
+ *  шестидесяти пикселей шапки — то есть не открывается вовсе. */
+function Layer({ children }: { children: ReactNode }) {
+  return createPortal(children, document.body);
 }
 /** Фокус — внутрь слоя при открытии и обратно при закрытии. */
 function useFocusTrap(ref: React.RefObject<HTMLElement>) {
@@ -47,7 +54,7 @@ export function Modal({ title, onClose, children, footer, size, subtitle }: {
   const ref = useRef<HTMLDivElement>(null);
   useEscape(onClose); useLockScroll(); useFocusTrap(ref);
   return (
-    <>
+    <Layer>
       <div className="lu-scrim" onClick={onClose} />
       <div ref={ref} className={cx("lu-modal", size === "sm" && "lu-modal--sm")} role="dialog" aria-modal="true" tabIndex={-1}>
         <div className="lu-modal__handle"><i /></div>
@@ -58,7 +65,7 @@ export function Modal({ title, onClose, children, footer, size, subtitle }: {
         <div className="lu-modal__body">{children}</div>
         {footer && <div className="lu-modal__foot">{footer}</div>}
       </div>
-    </>
+    </Layer>
   );
 }
 
@@ -68,7 +75,7 @@ export function Drawer({ title, onClose, children, side = "right", footer }: {
   const ref = useRef<HTMLDivElement>(null);
   useEscape(onClose); useLockScroll(); useFocusTrap(ref);
   return (
-    <>
+    <Layer>
       <div className="lu-scrim" onClick={onClose} />
       <div ref={ref} className={cx("lu-drawer", side === "left" && "lu-drawer--left")} role="dialog" aria-modal="true" tabIndex={-1}>
         <div className="lu-modal__head">
@@ -78,7 +85,7 @@ export function Drawer({ title, onClose, children, side = "right", footer }: {
         <div className="lu-modal__body">{children}</div>
         {footer && <div className="lu-modal__foot">{footer}</div>}
       </div>
-    </>
+    </Layer>
   );
 }
 

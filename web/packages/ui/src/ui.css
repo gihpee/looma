@@ -21,6 +21,12 @@ code, .lu-mono { font-family: var(--font-mono); font-size: .92em; }
 .lu-num { font-variant-numeric: tabular-nums; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r1); }
 ::selection { background: var(--accent-soft); }
+/* Телефон: страница не шире экрана (иначе Safari уменьшает её целиком), а
+ * поля ввода не мельче 16px — при меньшем iOS приближает экран на фокусе. */
+@media (max-width: 767px) {
+  html, body { overflow-x: hidden; max-width: 100vw; }
+  input, select, textarea { font-size: 16px !important; }
+}
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
 }
@@ -222,6 +228,15 @@ code, .lu-mono { font-family: var(--font-mono); font-size: .92em; }
   .lu-table--cards td { padding: 4px 0; border: 0; display: flex; justify-content: space-between; gap: 12px; }
   .lu-table--cards td::before { content: attr(data-label); color: var(--text-3); font-size: 12px; }
   .lu-table--cards td.lu-num { text-align: right; }
+  .lu-table--cards td > * { min-width: 0; }
+  /* Редактируемые таблицы: подпись над полем, поле во всю ширину — иначе
+   * подпись и ввод спорят за 340 пикселей, и ввод ужимается до нечитаемого. */
+  .lu-table--form td { flex-direction: column; align-items: stretch; gap: 4px; padding: 6px 0; }
+  .lu-table--form td[style] { min-width: 0 !important; }
+  .lu-table--form td > .lu-stack, .lu-table--form td > .lu-row { width: 100%; }
+  .lu-table--form td .lu-inputwrap, .lu-table--form td .lu-input { width: 100% !important; }
+  .lu-table--form tr { padding: 12px 14px 14px; }
+  .lu-table--form td:last-child { flex-direction: row; justify-content: flex-end; padding-top: 10px; }
 }
 
 /* ---------------------------------------------------------- прогресс */
@@ -239,7 +254,7 @@ code, .lu-mono { font-family: var(--font-mono); font-size: .92em; }
 .lu-kv__v { text-align: right; }
 
 /* ---------------------------------------------------------------- код */
-.lu-code { position: relative; padding: 12px 14px; border-radius: 8px; background: var(--ink); color: var(--on-ink); font: 12px/1.6 var(--font-mono); white-space: pre; overflow-x: auto; }
+.lu-code { position: relative; padding: 12px 40px 12px 14px; border-radius: 8px; background: var(--ink); color: var(--on-ink); font: 12px/1.6 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 :root[data-theme="dark"] .lu-code { background: #05090b; color: #e8f2f5; }
 .lu-code__copy { position: absolute; top: 8px; right: 8px; }
 
@@ -250,9 +265,14 @@ code, .lu-mono { font-family: var(--font-mono); font-size: .92em; }
 .lu-empty svg { color: var(--accent); }
 
 /* ------------------------------------------------------------- слои */
-.lu-scrim { position: fixed; inset: 0; background: rgba(14, 20, 22, .42); z-index: 40; }
+.lu-scrim { position: fixed; inset: 0; background: rgba(14, 20, 22, .42); z-index: 40; animation: lu-fade .18s ease-out both; }
 .lu-modal { position: fixed; z-index: 41; background: var(--overlay); display: flex; flex-direction: column; overflow: hidden; box-shadow: var(--shadow-lg);
-  left: 0; right: 0; bottom: 0; max-height: 92vh; border-radius: 18px 18px 0 0; }
+  left: 0; right: 0; bottom: 0; max-height: 92vh; border-radius: 18px 18px 0 0; animation: lu-rise .26s cubic-bezier(.2, .8, .2, 1) both; }
+@keyframes lu-fade { from { opacity: 0; } }
+@keyframes lu-rise { from { transform: translateY(100%); } }
+@keyframes lu-pop { from { opacity: 0; transform: translate(-50%, -50%) scale(.97); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+@keyframes lu-slide-right { from { transform: translateX(100%); } }
+@keyframes lu-slide-left { from { transform: translateX(-100%); } }
 .lu-modal__handle { display: flex; justify-content: center; padding: 8px 0 0; }
 .lu-modal__handle i { width: 36px; height: 4px; border-radius: 2px; background: var(--border-2); }
 .lu-modal__head { display: flex; align-items: center; gap: 8px; padding: 12px 8px 12px 20px; }
@@ -260,15 +280,15 @@ code, .lu-mono { font-family: var(--font-mono); font-size: .92em; }
 .lu-modal__body { padding: 4px 16px 16px; overflow-y: auto; flex-grow: 1; min-height: 0; }
 .lu-modal__foot { padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid var(--border); background: var(--bg); display: flex; flex-direction: column; gap: 10px; }
 @media (min-width: 768px) {
-  .lu-modal { left: 50%; top: 50%; bottom: auto; right: auto; transform: translate(-50%, -50%); width: min(880px, calc(100vw - 48px)); max-height: calc(100vh - 48px); border-radius: var(--r3); }
+  .lu-modal { left: 50%; top: 50%; bottom: auto; right: auto; transform: translate(-50%, -50%); width: min(880px, calc(100vw - 48px)); max-height: calc(100vh - 48px); border-radius: var(--r3); animation: lu-pop .18s ease-out both; }
   .lu-modal--sm { width: min(520px, calc(100vw - 48px)); }
   .lu-modal__handle { display: none; }
   .lu-modal__head { padding: 18px 16px 8px 24px; }
   .lu-modal__body { padding: 8px 24px 20px; }
   .lu-modal__foot { padding: 14px 24px; flex-direction: row; align-items: center; justify-content: space-between; }
 }
-.lu-drawer { position: fixed; z-index: 41; top: 0; bottom: 0; right: 0; width: min(560px, 100vw); background: var(--overlay); box-shadow: var(--shadow-lg); display: flex; flex-direction: column; }
-.lu-drawer--left { right: auto; left: 0; width: min(330px, 86vw); }
+.lu-drawer { position: fixed; z-index: 41; top: 0; bottom: 0; right: 0; width: min(560px, 100vw); background: var(--overlay); box-shadow: var(--shadow-lg); display: flex; flex-direction: column; animation: lu-slide-right .26s cubic-bezier(.2, .8, .2, 1) both; }
+.lu-drawer--left { right: auto; left: 0; width: min(330px, 86vw); animation-name: lu-slide-left; }
 
 /* ---------------------------------------------------------------- тосты */
 .lu-toasts { position: fixed; z-index: 50; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
@@ -331,6 +351,8 @@ code, .lu-mono { font-family: var(--font-mono); font-size: .92em; }
 .lu-topbar__title b { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lu-topbar__title small { font-size: 12px; color: var(--text-3); }
 .lu-topbar__right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.lu-topbar__right .lu-btn { height: 36px; padding: 0 12px; font-size: 13px; border-radius: 8px; }
+.lu-topbar__right .lu-iconbtn { width: 36px; padding: 0; }
 .lu-topbar .lu-search { display: none; }
 .lu-main { flex-grow: 1; min-width: 0; }
 .lu-page { padding: 20px 16px calc(var(--tabbar-h) + 28px); display: flex; flex-direction: column; gap: 16px; max-width: var(--content-max); width: 100%; margin: 0 auto; }
@@ -387,3 +409,12 @@ code, .lu-mono { font-family: var(--font-mono); font-size: .92em; }
 .lu-weft { position: relative; overflow: hidden; }
 .lu-weft::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, var(--surface) 0 40%, transparent 60%); animation: lu-weft .62s cubic-bezier(.2,.8,.2,1) forwards; }
 @keyframes lu-weft { from { transform: translateX(0); } to { transform: translateX(110%); } }
+
+/* ---------------------------------------------------------------- 404 */
+.lu-404 { min-height: 70vh; display: grid; place-items: center; padding: 24px 16px; background: var(--bg); }
+.lu-404__box { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 12px; max-width: 520px; color: var(--accent); }
+.lu-404__code { font: 500 13px var(--font-mono); letter-spacing: .1em; color: var(--text-3); }
+.lu-404__box h1 { margin: 0; font: 700 30px/1.1 var(--font-display); letter-spacing: -.025em; color: var(--text); }
+.lu-404__box p { margin: 0; font-size: 15px; line-height: 1.55; color: var(--text-2); }
+.lu-404__cta { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin-top: 8px; }
+.lu-404__path { margin-top: 12px; font-size: 12px; color: var(--text-3); }

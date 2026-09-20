@@ -6,4 +6,5 @@ export * from "./network";
 export * from "./shell";
 export * from "./theme";
 export { Mark } from "./mark";
+export { NotFound } from "./notfound";
 export * from "./format";
