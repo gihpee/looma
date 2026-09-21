@@ -27,6 +27,18 @@ const MENU = {
   ],
 };
 
+/** Панель остаётся в DOM ещё `ms` после закрытия — чтобы успела уйти
+ *  анимацией, а не исчезнуть на полукадре. */
+function usePresence(open: boolean, ms: number) {
+  const [shown, setShown] = useState(open);
+  useEffect(() => {
+    if (open) { setShown(true); return; }
+    const t = window.setTimeout(() => setShown(false), ms);
+    return () => clearTimeout(t);
+  }, [open, ms]);
+  return shown;
+}
+
 export function Announcement({ pricing }: { pricing?: PublicPricing | null }) {
   const gpu = cheapestClass(pricing);
   const model = cheapestModel(pricing);
@@ -49,6 +61,7 @@ export function Announcement({ pricing }: { pricing?: PublicPricing | null }) {
 export function Header() {
   const desktop = useDesktop();
   const [mega, setMega] = useState(false);
+  const shown = usePresence(mega, 160);
   const [menu, setMenu] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   // Наведение открывает сразу, а закрывает с задержкой: курсор по дороге от
@@ -80,8 +93,8 @@ export function Header() {
         <IconButton label="Меню" kind="ghost" className="lp-head__burger" onClick={() => setMenu(true)}><Menu size={22} /></IconButton>
       </div>
 
-      {desktop && mega && (
-        <div className="lp-mega" id="lp-mega" role="region" aria-label="Продукты" onMouseEnter={hoverIn} onMouseLeave={hoverOut}>
+      {desktop && shown && (
+        <div className={`lp-mega${mega ? "" : " lp-mega--out"}`} id="lp-mega" role="region" aria-label="Продукты" onMouseEnter={hoverIn} onMouseLeave={hoverOut}>
           <div className="lp-mega__col">
             <div className="lp-mega__title"><span className="lu-logo">c</span><div><b>looma-compute</b><small>свой код на распределённых картах</small></div></div>
             {MENU.compute.map((m) => <a key={m.href} className="lp-mega__item" href={m.href} onClick={() => setMega(false)}><b>{m.title}</b><span>{m.text}</span></a>)}

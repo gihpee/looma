@@ -291,9 +291,10 @@ function HowWeCount() {
 function Owners() {
   return (
     <section className="lp-section lp-section--bg" id="owners">
-      <div className="lp-wrap lp-owners">
+      <div className="lp-wrap">
+        <span className="lp-section__kicker lp-kicker--alone">Для владельцев машин</span>
+        <div className="lp-owners">
         <div className="lp-section__head" style={{ marginBottom: 0, flexDirection: "column", alignItems: "flex-start" }}>
-          <span className="lp-section__kicker">Для владельцев машин</span>
           <h2>Подключить машину — одна команда</h2>
           <p>Ключ несёт внутри адрес оркестратора: ничего не вводить, ничего не пробрасывать. Узел сам звонит наружу, чужой код идёт в песочнице под отдельным пользователем, а вы решаете, когда отдать карту.</p>
           <LinkButton kind="ink" href={`${DOCS}/nodes`}>Как подключить <ArrowRight size={16} /></LinkButton>
@@ -302,6 +303,7 @@ function Owners() {
           <Card className="lp-fact"><span className="lp-fact__icon"><Terminal size={18} /></span><h3>Без входящих портов</h3><p>Роутер не трогаем. Узел открывает одно исходящее соединение и держит его.</p></Card>
           <Card className="lp-fact"><span className="lp-fact__icon"><Layers size={18} /></span><h3>Код в песочнице</h3><p>Отдельный пользователь, свой каталог, лимиты по памяти и процессам.</p></Card>
           <Card className="lp-fact"><span className="lp-fact__icon"><Cpu size={18} /></span><h3>Карта возвращается</h3><p>Снять машину из сети можно в любой момент — задачи переедут на другие узлы.</p></Card>
+        </div>
         </div>
       </div>
     </section>

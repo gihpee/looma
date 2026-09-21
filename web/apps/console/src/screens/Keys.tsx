@@ -4,8 +4,8 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Plus } from "lucide-react";
 import { send, useApiKeys, useModels, type ApiKey } from "@looma/api";
-import { Button, Card, CardBody, CardHead, CodeBlock, Confirm, Empty, Field, Input, Modal, Notice, Page, PageHead, Segmented, dateOnly, useAction, useToast } from "@looma/ui";
-import { API_BASE, ErrorLine, curlSnippet, pythonSnippet } from "../lib";
+import { Button, Card, CardBody, CardHead, CodeBlock, Confirm, Empty, Field, Input, Modal, Page, PageHead, Segmented, dateOnly, useAction, useToast } from "@looma/ui";
+import { ErrorLine, curlSnippet, pythonSnippet } from "../lib";
 
 export function Keys() {
   const qc = useQueryClient();
@@ -68,9 +68,7 @@ export function Keys() {
           <Card>
             <CardHead><b>Как использовать</b><Segmented soft value={lang} onChange={setLang} options={[{ value: "curl", label: "curl" }, { value: "python", label: "python" }]} /></CardHead>
             <CardBody className="lu-stack">
-              <div style={{ fontSize: 13 }}>base_url: <code>{API_BASE}/v1</code></div>
               <CodeBlock code={lang === "curl" ? curlSnippet(model) : pythonSnippet(model)} />
-              <Notice tone="info">Совместимо с OpenAI SDK: достаточно подменить base_url и ключ.</Notice>
             </CardBody>
           </Card>
         </div>

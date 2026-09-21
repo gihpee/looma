@@ -2,7 +2,7 @@
 <html lang="ru" data-theme="light">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
     <title>Looma Float — GPU-сеть: инференс, обучение и кластеры</title>
     <meta name="description" content="Распределённая сеть GPU на домашних машинах. Ray-кластер под ваш код, OpenAI-совместимый инференс и обучение LoRA — платите только за использованное. В разы дешевле облаков." />
     <meta property="og:type" content="website" />
@@ -19,11 +19,10 @@
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" />
     <script>
       // Тема — до первой отрисовки, чтобы страница не мигала светлым перед
-      // тёмным. Сохранённый выбор важнее системного; системный — только для
-      // первого визита.
+      // тёмным. По умолчанию светлая; тёмная — только если человек выбрал её
+      // сам (системная настройка не учитывается).
       try {
         var t = localStorage.getItem("looma_theme");
-        if (!t && matchMedia("(prefers-color-scheme: dark)").matches) t = "dark";
         if (t === "dark") document.documentElement.dataset.theme = "dark";
       } catch (e) {}
     </script>

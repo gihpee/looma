@@ -2,8 +2,8 @@
  *
  *  Атрибут data-theme на <html> ставится ещё в index.html до первой отрисовки
  *  (иначе страница мигает). Здесь — только чтение и переключение; источник
- *  правды один: localStorage.looma_theme, а системная тема — лишь подсказка
- *  для первого визита. */
+ *  правды один: localStorage.looma_theme; системная тема не учитывается —
+ *  светлая по умолчанию для всех. */
 import { useCallback, useEffect, useState } from "react";
 import { Moon, Sun } from "lucide-react";
 

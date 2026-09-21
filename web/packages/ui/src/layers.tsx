@@ -26,7 +26,26 @@ function useLockScroll() {
  *  становится для position: fixed «окном», и дровер открывается внутри
  *  шестидесяти пикселей шапки — то есть не открывается вовсе. */
 function Layer({ children }: { children: ReactNode }) {
-  return createPortal(children, document.body);
+  const box = useRef<HTMLDivElement>(null);
+  // Уход с анимацией. React убирает узел сразу, поэтому на время анимации
+  // в body остаётся его копия с классом ухода; так закрывается всё — и по
+  // крестику, и по клику в меню, и когда действие само закрыло модалку.
+  useEffect(() => {
+    const node = box.current;
+    return () => {
+      // В StrictMode React репетирует размонтирование, не убирая узел из
+      // документа — тогда призрак не нужен.
+      if (!node || node.isConnected) return;
+      const ghost = node.cloneNode(true) as HTMLElement;
+      ghost.classList.add("lu-layer--out");
+      ghost.setAttribute("aria-hidden", "true");
+      document.body.appendChild(ghost);
+      const done = () => ghost.remove();
+      ghost.addEventListener("animationend", done, { once: true });
+      setTimeout(done, 400);
+    };
+  }, []);
+  return createPortal(<div ref={box} className="lu-layer">{children}</div>, document.body);
 }
 /** Фокус — внутрь слоя при открытии и обратно при закрытии. */
 function useFocusTrap(ref: React.RefObject<HTMLElement>) {

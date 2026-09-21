@@ -3,11 +3,10 @@
  *  рассуждения `<think>` сворачивается, история — в браузере. */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { ChevronDown, ChevronRight, Code2, Copy, Menu, Plus, RotateCcw, SlidersHorizontal, Trash2, ArrowUp, Square } from "lucide-react";
+import { ChevronDown, ChevronRight, Copy, Menu, Plus, RotateCcw, SlidersHorizontal, Trash2, ArrowUp, Square } from "lucide-react";
 import { ApiError, stream, useModels, type ModelInfo } from "@looma/api";
-import { Button, CodeBlock, Drawer, Field, IconButton, Logo, Modal, Notice, StateBadge, Textarea, Toggle, useDesktop, useToast, money } from "@looma/ui";
+import { Button, Drawer, Field, IconButton, Logo, Modal, Notice, StateBadge, Textarea, Toggle, useDesktop, useToast, money } from "@looma/ui";
 import { chatStore, type ChatMessage, type ChatThread } from "../chatStore";
-import { API_BASE } from "../lib";
 import "./chat.css";
 
 /** Разделить накопленный текст на рассуждение и ответ (тег может прийти по кускам). */
@@ -39,7 +38,6 @@ export function Chat() {
   const [error, setError] = useState("");
   const [history, setHistory] = useState(false);
   const [settings, setSettings] = useState(false);
-  const [code, setCode] = useState(false);
   const [openThink, setOpenThink] = useState<Record<number, boolean>>({});
   const abort = useRef<AbortController | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
@@ -128,7 +126,6 @@ export function Chat() {
       tps: (() => { const xs = ms.map((m) => m.tps).filter((x): x is number => !!x); return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0; })() };
   }, [current]);
 
-  const snippet = `curl ${API_BASE}/v1/chat/completions \\\n  -H "Authorization: Bearer $LOOMA_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '${JSON.stringify({ model, messages: [...(params.system ? [{ role: "system", content: params.system }] : []), { role: "user", content: prompt || "Привет" }], temperature: params.temperature, max_tokens: params.maxTokens }, null, 0)}'`;
 
   const historyPane = (
     <div className="ch-history">
@@ -181,7 +178,6 @@ export function Chat() {
           {info && <StateBadge value="running" label="отвечает" />}
           {info?.price_in != null && <span className="lu-muted lu-hide-mobile" style={{ fontSize: 12 }}>{Math.round(info.price_in / 100)} ₽ вход · {Math.round((info.price_out ?? 0) / 100)} ₽ выход за 1M</span>}
           <span className="lu-spacer" />
-          <Button size="sm" icon={<Code2 size={14} />} onClick={() => setCode(true)} className="lu-hide-mobile">Показать как код</Button>
           {!desktop && <IconButton label="Параметры" kind="ghost" onClick={() => setSettings(true)}><SlidersHorizontal size={19} /></IconButton>}
           {!desktop && <IconButton label="Новый чат" kind="ghost" onClick={newThread}><Plus size={19} /></IconButton>}
         </div>
@@ -255,11 +251,6 @@ export function Chat() {
 
       {history && <Drawer title="История" side="left" onClose={() => setHistory(false)}>{historyPane}</Drawer>}
       {settings && <Modal title="Параметры" onClose={() => setSettings(false)}>{paramsPane}</Modal>}
-      {code && (
-        <Modal title="Тот же запрос из кода" onClose={() => setCode(false)} subtitle={<>base_url <code>{API_BASE}/v1</code> · ключ — в разделе «Ключи API»</>}>
-          <CodeBlock code={snippet} />
-        </Modal>
-      )}
     </div>
   );
 }
